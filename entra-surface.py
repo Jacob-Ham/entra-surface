@@ -84,11 +84,11 @@ DEFAULT_ROLE_LABELS = {
     "AppRoleAssignment.ReadWrite.All": "Read and write all app role assignments",
     "RoleManagement.ReadWrite.Directory": "Manage directory role assignments",
     "RoleAssignmentSchedule.ReadWrite.Directory": "Read and write the role assignment schedule (PIM)",
-    "Directory.ReadWrite.All": "Read and write all directory data",
+    "Directory.ReadWrite.All": "Read and write directory attributes.",
     "User.ReadWrite.All": "Read and write all users' full profiles",
-    "Group.ReadWrite.All": "Read and write all groups",
-    "GroupMember.ReadWrite.All": "Read and write all group memberships",
-    "UserAuthenticationMethod.ReadWrite.All": "Read and write user authentication methods",
+    "Group.ReadWrite.All": "Read and write all groups except role-assignable",
+    "GroupMember.ReadWrite.All": "Read and write all group memberships except role-assignable",
+    "UserAuthenticationMethod.ReadWrite.All": "Read and write user authentication methods except for privileged users",
     "Domain.ReadWrite.All": "Read and write custom domains",
     "Synchronization.ReadWrite.All": "Manage directory synchronization",
     "Policy.ReadWrite.ConditionalAccess": "Edit conditional access policies",
@@ -797,7 +797,11 @@ def sp_display_name(rec):
 
 
 def check_priv_app_ownership(ctx):
-    """Legacy audit, reimplemented on the entity graph. Output shape unchanged."""
+    """Legacy audit, reimplemented on the entity graph. Output shape unchanged.
+
+    Covers two kinds of privilege: privileged app-role (application permission)
+    grants from the resources config, and privileged directory roles held by
+    service principals (directly or through group membership)."""
     graph, resource_index, resource_names = ctx["graph"], ctx["resource_index"], ctx["resource_names"]
     include_disabled = ctx["include_disabled"]
 
@@ -810,13 +814,9 @@ def check_priv_app_ownership(ctx):
             matches.append((ra["principal_id"], ra["resource_id"], role_info))
 
     findings = []
-    for principal_id, resource_id, role_info in matches:
-        sp = graph["sp"].get(principal_id)
-        if not sp:
-            continue
-        if not include_disabled and (not sp.get("accountEnabled") or sp.get("deletionTimestamp")):
-            continue
 
+    def emit_finding(sp, principal_id, severity, title_prefix, permission,
+                     resource_label, reason, evidence):
         app_entries = graph["app_by_appid"].get(sp.get("appId"), [])
         owner_ids = set()
         display_name = sp_display_name(sp)
@@ -831,9 +831,9 @@ def check_priv_app_ownership(ctx):
 
         findings.append(make_finding(
             check_id="priv_app_ownership", category="apps",
-            severity=role_info["severity"],
-            title="Privileged application permission with owner" if owners else "Privileged application permission with no owner",
-            evidence=role_info["reason"],
+            severity=severity,
+            title=f"{title_prefix} with owner" if owners else f"{title_prefix} with no owner",
+            evidence=evidence,
             remediation=("Assign an accountable owner or remove the privileged grant." if not owners
                          else "Verify the privilege is still required by the nominated owner."),
             primary_id=principal_id,
@@ -863,9 +863,9 @@ def check_priv_app_ownership(ctx):
         finding["pw"] = pw
         finding["keys"] = kc
         finding["is_foreign"] = app_object_id is None and bool(sp.get("appOwnerTenantId"))
-        finding["resource_name"] = resource_names.get(resource_id, resource_id)
-        finding["permission"] = role_info["value"]
-        finding["reason"] = role_info.get("reason", "")
+        finding["resource_name"] = resource_label
+        finding["permission"] = permission
+        finding["reason"] = reason
         finding["owners"] = [
             {
                 "object_id": o["objectId"],
@@ -876,6 +876,42 @@ def check_priv_app_ownership(ctx):
             }
             for o in owners
         ]
+
+    for principal_id, resource_id, role_info in matches:
+        sp = graph["sp"].get(principal_id)
+        if not sp:
+            continue
+        if not include_disabled and (not sp.get("accountEnabled") or sp.get("deletionTimestamp")):
+            continue
+        emit_finding(sp, principal_id, role_info["severity"],
+                     "Privileged application permission",
+                     role_info["value"],
+                     resource_names.get(resource_id, resource_id),
+                     role_info.get("reason", ""),
+                     role_info["reason"])
+
+    # SPs holding privileged (Critical/High) directory roles, directly or
+    # through group membership — same ownership question as app-role grants.
+    role_sev = ctx["check_cfg"]["directory_roles"]
+    group_roles = ctx["group_roles"]
+    for principal_id in sorted(graph["sp"]):
+        sp = graph["sp"][principal_id]
+        roles = [r for r in sp_directory_roles(graph, group_roles, principal_id, role_sev)
+                 if severity_rank(r["severity"]) <= severity_rank("High")]
+        if not roles:
+            continue
+        if not include_disabled and (not sp.get("accountEnabled") or sp.get("deletionTimestamp")):
+            continue
+        severity = min((r["severity"] for r in roles), key=severity_rank)
+        details = [r["name"] + ("" if r["path"] is None
+                                else f" (via {' \u2192 '.join(r['path'])})")
+                   for r in roles]
+        emit_finding(sp, principal_id, severity,
+                     "Privileged directory role",
+                     ", ".join(r["name"] for r in roles),
+                     "Directory role",
+                     " \u00b7 ".join(details),
+                     "Directory role: " + " \u00b7 ".join(details))
 
     findings.sort(key=lambda f: (severity_rank(f["severity"]), f["display_name"] or ""))
     return findings
@@ -1161,6 +1197,7 @@ def check_app_directory_roles(ctx):
                     "enabled": bool(rec.get("accountEnabled"))},
         )
         f["dir_role_tags"] = roles
+        f["sp_id"] = sp_oid
         findings.append(f)
     findings.sort(key=lambda f: (severity_rank(f["severity"]),
                                  (f["target"]["name"] or "").lower()))
@@ -1295,11 +1332,20 @@ def check_privileged_users(ctx):
                                         "source": "PIM eligible"})
 
     # ---- group memberships / ownership -------------------------------------
+    group_path_cache = {}
+
+    def path_roles_for(gid):
+        if gid not in group_path_cache:
+            group_path_cache[gid] = resolve_group_role_paths(
+                gid, group_roles, graph["group_member_group"], group_name)
+        return group_path_cache[gid]
+
     for gid, uids in graph["group_member_user"].items():
         rec = graph["group"].get(gid)
         if not rec:
             continue
         gname = rec.get("displayName") or gid
+        inherited = path_roles_for(gid)
         for uid in uids:
             p = ensure(uid)
             p["member_count"] += 1
@@ -1311,6 +1357,11 @@ def check_privileged_users(ctx):
             })
             if gid in capable:
                 p["cap_member"].append({"name": gname, "roles": group_roles.get(gid, [])})
+            # directory roles inherited through this group (incl. nesting),
+            # with the group path — same treatment as service principals
+            for r in inherited:
+                p["roles"].append({"name": r["name"], "severity": r["severity"],
+                                   "source": "via " + " \u2192 ".join(r["path"])})
     for gid, uids in graph["group_owner_user"].items():
         for uid in uids:
             p = ensure(uid)
@@ -2708,15 +2759,22 @@ def run_checks(graph, config_resources, check_cfg, args):
 
     results = []
     for spec in selected:
-        findings = spec["run"](ctx)
-        filtered = []
-        for f in findings:
-            if severity_rank(f["severity"]) > min_rank:
-                continue
-            key = f"{f['check_id']}:{f['primary_id']}"
-            if key in suppress or f["check_id"] in suppress:
-                continue
-            filtered.append(f)
+        sys.stdout.write(f"Running {spec['id']}...")
+        sys.stdout.flush()
+        try:
+            findings = spec["run"](ctx)
+            filtered = []
+            for f in findings:
+                if severity_rank(f["severity"]) > min_rank:
+                    continue
+                key = f"{f['check_id']}:{f['primary_id']}"
+                if key in suppress or f["check_id"] in suppress:
+                    continue
+                filtered.append(f)
+        except Exception:
+            sys.stdout.write(" error\n")
+            raise
+        sys.stdout.write(f" {len(filtered)}\n")
         if filtered:
             results.append({"id": spec["id"], "category": spec["category"],
                             "title": spec["title"], "description": spec["description"],
@@ -3605,6 +3663,28 @@ def ad_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None):
     return out, total
 
 
+def realm_card_html(meta):
+    """Realm summary above the AD-synced users table: realm, SID prefix, synced
+    count, and DC hosts — hosts are capped at 10 with a dropdown for the rest."""
+    parts = []
+    if meta.get("domain"):
+        parts.append(f"Realm: <b>{esc(meta['domain'])}</b>")
+    if meta.get("sid_prefix"):
+        parts.append(f"Domain SID: <b>{esc(meta['sid_prefix'].rstrip('-'))}-x</b>")
+    if meta.get("synced_count"):
+        parts.append(f"{meta['synced_count']} synced user(s)")
+    hosts = meta.get("dc_hosts") or []
+    if hosts:
+        host_html = f"<b>{esc(', '.join(hosts[:10]))}</b>"
+        if len(hosts) > 10:
+            host_html += (f' <details class="inline-more"><summary>+{len(hosts) - 10} more</summary>'
+                          f'<span> {esc(", ".join(hosts[10:]))}</span></details>')
+        parts.append("DC hosts: " + host_html)
+    if not parts:
+        return ""
+    return '<div class="realm">' + " \u00b7 ".join(parts) + "</div>"
+
+
 def render_report(results, tenant_name, db_path, config_path, include_disabled, entity_details,
                   min_severity_label, entity_profiles=None, tenant_summary=None, graph=None,
                   serve_mode=False, serve_tables=None, check_cfg=None):
@@ -4112,19 +4192,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 
     # ---- ad_sync_users section (realm card + flag roster) -----------------
     def ad_users_section(res):
-        meta = res.get("meta") or {}
-        realm_html = ""
-        parts = []
-        if meta.get("domain"):
-            parts.append(f"Realm: <b>{esc(meta['domain'])}</b>")
-        if meta.get("sid_prefix"):
-            parts.append(f"Domain SID: <b>{esc(meta['sid_prefix'].rstrip('-'))}-x</b>")
-        if meta.get("synced_count"):
-            parts.append(f"{meta['synced_count']} synced user(s)")
-        if meta.get("dc_hosts"):
-            parts.append("DC hosts: <b>" + esc(", ".join(meta["dc_hosts"])) + "</b>")
-        if parts:
-            realm_html = '<p class="realm">' + " \u00b7 ".join(parts) + "</p>"
+        realm_html = realm_card_html(res.get("meta") or {})
 
         rows_html = "" if serve_mode else "\n".join(ad_rows_html(res["findings"])[0])
         if serve_tables is not None:
@@ -4450,6 +4518,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   .tag-divergence {{ color: var(--status-low); border-color: color-mix(in srgb, var(--status-low) 45%, transparent); }}
   .realm {{ margin: 8px 0 10px; color: var(--text-secondary); font-size: 12px; }}
   .realm b {{ color: var(--text-primary); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }}
+  details.inline-more {{ display: inline; }}
+  details.inline-more summary {{ display: inline; cursor: pointer; color: var(--accent); }}
+  details.inline-more > span {{ display: inline; }}
   .engine-card {{
     border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px;
     background: var(--surface-1); margin: 4px 0 6px;
@@ -6532,9 +6603,6 @@ def main():
                                               check_cfg=check_cfg))
 
     total = sum(len(res["findings"]) for res in results)
-    print(f"Checks run: {', '.join(res['id'] for res in results) or 'none'}")
-    for res in results:
-        print(f"  {res['id']:<28} {len(res['findings']):>4} finding(s)")
 
     if args.serve:
         SERVE_STATE["shell"] = report_html
