@@ -18,6 +18,9 @@ Checks (config: privileged_roles.json -> "checks"):
   implicit_flow           - apps with the OAuth2 implicit flow enabled
   public_client_privileged - public clients holding privileged roles
   foreign_principal       - SPs owned by another tenant with privileged roles
+  app_dir_roles           - applications (service principals) holding directory
+                            roles, assigned directly or via group membership
+                            (incl. nesting); rated by the most critical role
   privileged_users        - full user roster: one row per user; privileged users are
                             rated by directory roles (assigned and eligible), owned
                             privileged apps / role-carrying SPs, and role-capable group
@@ -1126,6 +1129,44 @@ def check_foreign_principal(ctx):
     return findings
 
 
+def check_app_directory_roles(ctx):
+    """One row per service principal holding directory roles — assigned directly
+    or inherited through group membership (incl. nesting). Rated by the most
+    critical directory role per the 'directory_roles' config (unrated = Info)."""
+    graph = ctx["graph"]
+    group_roles = ctx["group_roles"]
+    role_sev = ctx["check_cfg"]["directory_roles"]
+    findings = []
+    for sp_oid in sorted(graph["sp"]):
+        rec = graph["sp"][sp_oid]
+        roles = sp_directory_roles(graph, group_roles, sp_oid, role_sev)
+        if not roles:
+            continue
+        severity = min((r["severity"] for r in roles), key=severity_rank)
+        parts = [r["name"] + ("" if r["path"] is None
+                              else f" (via {' \u2192 '.join(r['path'])})")
+                 for r in roles]
+        f = make_finding(
+            check_id="app_dir_roles", category="apps",
+            severity=severity,
+            title=f"Application with directory roles: {sp_display_name(rec)}",
+            evidence=" \u00b7 ".join(parts),
+            remediation=("Review whether this application still needs its directory "
+                         "roles; prefer least-privilege alternatives, an accountable "
+                         "owner, and rotating credentials."),
+            primary_id=sp_oid,
+            object_ids={"sp": {sp_oid}},
+            target={"type": "Service Principal", "name": sp_display_name(rec), "id": sp_oid},
+            status={"label": "Enabled" if rec.get("accountEnabled") else "Disabled",
+                    "enabled": bool(rec.get("accountEnabled"))},
+        )
+        f["dir_role_tags"] = roles
+        findings.append(f)
+    findings.sort(key=lambda f: (severity_rank(f["severity"]),
+                                 (f["target"]["name"] or "").lower()))
+    return findings
+
+
 def check_privileged_users(ctx):
     """Aggregate every privilege signal we can attribute per user into one finding.
 
@@ -1961,10 +2002,148 @@ def parse_desktop_sso(policy_detail):
         return None
 
 
+def resolve_group_role_paths(gid, group_roles, group_member_group, group_label):
+    """Directory roles members of `gid` inherit through nested group membership.
+
+    Walks up the containment chain (gid is a member of parent groups, which may
+    themselves be nested in further groups) and returns one entry per role with
+    the shortest group path from `gid` to the role-bearing group, e.g.
+    {"name": "Global Administrator", "severity": "Critical",
+     "path": ["Team A", "Team A - Admins", "Root Admins"]}.
+    """
+    found = {}
+    seen = {gid}
+    queue = [(gid, [gid])]
+    while queue:
+        cur, path = queue.pop(0)
+        for r in group_roles.get(cur, []):
+            if r["name"] not in found:
+                found[r["name"]] = {
+                    "name": r["name"], "severity": r["severity"],
+                    "path": [group_label(g) for g in path],
+                }
+        for parent, children in group_member_group.items():
+            if cur in children and parent not in seen:
+                seen.add(parent)
+                queue.append((parent, path + [parent]))
+    return sorted(found.values(), key=lambda r: severity_rank(r["severity"]))
+
+
+def compute_group_roles(graph, check_cfg):
+    """{group_id: [{"name", "severity"}]} - directory roles carried by each group:
+    direct role memberships (lnk_role_member_group) plus role assignments whose
+    principal is a group (RoleAssignments). Shared by the user/groups checks and
+    the SP/app profile drawer."""
+    role_sev = check_cfg["directory_roles"]
+
+    def _grole_name(oid):
+        rec = graph["directory_role"].get(oid)
+        return rec.get("displayName") if rec else oid
+
+    def _gdef_name(oid):
+        rec = graph["role_definition"].get(oid)
+        return rec.get("displayName") if rec else oid
+
+    def _gsev(name):
+        return role_sev.get(name, "Info")
+
+    group_roles = defaultdict(list)
+    for role_oid, gid in graph["role_member_group"]:
+        name = _grole_name(role_oid)
+        group_roles[gid].append({"name": name, "severity": _gsev(name)})
+    for ra in graph["directory_role_assigns"]:
+        if ra["principal_id"] in graph["group"]:
+            name = _gdef_name(ra["role_definition_id"])
+            group_roles[ra["principal_id"]].append({"name": name, "severity": _gsev(name)})
+    for gid in list(group_roles):
+        seen = set()
+        group_roles[gid] = [r for r in group_roles[gid]
+                            if not (r["name"] in seen or seen.add(r["name"]))]
+    return group_roles
+
+
+def sp_directory_roles(graph, group_roles, sp_oid, role_sev):
+    """Directory roles held by a service principal: direct memberships plus
+    roles inherited through group membership (incl. nesting), each with the
+    group path to the role-bearing group (None when assigned directly)."""
+    def _dir_role_name(oid):
+        rec = graph["directory_role"].get(oid)
+        return rec.get("displayName") if rec else oid
+
+    def _group_label(gid):
+        rec = graph["group"].get(gid)
+        return rec.get("displayName") if rec else gid
+
+    roles = []
+    for role_oid, member in graph["role_member_sp"]:
+        if member == sp_oid:
+            name = _dir_role_name(role_oid)
+            roles.append({"name": name, "severity": role_sev.get(name, "Info"), "path": None})
+    seen = {r["name"] for r in roles}
+    for gid, members in graph["group_member_sp"].items():
+        if sp_oid not in members:
+            continue
+        for r in resolve_group_role_paths(gid, group_roles,
+                                          graph["group_member_group"], _group_label):
+            if r["name"] not in seen:
+                seen.add(r["name"])
+                roles.append({"name": r["name"], "severity": r["severity"],
+                              "path": list(r["path"])})
+    return roles
+
+
+def build_role_applications(graph, group_roles):
+    """Directory role displayName -> service principals holding that role
+    (direct memberships/assignments, plus via group membership incl. nesting).
+    Each entry: {"id", "name", "path"} where path is the group chain to the
+    role-bearing group (None = assigned directly). Drives the 'Applications'
+    tab of the directory-role drilldown."""
+    def _sp_label(sp_oid):
+        rec = graph["sp"].get(sp_oid)
+        return (rec.get("displayName") or rec.get("appDisplayName") or sp_oid) if rec else sp_oid
+
+    def _group_label(gid):
+        rec = graph["group"].get(gid)
+        return rec.get("displayName") if rec else gid
+
+    def _role_name(oid):
+        rec = graph["directory_role"].get(oid)
+        return rec.get("displayName") if rec else oid
+
+    def _def_name(oid):
+        rec = graph["role_definition"].get(oid)
+        return rec.get("displayName") if rec else oid
+
+    index = defaultdict(list)
+
+    def add(role, sp_oid, path):
+        for existing in index[role]:
+            if existing["id"] == sp_oid and existing["path"] == path:
+                return
+        index[role].append({"id": sp_oid, "name": _sp_label(sp_oid), "path": path})
+
+    for role_oid, sp_oid in graph["role_member_sp"]:
+        add(_role_name(role_oid), sp_oid, None)
+    for ra in graph["directory_role_assigns"]:
+        if ra["principal_id"] in graph["sp"]:
+            add(_def_name(ra["role_definition_id"]), ra["principal_id"], None)
+    for gid, sp_ids in graph["group_member_sp"].items():
+        for r in resolve_group_role_paths(gid, group_roles,
+                                          graph["group_member_group"], _group_label):
+            for sp_oid in sp_ids:
+                if sp_oid in graph["sp"]:
+                    add(r["name"], sp_oid, r["path"])
+    for role in index:
+        index[role].sort(key=lambda e: (e["name"] or "").lower())
+    return dict(index)
+
+
 def check_groups(ctx):
     """One row per group: directory roles carried by the group, role-capability
     (assignable / role-bearing / nested), dynamic membership rules, owners, and
-    privileged / service-principal members."""
+    privileged / service-principal members. User members carry role tags for
+    their own directory roles plus the roles the group grants them, resolved
+    through nested group membership with the group path to each role."""
     graph = ctx["graph"]
     role_sev = ctx["check_cfg"]["directory_roles"]
     capable = ctx["capable_groups"]
@@ -2005,6 +2184,40 @@ def check_groups(ctx):
         u = graph["user"].get(uid)
         return (u.get("displayName") or u.get("userPrincipalName") or uid) if u else uid
 
+    def group_label(gid):
+        rec = graph["group"].get(gid)
+        return rec.get("displayName") if rec else gid
+
+    # Roles members inherit through nested group membership, with the group
+    # path from the viewed group to each role-bearing group.
+    role_path_cache = {}
+
+    def role_paths_for(gid):
+        if gid not in role_path_cache:
+            role_path_cache[gid] = resolve_group_role_paths(
+                gid, group_roles, graph["group_member_group"], group_label)
+        return role_path_cache[gid]
+
+    # direct directory roles per SP (lnk_role_member_serviceprincipal)
+    sp_dir_roles = defaultdict(list)
+    for role_oid, sp_oid in graph["role_member_sp"]:
+        rname = role_name(role_oid)
+        sp_dir_roles[sp_oid].append({"name": rname, "severity": sev_of(rname)})
+
+    # privileged app-role assignments per SP, rated by the resources config
+    # (same criticality tags as the priv_app_ownership findings)
+    sp_priv_grants = defaultdict(list)
+    for ra in graph["role_assigns"]:
+        if ra["principal_type"] != "ServicePrincipal":
+            continue
+        info = ctx["resource_index"].get(ra["resource_id"], {}).get(ra["app_role_id"])
+        if info:
+            sp_priv_grants[ra["principal_id"]].append({
+                "name": info["value"],
+                "severity": info["severity"],
+                "resource": ctx["resource_names"].get(ra["resource_id"], ra["resource_id"]),
+            })
+
     findings = []
     for gid, rec in graph["group"].items():
         name = rec.get("displayName") or gid
@@ -2023,12 +2236,35 @@ def check_groups(ctx):
                           key=lambda a: (a.get("eligible", False), a["role"].lower()))
 
         dir_roles = group_roles.get(gid, [])
+        group_role_tags = role_paths_for(gid)
         parents = sorted((graph["group"][p].get("displayName") or p)
                          for p, children in graph["group_member_group"].items() if gid in children)
         children = sorted((graph["group"][c].get("displayName") or c)
                           for c in graph["group_member_group"].get(gid, []))
-        sp_members = sorted((graph["sp"][s].get("displayName") or s)
-                            for s in graph["group_member_sp"].get(gid, set()) if s in graph["sp"])
+        sp_members = []
+        for s in graph["group_member_sp"].get(gid, set()):
+            if s not in graph["sp"]:
+                continue
+            tags = {}
+            for r in sp_dir_roles.get(s, []):
+                tags[r["name"]] = {"name": r["name"], "severity": r["severity"],
+                                   "path": None, "kind": "dir"}
+            for r in group_role_tags:
+                if r["name"] not in tags:
+                    tags[r["name"]] = {"name": r["name"], "severity": r["severity"],
+                                       "path": list(r["path"]), "kind": "dir"}
+            for g in sp_priv_grants.get(s, []):
+                key = f"app:{g['name']}"
+                if key not in tags:
+                    tags[key] = {"name": g["name"], "severity": g["severity"],
+                                 "path": None, "kind": "app", "resource": g["resource"]}
+            sp_members.append({
+                "id": s,
+                "name": graph["sp"][s].get("displayName") or s,
+                "enabled": bool(graph["sp"][s].get("accountEnabled")),
+                "roles": sorted(tags.values(), key=lambda r: severity_rank(r["severity"])),
+            })
+        sp_members.sort(key=lambda m: (m["name"] or "").lower())
         owners = sorted(user_primary(u) for u in graph["group_owner_user"].get(gid, set())
                         if u in graph["user"])
 
@@ -2037,7 +2273,15 @@ def check_groups(ctx):
             if uid not in graph["user"]:
                 continue
             u = graph["user"][uid]
-            roles = user_roles.get(uid, [])
+            merged = {}
+            for r in user_roles.get(uid, []):
+                merged[r["name"]] = {"name": r["name"], "severity": r["severity"], "path": None}
+            for r in group_role_tags:
+                if r["name"] not in merged:
+                    merged[r["name"]] = {
+                        "name": r["name"], "severity": r["severity"], "path": list(r["path"]),
+                    }
+            roles = sorted(merged.values(), key=lambda r: severity_rank(r["severity"]))
             members.append({
                 "name": u.get("displayName") or uid,
                 "upn": u.get("userPrincipalName") or "",
@@ -2099,7 +2343,8 @@ def check_groups(ctx):
         f["owners"] = owners
         f["members"] = members
         f["sp_members"] = sp_members
-        f["member_count"] = len(members)
+        f["member_count"] = len(members) + len(sp_members)
+        f["user_member_count"] = len(members)
         f["priv_member_count"] = len(priv_members)
         f["dyn_rule"] = rule
         f["dyn_attrs"] = dyn_attrs
@@ -2303,6 +2548,15 @@ CHECK_SPECS = [
         "run": check_foreign_principal,
     },
     {
+        "id": "app_dir_roles",
+        "category": "apps",
+        "title": "Directory roles assigned to applications",
+        "description": ("One row per service principal holding directory roles, "
+                        "assigned directly or inherited through group membership "
+                        "(incl. nesting). Rated by the most critical directory role."),
+        "run": check_app_directory_roles,
+    },
+    {
         "id": "privileged_users",
         "category": "users",
         "title": "Users",
@@ -2425,17 +2679,6 @@ def run_checks(graph, config_resources, check_cfg, args):
     }
 
     # ---- role-capable groups + roles carried by groups (shared) ----------
-    def _grole_name(oid):
-        rec = graph["directory_role"].get(oid)
-        return rec.get("displayName") if rec else oid
-
-    def _gdef_name(oid):
-        rec = graph["role_definition"].get(oid)
-        return rec.get("displayName") if rec else oid
-
-    def _gsev(name):
-        return check_config["directory_roles"].get(name, "Info")
-
     capable_groups = set()
     for gid, rec in graph["group"].items():
         if rec.get("isAssignableToRole") in (1, True):
@@ -2458,18 +2701,7 @@ def run_checks(graph, config_resources, check_cfg, args):
                         capable_groups.add(child)
                         changed = True
 
-    group_roles = defaultdict(list)
-    for role_oid, gid in graph["role_member_group"]:
-        name = _grole_name(role_oid)
-        group_roles[gid].append({"name": name, "severity": _gsev(name)})
-    for ra in graph["directory_role_assigns"]:
-        if ra["principal_id"] in graph["group"]:
-            name = _gdef_name(ra["role_definition_id"])
-            group_roles[ra["principal_id"]].append({"name": name, "severity": _gsev(name)})
-    for gid in list(group_roles):
-        seen = set()
-        group_roles[gid] = [r for r in group_roles[gid]
-                            if not (r["name"] in seen or seen.add(r["name"]))]
+    group_roles = compute_group_roles(graph, check_config)
 
     ctx["capable_groups"] = capable_groups
     ctx["group_roles"] = group_roles
@@ -2519,6 +2751,38 @@ def run_checks(graph, config_resources, check_cfg, args):
                 roles.extend(graph["az_user_roles"].get(uid, []))
             if roles:
                 f["az_roles"] = _az_sorted(roles)
+
+    # ---- directory roles per SP (Privileges-column severity on app findings) ----
+    # Every finding whose principals include service principals is rated by the
+    # SP's directory roles (direct + via group membership): the finding's
+    # severity is raised to the most critical directory role it holds.
+    sp_dir_cache = {}
+
+    def sp_dir_tags(sp_oid):
+        if sp_oid not in sp_dir_cache:
+            sp_dir_cache[sp_oid] = sp_directory_roles(
+                graph, group_roles, sp_oid, check_config["directory_roles"])
+        return sp_dir_cache[sp_oid]
+
+    for res in results:
+        for f in res["findings"]:
+            o = f.get("object_ids") or {}
+            sp_ids = o.get("sp", set())
+            if not sp_ids:
+                continue
+            merged = {}
+            for sp_oid in sorted(sp_ids):
+                for r in sp_dir_tags(sp_oid):
+                    if r["name"] not in merged:
+                        merged[r["name"]] = r
+            if not merged:
+                continue
+            f["dir_role_tags"] = sorted(
+                merged.values(), key=lambda r: severity_rank(r["severity"]))
+            best_rank = min(severity_rank(r["severity"]) for r in f["dir_role_tags"])
+            if best_rank < severity_rank(f["severity"]):
+                f["severity"] = next(
+                    sev for sev, rank in SEVERITY_ORDER.items() if rank == best_rank)
     return results
 
 
@@ -2608,6 +2872,7 @@ def build_entity_profiles(graph, check_cfg, sp_ids, app_ids):
     (roles this principal grants to others / roles granted to it)."""
     role_sev = check_cfg["directory_roles"]
     role_labels = check_cfg.get("role_labels") or {}
+    group_roles = compute_group_roles(graph, check_cfg)
     app_roles_cache = {}  # sp_oid -> {role_id: {value, description}}
 
     def catalog_entry(value, description):
@@ -2650,17 +2915,8 @@ def build_entity_profiles(graph, check_cfg, sp_ids, app_ids):
             return graph["user"][pid].get("displayName") or pid
         return sp_label(pid)
 
-    def dir_role_name(oid):
-        rec = graph["directory_role"].get(oid)
-        return rec.get("displayName") if rec else oid
-
     def dir_roles_for(sp_oid):
-        roles = []
-        for role_oid, member in graph["role_member_sp"]:
-            if member == sp_oid:
-                name = dir_role_name(role_oid)
-                roles.append({"name": name, "severity": role_sev.get(name, "Info")})
-        return roles
+        return sp_directory_roles(graph, group_roles, sp_oid, role_sev)
 
     def groups_for(sp_oid):
         return [{"name": graph["group"][g].get("displayName") or g}
@@ -3136,6 +3392,53 @@ def generic_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=N
     return out, total
 
 
+# ---- app directory roles rows ------------------------------------------------
+
+def app_dir_search_text(f):
+    t = f.get("target") or {}
+    roles = ", ".join(r["name"] for r in f.get("dir_role_tags", []))
+    return " ".join([t.get("name") or "", f.get("severity") or "", roles]).lower()
+
+
+def app_dir_sort_value(f, key):
+    t = f.get("target") or {}
+    return {
+        "1": severity_rank(f.get("severity", "Info")),
+        "2": (t.get("name") or "").lower(),
+        "3": (t.get("id") or "").lower(),
+        "4": ", ".join(r["name"] for r in f.get("dir_role_tags", [])).lower(),
+        "5": 0 if (f.get("status") or {}).get("enabled") else 1,
+    }.get(key, 0)
+
+
+APP_DIR_SORT_KEYS = {str(i): str(i) for i in range(1, 6)}
+
+
+def app_dir_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None):
+    selected, total = page_rows(findings, q, sort_key, desc, start, stop,
+                                app_dir_search_text, app_dir_sort_value)
+    out = []
+    for f in selected:
+        key = f"row-{len(out)}"
+        tags = f.get("dir_role_tags", [])
+        role_chips = "".join(
+            f'<span class="badge {severity_class(r["severity"])} role-badge" '
+            f'data-role="{esc(r["name"])}" data-role-field="roles" '
+            f'title="{esc(r["name"] + " \u2014 via " + " \u2192 ".join(r["path"]) if r.get("path") else r["name"] + " \u2014 direct assignment")}">'
+            f'{esc(r["name"])}</span> '
+            for r in tags)
+        out.append(f"""
+        <tr data-sp-id="{esc(f.get("sp_id") or "")}" data-detail-key="{key}">
+          <td class="expand-cell">{EXPAND_BUTTON_HTML}</td>
+          <td data-field="severity" data-value="{esc(f["severity"])}">{severity_badge(f["severity"])}</td>
+          <td class="clickable" data-field="app" data-value="{esc(f["target"]["name"])}">{esc(f["target"]["name"])}</td>
+          <td class="mono" data-field="id" data-value="{esc(f["target"]["id"])}">{esc(f["target"]["id"])}</td>
+          <td data-field="appDirRoles" data-value="{esc(', '.join(r['name'] for r in tags))}">{role_chips or '<span class="muted">&mdash;</span>'}</td>
+          <td data-field="status" data-value="{esc((f.get("status") or {}).get("label", ""))}">{status_cell(f.get("status"))}</td>
+        </tr>{drawer_for_html(key, 6)}""")
+    return out, total
+
+
 # ---- groups / dynamic rows ---------------------------------------------------
 
 def group_search_text(f):
@@ -3185,7 +3488,7 @@ def group_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=Non
                 if any(r["severity"] != "Info" for r in m["roles"]) else ""))
             for m in f["members"])
         if f["sp_members"]:
-            member_titles += ("\n" if member_titles else "") + f"{len(f['sp_members'])} SP member(s): " + ", ".join(f["sp_members"])
+            member_titles += ("\n" if member_titles else "") + f"{len(f['sp_members'])} SP member(s): " + ", ".join(m["name"] for m in f["sp_members"])
         priv_titles = "\n".join(
             ((m["upn"] or m["name"])
              + " — " + ", ".join(r["name"] for r in m["roles"]))
@@ -3304,7 +3607,7 @@ def ad_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None):
 
 def render_report(results, tenant_name, db_path, config_path, include_disabled, entity_details,
                   min_severity_label, entity_profiles=None, tenant_summary=None, graph=None,
-                  serve_mode=False, serve_tables=None):
+                  serve_mode=False, serve_tables=None, check_cfg=None):
     all_findings = [f for res in results for f in res["findings"]]
 
     category_counts = Counter(res["category"] for res in results for _ in res["findings"])
@@ -3408,24 +3711,18 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
                 rows.append((label, pid, kind, a))
         return rows
 
-    # ---- legacy privileged-ownership section -----------------------------
-    def legacy_section():
+    # ---- legacy privileged-ownership sections ----------------------------
+    def legacy_owned_section():
         priv = next((res for res in results if res["id"] == "priv_app_ownership"), None)
         if not priv:
             return ""
         owned = [f for f in priv["findings"] if f["owners"]]
-        unowned = [f for f in priv["findings"] if not f["owners"]]
         owned_rows = "" if serve_mode else "\n".join(legacy_rows_html(owned)[0])
-        unowned_rows = "" if serve_mode else "\n".join(legacy_unowned_rows_html(unowned)[0])
         if serve_tables is not None:
             serve_tables["owned-table"] = {"findings": owned, "rows": legacy_rows_html,
                                            "search": legacy_search_text,
                                            "sort_keys": LEGACY_SORT_KEYS, "colspan": 11}
-            serve_tables["unowned-table"] = {"findings": unowned, "rows": legacy_unowned_rows_html,
-                                             "search": unowned_search_text,
-                                             "sort_keys": UNOWNED_SORT_KEYS, "colspan": 8}
         owned_pager = serve_pager() if serve_mode else ""
-        unowned_pager = serve_pager() if serve_mode else ""
         return f"""
   <section data-category="apps">
     <h2>{esc(priv["title"])}</h2>
@@ -3457,7 +3754,20 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     {owned_pager}
     {'<div class="empty">No owned applications matched the configured privileged roles.</div>' if not owned else ''}
   </section>
+"""
 
+    def legacy_unowned_section():
+        priv = next((res for res in results if res["id"] == "priv_app_ownership"), None)
+        if not priv:
+            return ""
+        unowned = [f for f in priv["findings"] if not f["owners"]]
+        unowned_rows = "" if serve_mode else "\n".join(legacy_unowned_rows_html(unowned)[0])
+        if serve_tables is not None:
+            serve_tables["unowned-table"] = {"findings": unowned, "rows": legacy_unowned_rows_html,
+                                             "search": unowned_search_text,
+                                             "sort_keys": UNOWNED_SORT_KEYS, "colspan": 8}
+        unowned_pager = serve_pager() if serve_mode else ""
+        return f"""
   <section data-category="apps">
     <h2>Privileged applications / service principals with no recorded owner</h2>
     <div class="table-scroll">
@@ -3703,6 +4013,41 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
                         graph["user"].get(uid))),
         "azUsrRoles")
 
+    # ---- app directory roles section --------------------------------------
+    def app_dir_roles_section(res):
+        rows_html = "" if serve_mode else "\n".join(app_dir_rows_html(res["findings"])[0])
+        if serve_tables is not None:
+            serve_tables["app-dir-roles-table"] = {"findings": res["findings"], "rows": app_dir_rows_html,
+                                                   "search": app_dir_search_text,
+                                                   "sort_keys": APP_DIR_SORT_KEYS, "colspan": 6}
+        pager = serve_pager() if serve_mode else ""
+        return f"""
+  <section data-category="apps">
+    <h2>{esc(res["title"])}</h2>
+    <div class="table-scroll">
+    <table id="app-dir-roles-table" class="findings" data-serve="1">
+      <colgroup>
+        <col style="width:44px">
+        <col style="width:90px"><col style="width:200px"><col style="width:220px">
+        <col style="width:260px"><col style="width:90px">
+      </colgroup>
+      <thead>
+        <tr>
+          <th class="no-sort"></th>
+          <th data-type="text">Privileges</th>
+          <th data-type="text">Application</th>
+          <th data-type="text">Object ID</th>
+          <th data-type="text">Directory roles</th>
+          <th data-type="text">Status</th>
+        </tr>
+      </thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+    </div>
+    {pager}
+  </section>
+"""
+
     # ---- ad_sync_engine assessment card --------------------------------------
     def ad_summary_card(res):
         f = res["findings"][0]
@@ -3834,13 +4179,25 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     policy_profile_data = {}
     for res in results:
         if res["id"] == "priv_app_ownership":
-            legacy_html = legacy_section()
-            if legacy_html:
-                sections_html.append(legacy_html)
+            owned_html = legacy_owned_section()
+            if owned_html:
+                sections_html.append(owned_html)
+            # 'Directory roles assigned to applications' renders as the
+            # second table, right after the ownership table
+            app_dir = next((r for r in results if r["id"] == "app_dir_roles"), None)
+            if app_dir:
+                sections_html.append(app_dir_roles_section(app_dir))
+            unowned_html = legacy_unowned_section()
+            if unowned_html:
+                sections_html.append(unowned_html)
+        elif res["id"] == "app_dir_roles":
+            pass  # already rendered after the first table above
         elif res["id"] == "privileged_users":
             sections_html.append(users_section(res))
             if not serve_mode:
                 user_profile_data = {f["user_id"]: f for f in res["findings"]}
+        elif res["id"] == "app_dir_roles":
+            sections_html.append(app_dir_roles_section(res))
         elif res["id"] == "groups":
             sections_html.append(groups_section(res))
             dyn_html = dynamic_groups_table(res)
@@ -3861,6 +4218,11 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     user_profile_json = json.dumps(user_profile_data, default=str).replace("</", "<\\/")
     group_profile_json = json.dumps(group_profile_data, default=str).replace("</", "<\\/")
     policy_profile_json = json.dumps(policy_profile_data, default=str).replace("</", "<\\/")
+    # directory role -> service principals holding it (drilldown 'Applications' tab);
+    # small index, embedded in serve mode too
+    role_apps_json = json.dumps(
+        build_role_applications(graph, compute_group_roles(graph, check_cfg or {})),
+        default=str).replace("</", "<\\/")
 
     # ---- tabs ------------------------------------------------------------
     tabs_html = ['<button type="button" class="tab-btn active" data-category="all">All</button>']
@@ -4030,6 +4392,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   section {{ margin-top: 32px; }}
   section[data-category] {{ margin-top: 26px; }}
   section.hidden {{ display: none; }}
+  .hidden {{ display: none; }}
   section h2 {{ font-size: 15px; font-weight: 600; margin: 0 0 4px; }}
   section .sub {{ color: var(--text-secondary); font-size: 12px; margin: 0 0 10px; }}
   .table-scroll {{
@@ -4130,7 +4493,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   }}
   .icon-btn:hover {{ background: var(--row-hover); color: var(--text-primary); }}
   #drilldown-table {{ table-layout: auto; width: 100%; }}
+  #drilldown-table, #drilldown-apps-table {{ table-layout: auto; width: 100%; }}
   #drilldown-table th, #drilldown-table td {{ padding: 8px 12px; border-bottom: 1px solid var(--gridline); text-align: left; font-size: 13px; }}
+  #drilldown-apps-table th, #drilldown-apps-table td {{ padding: 8px 12px; border-bottom: 1px solid var(--gridline); text-align: left; font-size: 13px; }}
   #drilldown-table th {{ color: var(--text-muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.02em; white-space: nowrap; }}
   .detail-section {{ margin-bottom: 22px; }}
   .detail-section:last-child {{ margin-bottom: 0; }}
@@ -4222,10 +4587,17 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
       <button type="button" class="icon-btn" id="drilldown-close" aria-label="Close">&times;</button>
     </div>
     <div class="modal-body">
-      <div class="table-scroll">
+      <div class="drawer-tabs hidden" id="drilldown-tabs"></div>
+      <div class="table-scroll" id="drilldown-users-scroll">
         <table id="drilldown-table">
           <thead><tr id="drilldown-thead-row"></tr></thead>
           <tbody id="drilldown-tbody"></tbody>
+        </table>
+      </div>
+      <div class="table-scroll hidden" id="drilldown-apps-scroll">
+        <table id="drilldown-apps-table">
+          <thead><tr id="drilldown-apps-thead"></tr></thead>
+          <tbody id="drilldown-apps-tbody"></tbody>
         </table>
       </div>
     </div>
@@ -4239,6 +4611,8 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 <script type="application/json" id="entity-profile-data">{entity_profiles_json}</script>
 
 <script type="application/json" id="group-profile-data">{group_profile_json}</script>
+
+<script type="application/json" id="role-apps-data">{role_apps_json}</script>
 
 <script type="application/json" id="policy-profile-data">{policy_profile_json}</script>
 
@@ -4366,8 +4740,21 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   var subtitleEl = document.getElementById('drilldown-subtitle');
   var theadRow = document.getElementById('drilldown-thead-row');
   var tbody = document.getElementById('drilldown-tbody');
+  var tabsWrap = document.getElementById('drilldown-tabs');
+  var usersScroll = document.getElementById('drilldown-users-scroll');
+  var appsScroll = document.getElementById('drilldown-apps-scroll');
+  var appsThead = document.getElementById('drilldown-apps-thead');
+  var appsTbody = document.getElementById('drilldown-apps-tbody');
 
-  function closeDrilldown() {{ overlay.classList.add('hidden'); }}
+  var ROLE_APPS = {{}};
+  try {{ ROLE_APPS = JSON.parse(document.getElementById('role-apps-data').textContent); }} catch (e) {{}}
+
+  function closeDrilldown() {{
+    overlay.classList.add('hidden');
+    tabsWrap.classList.add('hidden');
+    usersScroll.classList.remove('hidden');
+    appsScroll.classList.add('hidden');
+  }}
 
   var CONTAINS_FIELDS = {{ roles: true, grpRoles: true, dynMods: true, dynAttrs: true, azRoles: true, azUsrRoles: true, azSpRoles: true }};
   var SERVE_DRILLDOWN_FIELDS = {{
@@ -4381,25 +4768,33 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     adUser: 1, adUpn: 1, adCn: 1, adDn: 1, adSid: 1, adPw: 1, adTags: 1, adStatus: 1
   }};
 
+  function isRoleDrilldown(field) {{ return field === 'roles'; }}
+
   function openDrilldown(field, value) {{
+    if (isRoleDrilldown(field)) {{ openRoleDrilldown(field, value); return; }}
+    tabsWrap.classList.add('hidden');
+    usersScroll.classList.remove('hidden');
+    appsScroll.classList.add('hidden');
     if (window.REPORT_SERVE && SERVE_DRILLDOWN_FIELDS[field]) {{
       fetch('/api/drilldown?field=' + encodeURIComponent(field) + '&value=' + encodeURIComponent(value))
         .then(function(r) {{ return r.json(); }})
         .then(function(d) {{
-          if (!d || d.rows_html == null) {{ openDrilldownLocal(field, value); return; }}
+          if (!d || d.rows_html == null) {{ fillUsersLocal(field, value); return; }}
           titleEl.textContent = d.title;
           subtitleEl.textContent = d.subtitle;
           theadRow.innerHTML = d.thead_html;
           tbody.innerHTML = d.rows_html;
           overlay.classList.remove('hidden');
         }})
-        .catch(function() {{ openDrilldownLocal(field, value); }});
+        .catch(function() {{ fillUsersLocal(field, value); overlay.classList.remove('hidden'); }});
       return;
     }}
-    openDrilldownLocal(field, value);
+    titleEl.textContent = (FIELD_LABELS[field] || field) + ': ' + value;
+    fillUsersLocal(field, value);
+    overlay.classList.remove('hidden');
   }}
 
-  function openDrilldownLocal(field, value) {{
+  function fillUsersLocal(field, value) {{
     var matches = allRecords.filter(function(r) {{
       var v = r[field] || '';
       if (CONTAINS_FIELDS[field]) {{
@@ -4409,7 +4804,6 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     }});
     var columns = DRILLDOWN_COLUMNS[field] || Object.keys(FIELD_LABELS).filter(function(f) {{ return f !== field; }});
 
-    titleEl.textContent = (FIELD_LABELS[field] || field) + ': ' + value;
     subtitleEl.textContent = matches.length + (matches.length === 1 ? ' matching finding in the collected set' : ' matching findings in the collected set');
 
     theadRow.innerHTML = '';
@@ -4459,9 +4853,110 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
       tdr.appendChild(tdc);
       tbody.appendChild(tdr);
     }});
+  }}
 
+  function fillAppsPane(role) {{
+    var entries = ROLE_APPS[role] || [];
+    appsTbody.innerHTML = '';
+    appsThead.innerHTML = '';
+    appsThead.appendChild(document.createElement('th'));
+    ['Application', 'ObjectId', 'Assignment'].forEach(function(label) {{
+      var th = document.createElement('th');
+      th.textContent = label;
+      appsThead.appendChild(th);
+    }});
+    if (!entries.length) {{
+      var tr = document.createElement('tr');
+      var td = document.createElement('td');
+      td.colSpan = 4;
+      td.className = 'muted';
+      td.textContent = 'No service principals hold this directory role.';
+      tr.appendChild(td);
+      appsTbody.appendChild(tr);
+      return;
+    }}
+    entries.forEach(function(a, i) {{
+      var key = 'ra-' + i;
+      var tr = document.createElement('tr');
+      tr.setAttribute('data-sp-id', a.id);
+      tr.setAttribute('data-detail-key', key);
+      var expandTd = document.createElement('td');
+      expandTd.className = 'expand-cell';
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'icon-btn expand-btn';
+      btn.setAttribute('aria-label', 'View full details');
+      btn.textContent = '+';
+      expandTd.appendChild(btn);
+      tr.appendChild(expandTd);
+      var nameTd = document.createElement('td');
+      nameTd.textContent = a.name;
+      tr.appendChild(nameTd);
+      var idTd = document.createElement('td');
+      idTd.className = 'mono';
+      idTd.textContent = a.id;
+      tr.appendChild(idTd);
+      var assignTd = document.createElement('td');
+      assignTd.textContent = a.path ? ('via ' + a.path.join(' \u2192 ')) : 'Direct';
+      tr.appendChild(assignTd);
+      appsTbody.appendChild(tr);
+      var tdr = document.createElement('tr');
+      tdr.className = 'drawer';
+      tdr.setAttribute('data-detail-for', key);
+      var tdc = document.createElement('td');
+      tdc.colSpan = 4;
+      var tdb = document.createElement('div');
+      tdb.className = 'drawer-body';
+      tdc.appendChild(tdb);
+      tdr.appendChild(tdc);
+      appsTbody.appendChild(tdr);
+    }});
+  }}
+
+  function openRoleDrilldown(field, value) {{
+    titleEl.textContent = (FIELD_LABELS[field] || field) + ': ' + value;
+    tabsWrap.innerHTML = '';
+    var mkTab = function(id, label, active) {{
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'drawer-tab' + (active ? ' active' : '');
+      b.setAttribute('data-dtab', id);
+      b.textContent = label;
+      return b;
+    }};
+    var entries = ROLE_APPS[value] || [];
+    tabsWrap.appendChild(mkTab('users', 'Users', true));
+    tabsWrap.appendChild(mkTab('apps', 'Applications (' + entries.length + ')', false));
+    tabsWrap.classList.remove('hidden');
+    usersScroll.classList.remove('hidden');
+    appsScroll.classList.add('hidden');
+    fillAppsPane(value);
+    if (window.REPORT_SERVE && SERVE_DRILLDOWN_FIELDS[field]) {{
+      fetch('/api/drilldown?field=' + encodeURIComponent(field) + '&value=' + encodeURIComponent(value))
+        .then(function(r) {{ return r.json(); }})
+        .then(function(d) {{
+          if (!d || d.rows_html == null) {{ fillUsersLocal(field, value); return; }}
+          subtitleEl.textContent = d.subtitle;
+          theadRow.innerHTML = d.thead_html;
+          tbody.innerHTML = d.rows_html;
+        }})
+        .catch(function() {{ fillUsersLocal(field, value); }});
+    }} else {{
+      fillUsersLocal(field, value);
+    }}
     overlay.classList.remove('hidden');
   }}
+
+  tabsWrap.addEventListener('click', function(e) {{
+    var b = e.target.closest('.drawer-tab');
+    if (!b) return;
+    var id = b.getAttribute('data-dtab');
+    Array.prototype.forEach.call(tabsWrap.querySelectorAll('.drawer-tab'), function(x) {{
+      x.classList.toggle('active', x === b);
+    }});
+    usersScroll.classList.toggle('hidden', id !== 'users');
+    appsScroll.classList.toggle('hidden', id !== 'apps');
+  }});
 
   document.addEventListener('click', function(e) {{
     var badge = e.target.closest('.role-badge');
@@ -4612,7 +5107,11 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
           }}).join('') + '</ul>'
         : '<p class="muted">No owners recorded.</p>';
     var dirRolesHtml = (prof.dir_roles && prof.dir_roles.length)
-        ? '<p>' + prof.dir_roles.map(function(r) {{ return pSev(r.severity) + ' ' + pEsc(r.name); }}).join(' &nbsp;&middot;&nbsp; ') + '</p>'
+        ? '<p>' + prof.dir_roles.map(function(r) {{
+            var tag = pSev(r.severity) + ' ' + pEsc(r.name);
+            if (r.path) tag += ' <span class="muted">via ' + pEsc(r.path.join(' \u2192 ')) + '</span>';
+            return tag;
+          }}).join(' &nbsp;&middot;&nbsp; ') + '</p>'
         : '<p class="muted">No directory roles assigned.</p>';
     var groupsHtml = (prof.groups && prof.groups.length)
         ? '<p>' + prof.groups.map(function(g) {{ return pEsc(g.name); }}).join(', ') + '</p>'
@@ -4650,11 +5149,11 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
       ];
     }} else {{
       var gTitle = 'Roles granted to others (' + prof.granted_roles.length + ')';
-      var aTitle = 'Roles assigned to this principal (' + prof.assigned_roles.length + ')';
+      var aTitle = 'App roles assigned to this principal (' + prof.assigned_roles.length + ')';
       var gPane = minorTable([['Principal Name', 'principal_name'], ['Principal Type', 'principal_type'], ['Role', 'role'], ['Description', 'description']], prof.granted_roles)
           || '<p class="muted">No roles granted by this principal.</p>';
       var aPane = minorTable([['Principal Name', 'principal_name'], ['Principal Type', 'principal_type'], ['Role', 'role'], ['Application', 'application'], ['Description', 'description']], prof.assigned_roles)
-          || '<p class="muted">No roles assigned to this principal.</p>';
+          || '<p class="muted">No app-role assignments to this principal. Directory roles (incl. those inherited via group membership) are listed under Overview &rarr; Assigned roles.</p>';
       panes = [
         ['overview', 'Overview', overview],
         ['azure', 'Azure roles (' + (prof.az_roles ? prof.az_roles.length : 0) + ')', azTableHtml(prof.az_roles || [], false)],
@@ -4791,8 +5290,8 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     var ownersHtml = (g.owners && g.owners.length)
         ? '<p>' + g.owners.map(function(o) {{ return pEsc(o); }}).join(', ') + '</p>'
         : '<p class="muted">No owners recorded.</p>';
-    var membershipHtml = '<p class="muted">' + g.member_count + ' user member(s)';
-    if (g.sp_members && g.sp_members.length) membershipHtml += ' · ' + g.sp_members.length + ' SP member(s): ' + pEsc(g.sp_members.join(', '));
+    var membershipHtml = '<p class="muted">' + (g.user_member_count || 0) + ' user member(s)';
+    if (g.sp_members && g.sp_members.length) membershipHtml += ' · ' + g.sp_members.length + ' app member(s): ' + pEsc(g.sp_members.map(function(m) {{ return m.name; }}).join(', '));
     if (g.parents && g.parents.length) membershipHtml += ' · member of: ' + pEsc(g.parents.join(', '));
     if (g.children && g.children.length) membershipHtml += ' · contains groups: ' + pEsc(g.children.join(', '));
     membershipHtml += '</p>';
@@ -4820,23 +5319,61 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     var capped = allMembers.length > 500;
     var shownMembers = capped ? allMembers.slice(0, 500) : allMembers;
     var memberRows = shownMembers.map(function(m) {{
-      var roles = (m.roles || []).filter(function(r) {{ return r.severity !== 'Info'; }})
-          .map(function(r) {{ return r.name; }}).join(', ');
+      var roleHtml = (m.roles || []).filter(function(r) {{ return r.severity !== 'Info'; }})
+          .map(function(r) {{
+            var tag = pSev(r.severity) + ' ' + pEsc(r.name);
+            if (r.path && r.path.length > 1) {{
+              tag += ' <span class="muted">via ' + pEsc(r.path.join(' \u2192 ')) + '</span>';
+            }}
+            return tag;
+          }}).join(' ');
       return {{
         member: m.upn || m.name,
         name: (m.upn && m.name) ? m.name : '—',
-        roles: roles || '—',
+        roles: roleHtml || '—',
         priv: m.privileged ? 'Yes' : '—'
       }};
     }});
-    var membersHtml = minorTable([
-        ['Member', 'member'], ['Name', 'name'], ['Directory roles', 'roles'], ['Privileged', 'priv']
-      ], memberRows) || '<p class="muted">No user members recorded.</p>';
+    var membersHtml = memberRows.length
+        ? '<table class="minor-table"><thead><tr><th>Member</th><th>Name</th><th>Directory roles</th><th>Privileged</th></tr></thead><tbody>'
+          + memberRows.map(function(r) {{
+              return '<tr><td>' + pEsc(r.member) + '</td><td>' + pEsc(r.name) + '</td><td>' + r.roles + '</td><td>' + pEsc(r.priv) + '</td></tr>';
+            }}).join('') + '</tbody></table>'
+        : '<p class="muted">No user members recorded.</p>';
     if (capped) membersHtml += '<p class="muted">Showing first 500 of ' + allMembers.length + ' members.</p>';
+    var allSpMembers = g.sp_members || [];
+    var cappedSp = allSpMembers.length > 500;
+    var shownSpMembers = cappedSp ? allSpMembers.slice(0, 500) : allSpMembers;
+    var spMemberRows = shownSpMembers.map(function(m) {{
+      var roleHtml = (m.roles || []).filter(function(r) {{ return r.severity !== 'Info'; }})
+          .map(function(r) {{
+            var tag = pSev(r.severity) + ' ' + pEsc(r.name);
+            if (r.kind === 'app') {{
+              tag += ' <span class="muted">@ ' + pEsc(r.resource || 'app role') + '</span>';
+            }} else if (r.path && r.path.length > 1) {{
+              tag += ' <span class="muted">via ' + pEsc(r.path.join(' \u2192 ')) + '</span>';
+            }}
+            return tag;
+          }}).join(' ');
+      return {{
+        name: '<button type="button" class="dtab-sp-link obj-link" data-obj-id="' + pEsc(m.id) + '" data-obj-kind="sp">' + pEsc(m.name) + '</button>',
+        object_id: m.id,
+        roles: roleHtml || '—',
+        status: m.enabled ? 'Enabled' : 'Disabled'
+      }};
+    }});
+    var spMembersHtml = spMemberRows.length
+        ? '<table class="minor-table"><thead><tr><th>Service principal</th><th>ObjectId</th><th>Roles</th><th>Status</th></tr></thead><tbody>'
+          + spMemberRows.map(function(r) {{
+              return '<tr><td>' + r.name + '</td><td class="mono">' + pEsc(r.object_id) + '</td><td>' + r.roles + '</td><td>' + pEsc(r.status) + '</td></tr>';
+            }}).join('') + '</tbody></table>'
+        : '<p class="muted">No app (service principal) members recorded.</p>';
+    if (cappedSp) spMembersHtml += '<p class="muted">Showing first 500 of ' + allSpMembers.length + ' SP members.</p>';
     var panes = [
       ['overview', 'Overview', overview],
       ['azure', 'Azure roles (' + (g.az_roles ? g.az_roles.length : 0) + ')', azTableHtml(g.az_roles || [], false)],
-      ['members', 'Members (' + (g.member_count || 0) + ')', membersHtml]
+      ['user-members', 'User Members (' + (g.user_member_count || 0) + ')', membersHtml],
+      ['sp-members', 'App Members (' + (g.sp_members ? g.sp_members.length : 0) + ')', spMembersHtml]
     ];
     var tabsHtml = '<div class="drawer-tabs">' + panes.map(function(pt) {{
       return '<button type="button" class="drawer-tab' + (pt[0] === 'overview' ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pEsc(pt[1]) + '</button>';
@@ -4849,6 +5386,34 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     wrap.innerHTML = tabsHtml + panesHtml;
     container.appendChild(wrap);
     attachDrawerTabs(wrap);
+    Array.prototype.forEach.call(wrap.querySelectorAll('.obj-link'), function(b) {{
+      b.addEventListener('click', function() {{
+        var oid = b.getAttribute('data-obj-id');
+        var kind = b.getAttribute('data-obj-kind');
+        container.innerHTML = '';
+        var backRow = document.createElement('div');
+        backRow.className = 'drawer-back-row';
+        backRow.innerHTML = '<button type="button" class="drawer-tab drawer-back">&larr; Back to ' + pEsc(g.group_name || 'group') + '</button>';
+        container.appendChild(backRow);
+        Array.prototype.forEach.call(backRow.querySelectorAll('.drawer-back'), function(x) {{
+          x.addEventListener('click', function() {{
+            container.innerHTML = '';
+            renderGroupTabs(g, container);
+          }});
+        }});
+        var prof2 = PROFILES2.sp[oid];
+        if (prof2) {{
+          renderSpAppTabs(prof2, DETAILS.sp[oid] || null, container);
+          return;
+        }}
+        if (window.REPORT_SERVE && kind === 'sp') {{
+          fetchSpApp(oid, 'sp', container);
+          return;
+        }}
+        if (kind === 'sp') {{ container.appendChild(section('Service Principal', DETAILS.sp[oid] || null)); return; }}
+        container.appendChild(section('Application', DETAILS.app[oid] || null));
+      }});
+    }});
   }}
 
   function renderProfileTabs(p, container) {{
@@ -5963,7 +6528,8 @@ def main():
                                               args.include_disabled, entity_details_render,
                                               min_severity_label, entity_profiles_render,
                                               tenant_summary, graph=graph,
-                                              serve_mode=args.serve, serve_tables=serve_tables))
+                                              serve_mode=args.serve, serve_tables=serve_tables,
+                                              check_cfg=check_cfg))
 
     total = sum(len(res["findings"]) for res in results)
     print(f"Checks run: {', '.join(res['id'] for res in results) or 'none'}")
