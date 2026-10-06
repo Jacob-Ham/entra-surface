@@ -892,12 +892,15 @@ def check_priv_app_ownership(ctx):
 
     # SPs holding privileged (Critical/High) directory roles, directly or
     # through group membership — same ownership question as app-role grants.
+    # PIM-eligible roles are marker-only and never create ownership findings.
     role_sev = ctx["check_cfg"]["directory_roles"]
     group_roles = ctx["group_roles"]
+    group_eligible_roles = ctx.get("group_eligible_roles") or {}
     for principal_id in sorted(graph["sp"]):
         sp = graph["sp"][principal_id]
-        roles = [r for r in sp_directory_roles(graph, group_roles, principal_id, role_sev)
-                 if severity_rank(r["severity"]) <= severity_rank("High")]
+        roles = [r for r in sp_directory_roles(graph, group_roles, principal_id,
+                                               role_sev, group_eligible_roles)
+                 if not r.get("eligible") and severity_rank(r["severity"]) <= severity_rank("High")]
         if not roles:
             continue
         if not include_disabled and (not sp.get("accountEnabled") or sp.get("deletionTimestamp")):
@@ -1168,19 +1171,24 @@ def check_foreign_principal(ctx):
 def check_app_directory_roles(ctx):
     """One row per service principal holding directory roles — assigned directly
     or inherited through group membership (incl. nesting). Rated by the most
-    critical directory role per the 'directory_roles' config (unrated = Info)."""
+    critical active directory role per the 'directory_roles' config (unrated =
+    Info); PIM-eligible roles are marker-only and never raise the rating."""
     graph = ctx["graph"]
     group_roles = ctx["group_roles"]
+    group_eligible_roles = ctx.get("group_eligible_roles") or {}
     role_sev = ctx["check_cfg"]["directory_roles"]
     findings = []
     for sp_oid in sorted(graph["sp"]):
         rec = graph["sp"][sp_oid]
-        roles = sp_directory_roles(graph, group_roles, sp_oid, role_sev)
+        roles = sp_directory_roles(graph, group_roles, sp_oid, role_sev,
+                                   group_eligible_roles)
         if not roles:
             continue
-        severity = min((r["severity"] for r in roles), key=severity_rank)
-        parts = [r["name"] + ("" if r["path"] is None
-                              else f" (via {' \u2192 '.join(r['path'])})")
+        active = [r for r in roles if not r.get("eligible")]
+        severity = min((r["severity"] for r in active), key=severity_rank) if active else "Info"
+        parts = [r["name"] + (" (PIM eligible)" if r.get("eligible") else "")
+                 + ("" if r["path"] is None
+                    else f" (via {' \u2192 '.join(r['path'])})")
                  for r in roles]
         f = make_finding(
             check_id="app_dir_roles", category="apps",
@@ -1234,6 +1242,7 @@ def check_privileged_users(ctx):
     # ---- role-capable groups (shared with the groups check) ---------------
     capable = ctx["capable_groups"]
     group_roles = ctx["group_roles"]
+    group_eligible_roles = ctx.get("group_eligible_roles") or {}
 
     # ---- privileged app grants per SP ------------------------------------
     grants_by_sp = {}  # sp_oid -> [(permission, severity, resource)]
@@ -1340,12 +1349,21 @@ def check_privileged_users(ctx):
                 gid, group_roles, graph["group_member_group"], group_name)
         return group_path_cache[gid]
 
+    eligible_path_cache = {}
+
+    def eligible_paths_for(gid):
+        if gid not in eligible_path_cache:
+            eligible_path_cache[gid] = resolve_group_role_paths(
+                gid, group_eligible_roles, graph["group_member_group"], group_name)
+        return eligible_path_cache[gid]
+
     for gid, uids in graph["group_member_user"].items():
         rec = graph["group"].get(gid)
         if not rec:
             continue
         gname = rec.get("displayName") or gid
         inherited = path_roles_for(gid)
+        inherited_eligible = eligible_paths_for(gid)
         for uid in uids:
             p = ensure(uid)
             p["member_count"] += 1
@@ -1362,6 +1380,11 @@ def check_privileged_users(ctx):
             for r in inherited:
                 p["roles"].append({"name": r["name"], "severity": r["severity"],
                                    "source": "via " + " \u2192 ".join(r["path"])})
+            # PIM-eligible roles inherited through this group (incl. nesting)
+            for r in inherited_eligible:
+                p["eligible_roles"].append({"name": r["name"], "severity": r["severity"],
+                                            "source": "PIM eligible via "
+                                                      + " \u2192 ".join(r["path"])})
     for gid, uids in graph["group_owner_user"].items():
         for uid in uids:
             p = ensure(uid)
@@ -2113,12 +2136,18 @@ def compute_group_roles(graph, check_cfg):
     return group_roles
 
 
-def sp_directory_roles(graph, group_roles, sp_oid, role_sev):
-    """Directory roles held by a service principal: direct memberships plus
-    roles inherited through group membership (incl. nesting), each with the
-    group path to the role-bearing group (None when assigned directly)."""
+def sp_directory_roles(graph, group_roles, sp_oid, role_sev, group_eligible_roles=None):
+    """Directory roles held by a service principal: direct memberships and
+    assignments plus roles inherited through group membership (incl. nesting).
+    Each entry carries the group path to the role-bearing group (None when
+    assigned directly) and an 'eligible' flag — PIM-eligible roles are marker
+    data and never affect severity ratings."""
     def _dir_role_name(oid):
         rec = graph["directory_role"].get(oid)
+        return rec.get("displayName") if rec else oid
+
+    def _def_name(oid):
+        rec = graph["role_definition"].get(oid)
         return rec.get("displayName") if rec else oid
 
     def _group_label(gid):
@@ -2129,7 +2158,8 @@ def sp_directory_roles(graph, group_roles, sp_oid, role_sev):
     for role_oid, member in graph["role_member_sp"]:
         if member == sp_oid:
             name = _dir_role_name(role_oid)
-            roles.append({"name": name, "severity": role_sev.get(name, "Info"), "path": None})
+            roles.append({"name": name, "severity": role_sev.get(name, "Info"),
+                          "path": None, "eligible": False})
     seen = {r["name"] for r in roles}
     for gid, members in graph["group_member_sp"].items():
         if sp_oid not in members:
@@ -2139,15 +2169,35 @@ def sp_directory_roles(graph, group_roles, sp_oid, role_sev):
             if r["name"] not in seen:
                 seen.add(r["name"])
                 roles.append({"name": r["name"], "severity": r["severity"],
-                              "path": list(r["path"])})
+                              "path": list(r["path"]), "eligible": False})
+    # PIM-eligible directory roles (direct assignments + via groups): marker
+    # only — shown with an '(eligible)' marker, never rated.
+    if group_eligible_roles is not None:
+        for ea in graph["eligible_role_assigns"]:
+            if ea["principal_id"] == sp_oid:
+                name = _def_name(ea["role_definition_id"])
+                if name not in seen:
+                    seen.add(name)
+                    roles.append({"name": name, "severity": role_sev.get(name, "Info"),
+                                  "path": None, "eligible": True})
+        for gid, members in graph["group_member_sp"].items():
+            if sp_oid not in members:
+                continue
+            for r in resolve_group_role_paths(gid, group_eligible_roles,
+                                              graph["group_member_group"], _group_label):
+                if r["name"] not in seen:
+                    seen.add(r["name"])
+                    roles.append({"name": r["name"], "severity": r["severity"],
+                                  "path": list(r["path"]), "eligible": True})
     return roles
 
 
-def build_role_applications(graph, group_roles):
+def build_role_applications(graph, group_roles, group_eligible_roles=None):
     """Directory role displayName -> service principals holding that role
     (direct memberships/assignments, plus via group membership incl. nesting).
-    Each entry: {"id", "name", "path"} where path is the group chain to the
-    role-bearing group (None = assigned directly). Drives the 'Applications'
+    Each entry: {"id", "name", "path", "eligible"} where path is the group
+    chain to the role-bearing group (None = assigned directly) and eligible
+    marks PIM-eligible assignments (marker-only). Drives the 'Applications'
     tab of the directory-role drilldown."""
     def _sp_label(sp_oid):
         rec = graph["sp"].get(sp_oid)
@@ -2167,11 +2217,13 @@ def build_role_applications(graph, group_roles):
 
     index = defaultdict(list)
 
-    def add(role, sp_oid, path):
+    def add(role, sp_oid, path, eligible=False):
         for existing in index[role]:
-            if existing["id"] == sp_oid and existing["path"] == path:
+            if existing["id"] == sp_oid and existing["path"] == path \
+                    and existing.get("eligible") == eligible:
                 return
-        index[role].append({"id": sp_oid, "name": _sp_label(sp_oid), "path": path})
+        index[role].append({"id": sp_oid, "name": _sp_label(sp_oid), "path": path,
+                            "eligible": eligible})
 
     for role_oid, sp_oid in graph["role_member_sp"]:
         add(_role_name(role_oid), sp_oid, None)
@@ -2184,9 +2236,49 @@ def build_role_applications(graph, group_roles):
             for sp_oid in sp_ids:
                 if sp_oid in graph["sp"]:
                     add(r["name"], sp_oid, r["path"])
+    if group_eligible_roles:
+        for ea in graph["eligible_role_assigns"]:
+            if ea["principal_id"] in graph["sp"]:
+                name = _def_name(ea["role_definition_id"])
+                # eligible marker only matters when the role isn't held actively
+                if not any(e["id"] == ea["principal_id"] and not e.get("eligible")
+                           for e in index[name]):
+                    add(name, ea["principal_id"], None, eligible=True)
+        for gid, sp_ids in graph["group_member_sp"].items():
+            for r in resolve_group_role_paths(gid, group_eligible_roles,
+                                              graph["group_member_group"], _group_label):
+                for sp_oid in sp_ids:
+                    if sp_oid in graph["sp"] and not any(
+                            e["id"] == sp_oid and not e.get("eligible")
+                            for e in index[r["name"]]):
+                        add(r["name"], sp_oid, r["path"], eligible=True)
     for role in index:
         index[role].sort(key=lambda e: (e["name"] or "").lower())
     return dict(index)
+
+
+def compute_group_eligible_roles(graph, check_cfg):
+    """{group_id: [{"name", "severity"}]} - PIM-eligible directory roles carried
+    by each group (EligibleRoleAssignments whose principal is a group). Marker
+    data: eligible roles never affect severity ratings on groups/SPs."""
+    role_sev = check_cfg["directory_roles"]
+
+    def _gdef_name(oid):
+        rec = graph["role_definition"].get(oid)
+        return rec.get("displayName") if rec else oid
+
+    def _gsev(name):
+        return role_sev.get(name, "Info")
+
+    out = defaultdict(list)
+    for ea in graph["eligible_role_assigns"]:
+        if ea["principal_id"] in graph["group"]:
+            name = _gdef_name(ea["role_definition_id"])
+            out[ea["principal_id"]].append({"name": name, "severity": _gsev(name)})
+    for gid in list(out):
+        seen = set()
+        out[gid] = [r for r in out[gid] if not (r["name"] in seen or seen.add(r["name"]))]
+    return out
 
 
 def check_groups(ctx):
@@ -2199,6 +2291,7 @@ def check_groups(ctx):
     role_sev = ctx["check_cfg"]["directory_roles"]
     capable = ctx["capable_groups"]
     group_roles = ctx["group_roles"]
+    group_eligible_roles = ctx.get("group_eligible_roles") or {}
 
     def sev_of(name):
         return role_sev.get(name, "Info")
@@ -2287,6 +2380,7 @@ def check_groups(ctx):
                           key=lambda a: (a.get("eligible", False), a["role"].lower()))
 
         dir_roles = group_roles.get(gid, [])
+        eligible_roles = group_eligible_roles.get(gid, [])
         group_role_tags = role_paths_for(gid)
         parents = sorted((graph["group"][p].get("displayName") or p)
                          for p, children in graph["group_member_group"].items() if gid in children)
@@ -2355,6 +2449,8 @@ def check_groups(ctx):
         parts = []
         if dir_roles:
             parts.append("grants " + ", ".join(sorted({r["name"] for r in dir_roles})))
+        if eligible_roles:
+            parts.append(f"{len(eligible_roles)} PIM-eligible role(s)")
         if assignable:
             parts.append("assignable to role")
         if dynamic:
@@ -2389,6 +2485,7 @@ def check_groups(ctx):
         f["dynamic"] = dynamic
         f["assignable"] = assignable
         f["dir_roles"] = dir_roles
+        f["eligible_roles"] = eligible_roles
         f["parents"] = parents
         f["children"] = children
         f["owners"] = owners
@@ -2753,9 +2850,11 @@ def run_checks(graph, config_resources, check_cfg, args):
                         changed = True
 
     group_roles = compute_group_roles(graph, check_config)
+    group_eligible_roles = compute_group_eligible_roles(graph, check_config)
 
     ctx["capable_groups"] = capable_groups
     ctx["group_roles"] = group_roles
+    ctx["group_eligible_roles"] = group_eligible_roles
 
     results = []
     for spec in selected:
@@ -2819,7 +2918,8 @@ def run_checks(graph, config_resources, check_cfg, args):
     def sp_dir_tags(sp_oid):
         if sp_oid not in sp_dir_cache:
             sp_dir_cache[sp_oid] = sp_directory_roles(
-                graph, group_roles, sp_oid, check_config["directory_roles"])
+                graph, group_roles, sp_oid, check_config["directory_roles"],
+                group_eligible_roles)
         return sp_dir_cache[sp_oid]
 
     for res in results:
@@ -2837,7 +2937,11 @@ def run_checks(graph, config_resources, check_cfg, args):
                 continue
             f["dir_role_tags"] = sorted(
                 merged.values(), key=lambda r: severity_rank(r["severity"]))
-            best_rank = min(severity_rank(r["severity"]) for r in f["dir_role_tags"])
+            # eligible (PIM) roles are marker-only: rate by active roles alone
+            active = [r for r in f["dir_role_tags"] if not r.get("eligible")]
+            if not active:
+                continue
+            best_rank = min(severity_rank(r["severity"]) for r in active)
             if best_rank < severity_rank(f["severity"]):
                 f["severity"] = next(
                     sev for sev, rank in SEVERITY_ORDER.items() if rank == best_rank)
@@ -2931,6 +3035,7 @@ def build_entity_profiles(graph, check_cfg, sp_ids, app_ids):
     role_sev = check_cfg["directory_roles"]
     role_labels = check_cfg.get("role_labels") or {}
     group_roles = compute_group_roles(graph, check_cfg)
+    group_eligible_roles = compute_group_eligible_roles(graph, check_cfg)
     app_roles_cache = {}  # sp_oid -> {role_id: {value, description}}
 
     def catalog_entry(value, description):
@@ -2974,7 +3079,7 @@ def build_entity_profiles(graph, check_cfg, sp_ids, app_ids):
         return sp_label(pid)
 
     def dir_roles_for(sp_oid):
-        return sp_directory_roles(graph, group_roles, sp_oid, role_sev)
+        return sp_directory_roles(graph, group_roles, sp_oid, role_sev, group_eligible_roles)
 
     def groups_for(sp_oid):
         return [{"name": graph["group"][g].get("displayName") or g}
@@ -3186,14 +3291,16 @@ def cap_annotate(items):
 
 # Column index -> sort key for the privileged-users table (serve mode)
 USER_SORT_KEYS = {
-    "1": "severity", "2": "name", "3": "upn", "4": "roles", "5": "privapps",
-    "6": "capgroups", "7": "grpowned", "8": "caexcl", "9": "hybrid", "10": "status",
+    "1": "severity", "2": "name", "3": "upn", "4": "roles", "5": "eligible",
+    "6": "privapps", "7": "capgroups", "8": "grpowned", "9": "caexcl",
+    "10": "hybrid", "11": "status",
 }
 
 
 def user_search_text(f):
     parts = [f.get("user_display") or "", f.get("user_upn") or "", f.get("severity") or ""]
     parts += [r["name"] for r in f.get("roles", [])]
+    parts += [r["name"] for r in f.get("eligible_roles", [])]
     parts += [g.get("name") or "" for g in f.get("groups", [])]
     parts += [a.get("role", "") for a in f.get("az_roles", [])]
     if f.get("hybrid"):
@@ -3210,6 +3317,8 @@ def user_sort_value(f, key):
         return (f.get("user_upn") or "").lower()
     if key == "roles":
         return ", ".join(r["name"] for r in f.get("roles", [])).lower()
+    if key == "eligible":
+        return len(f.get("eligible_roles", []))
     if key == "privapps":
         return len(f.get("priv_apps", []))
     if key == "capgroups":
@@ -3247,6 +3356,10 @@ def user_rows_html(findings, start=0, stop=None, q="", sort_key=None, desc=False
         role_chips = "".join(
             f'<span class="badge {severity_class(r["severity"])} role-badge" data-role="{esc(r["name"])}" data-role-field="roles" title="{esc(r["source"])}">{esc(r["name"])}</span> '
             for r in f["roles"])
+        elig = f.get("eligible_roles") or []
+        elig_titles = "\n".join(f"{r['name']} ({r['source']})" for r in elig)
+        elig_cell = (f'<span class="perm" title="{esc(elig_titles)}">{len(elig)}</span>'
+                     if elig else '<span class="muted">&mdash;</span>')
         priv_titles = []
         for app in f["priv_apps"]:
             perms = ", ".join(g["permission"] for g in app["grants"])
@@ -3266,13 +3379,14 @@ def user_rows_html(findings, start=0, stop=None, q="", sort_key=None, desc=False
           <td class="clickable" data-field="user" data-value="{esc(f["user_display"])}">{esc(f["user_display"])}{guest}</td>
           <td class="clickable" data-field="userUpn" data-value="{esc(f["user_upn"])}">{esc(f["user_upn"])}</td>
           <td data-field="roles" data-value="{esc(', '.join(r["name"] for r in f["roles"]))}">{role_chips}</td>
+          <td class="clickable" data-field="eligible" data-value="{esc(', '.join(r['name'] for r in elig))}">{elig_cell}</td>
           <td data-field="privApps" data-value="{esc(str(len(f["priv_apps"])))}"><span class="perm" title="{esc(chr(10).join(priv_titles))}">{len(f["priv_apps"])}</span></td>
           <td data-field="capGroups" data-value="{esc(str(len(f["cap_member"])))}"><span class="perm" title="{esc(cap_titles)}">{len(f["cap_member"])}</span></td>
           <td data-field="grpOwned" data-value="{esc(str(f["owned_count"]))}"><span class="perm" title="{esc(owned_titles or '')}">{f["owned_count"]}</span></td>
           <td data-field="caExcl" data-value="{esc(str(ca_count))}"><span class="perm" title="{esc(ca_titles)}">{ca_cell}</span></td>
           <td data-field="hybrid" data-value="{esc('AD' if f['hybrid'] else 'Cloud')}">{account_source}</td>
           <td data-field="userStatus" data-value="{esc('Enabled' if f['user_enabled'] else 'Disabled')}">{bool_badge(f["user_enabled"])}</td>
-        </tr>{drawer_for_html(key, 11)}""")
+        </tr>{drawer_for_html(key, 12)}""")
     return out, len(items)
 
 
@@ -3479,12 +3593,22 @@ def app_dir_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=N
     for f in selected:
         key = f"row-{len(out)}"
         tags = f.get("dir_role_tags", [])
-        role_chips = "".join(
-            f'<span class="badge {severity_class(r["severity"])} role-badge" '
-            f'data-role="{esc(r["name"])}" data-role-field="roles" '
-            f'title="{esc(r["name"] + " \u2014 via " + " \u2192 ".join(r["path"]) if r.get("path") else r["name"] + " \u2014 direct assignment")}">'
-            f'{esc(r["name"])}</span> '
-            for r in tags)
+
+        def role_chip(r):
+            if r.get("eligible"):
+                title = r["name"] + " \u2014 PIM eligible"
+                if r.get("path"):
+                    title += " \u2014 via " + " \u2192 ".join(r["path"])
+                label = f'{esc(r["name"])} <span class="muted">(PIM)</span>'
+            else:
+                title = (r["name"] + " \u2014 via " + " \u2192 ".join(r["path"])
+                         if r.get("path") else r["name"] + " \u2014 direct assignment")
+                label = r["name"]
+            return (f'<span class="badge {severity_class(r["severity"])} role-badge" '
+                    f'data-role="{esc(r["name"])}" data-role-field="roles" '
+                    f'title="{esc(title)}">{label}</span> ')
+
+        role_chips = "".join(role_chip(r) for r in tags)
         out.append(f"""
         <tr data-sp-id="{esc(f.get("sp_id") or "")}" data-detail-key="{key}">
           <td class="expand-cell">{EXPAND_BUTTON_HTML}</td>
@@ -3501,8 +3625,9 @@ def app_dir_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=N
 
 def group_search_text(f):
     roles = ", ".join(r["name"] for r in f.get("dir_roles", []))
+    elig = ", ".join(r["name"] for r in f.get("eligible_roles", []))
     return " ".join([f.get("group_name") or "", f.get("severity") or "",
-                     roles, " ".join(f.get("types", []))]).lower()
+                     roles, elig, " ".join(f.get("types", []))]).lower()
 
 
 def group_sort_value(f, key):
@@ -3511,13 +3636,14 @@ def group_sort_value(f, key):
         "2": (f.get("group_name") or "").lower(),
         "3": " ".join(f.get("types", [])).lower(),
         "4": ", ".join(r["name"] for r in f.get("dir_roles", [])).lower(),
-        "5": f.get("member_count", 0),
-        "6": f.get("priv_member_count", 0),
-        "7": len(f.get("owners", [])),
+        "5": len(f.get("eligible_roles", [])),
+        "6": f.get("member_count", 0),
+        "7": f.get("priv_member_count", 0),
+        "8": len(f.get("owners", [])),
     }.get(key, 0)
 
 
-GROUP_SORT_KEYS = {str(i): str(i) for i in range(1, 8)}
+GROUP_SORT_KEYS = {str(i): str(i) for i in range(1, 9)}
 
 
 def group_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None):
@@ -3552,6 +3678,8 @@ def group_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=Non
              + " — " + ", ".join(r["name"] for r in m["roles"]))
             for m in f["members"] if m["privileged"])
         owner_titles = "\n".join(f["owners"])
+        elig = f.get("eligible_roles") or []
+        elig_titles = "\n".join(f"{r['name']} (PIM eligible)" for r in elig)
         out.append(f"""
         <tr data-group-id="{esc(f["group_id"])}" data-detail-key="{key}">
           <td class="expand-cell">{EXPAND_BUTTON_HTML}</td>
@@ -3559,10 +3687,11 @@ def group_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=Non
           <td class="clickable" data-field="group" data-value="{esc(f["group_name"])}">{esc(f["group_name"])}</td>
           <td data-field="grpType" data-value="{esc(', '.join(f['types'] + (['Public'] if f['is_public'] else []) + (['assignable'] if f['assignable'] else []) + (['dynamic'] if f['dynamic'] else [])))}">{''.join(type_chips) or '<span class="muted">&mdash;</span>'}</td>
           <td data-field="grpRoles" data-value="{esc(', '.join(r['name'] for r in f['dir_roles']))}">{role_chips or '<span class="muted">&mdash;</span>'}</td>
+          <td class="clickable" data-field="eligible" data-value="{esc(', '.join(r['name'] for r in elig))}"><span class="perm" title="{esc(elig_titles or '')}">{len(elig) if elig else '<span class="muted">&mdash;</span>'}</span></td>
           <td data-field="grpMembers" data-value="{esc(str(f['member_count']))}"><span class="perm" title="{esc(member_titles or '')}">{f['member_count']}</span></td>
           <td data-field="grpPriv" data-value="{esc(str(f['priv_member_count']))}"><span class="perm" title="{esc(priv_titles or '')}">{f['priv_member_count']}</span></td>
           <td data-field="grpOwners" data-value="{esc(str(len(f['owners'])))}"><span class="perm" title="{esc(owner_titles or '')}">{len(f['owners'])}</span></td>
-        </tr>{drawer_for_html(key, 8)}""")
+        </tr>{drawer_for_html(key, 9)}""")
     return out, total
 
 
@@ -3977,7 +4106,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         if serve_tables is not None:
             serve_tables["groups-table"] = {"findings": res["findings"], "rows": group_rows_html,
                                             "search": group_search_text,
-                                            "sort_keys": GROUP_SORT_KEYS, "colspan": 8}
+                                            "sort_keys": GROUP_SORT_KEYS, "colspan": 9}
         pager = serve_pager() if serve_mode else ""
         return f"""
   <section data-category="groups">
@@ -3987,7 +4116,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
       <colgroup>
         <col style="width:44px">
         <col style="width:100px"><col style="width:220px"><col style="width:180px"><col style="width:200px">
-        <col style="width:70px"><col style="width:80px"><col style="width:110px">
+        <col style="width:70px"><col style="width:70px"><col style="width:80px"><col style="width:110px">
       </colgroup>
       <thead>
         <tr>
@@ -3996,6 +4125,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
           <th data-type="text">Group</th>
           <th data-type="text">Type</th>
           <th data-type="text">Directory roles</th>
+          <th data-type="text">Eligible</th>
           <th data-type="text">Members</th>
           <th data-type="text">Priv. members</th>
           <th data-type="text">Owners</th>
@@ -4052,7 +4182,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         if serve_tables is not None:
             serve_tables["privileged-users-table"] = {
                 "findings": res["findings"], "rows": user_rows_html,
-                "search": user_search_text, "sort_keys": USER_SORT_KEYS, "colspan": 11}
+                "search": user_search_text, "sort_keys": USER_SORT_KEYS, "colspan": 12}
         rows = "" if serve_mode else "".join(user_rows_html(res["findings"])[0])
         pager = serve_pager() if serve_mode else ""
         return f"""
@@ -4063,7 +4193,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
       <colgroup>
         <col style="width:44px">
         <col style="width:90px"><col style="width:170px"><col style="width:190px"><col style="width:200px">
-        <col style="width:70px"><col style="width:70px"><col style="width:70px"><col style="width:70px"><col style="width:90px"><col style="width:80px">
+        <col style="width:70px"><col style="width:70px"><col style="width:70px"><col style="width:70px"><col style="width:70px"><col style="width:90px"><col style="width:80px">
       </colgroup>
       <thead>
         <tr>
@@ -4072,6 +4202,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
           <th data-type="text">User</th>
           <th data-type="text">UPN</th>
           <th data-type="text">Directory roles</th>
+          <th data-type="text">Eligible</th>
           <th data-type="text">Priv apps</th>
           <th data-type="text">Capable grp</th>
           <th data-type="text">Groups owned</th>
@@ -4289,7 +4420,8 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     # directory role -> service principals holding it (drilldown 'Applications' tab);
     # small index, embedded in serve mode too
     role_apps_json = json.dumps(
-        build_role_applications(graph, compute_group_roles(graph, check_cfg or {})),
+        build_role_applications(graph, compute_group_roles(graph, check_cfg or {}),
+                                compute_group_eligible_roles(graph, check_cfg or {})),
         default=str).replace("</", "<\\/")
 
     # ---- tabs ------------------------------------------------------------
@@ -4744,7 +4876,8 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     resource: 'Resource', permission: 'Permission', spStatus: 'SP Status',
     target: 'Target', targetType: 'Target Type', id: 'Object ID', status: 'Target Status',
     pw: 'Passwords', keys: 'Keys', roleCount: 'Role assignment',
-    userUpn: 'UPN', roles: 'Directory roles', privApps: 'Privileged apps owned',
+    userUpn: 'UPN', roles: 'Directory roles', eligible: 'Eligible roles',
+    privApps: 'Privileged apps owned',
     capGroups: 'Role-capable group memberships', grpOwned: 'Groups owned',
     group: 'Group', grpType: 'Type', grpRoles: 'Directory roles',
     grpMembers: 'Members', grpPriv: 'Privileged members', grpOwners: 'Owners',
@@ -4767,6 +4900,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     permission: ['app', 'ownerUpn', 'resource', 'severity', 'spStatus'],
     target:     ['targetType', 'id', 'roleCount', 'pw', 'keys', 'severity', 'status'],
     roles:      ['userUpn', 'privApps', 'capGroups', 'grpOwned', 'severity'],
+    eligible:   ['userUpn', 'group', 'severity'],
     group:      ['group', 'grpType', 'grpRoles', 'grpMembers', 'grpPriv', 'grpOwners', 'severity'],
     grpRoles:   ['group', 'grpMembers', 'grpPriv', 'severity'],
     polName:    ['polState', 'polScope', 'polApps', 'polControls', 'polInc', 'polExc', 'severity'],
@@ -4827,11 +4961,11 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     appsScroll.classList.add('hidden');
   }}
 
-  var CONTAINS_FIELDS = {{ roles: true, grpRoles: true, dynMods: true, dynAttrs: true, azRoles: true, azUsrRoles: true, azSpRoles: true }};
+  var CONTAINS_FIELDS = {{ roles: true, eligible: true, grpRoles: true, dynMods: true, dynAttrs: true, azRoles: true, azUsrRoles: true, azSpRoles: true }};
   var SERVE_DRILLDOWN_FIELDS = {{
     owner: 1, ownerUpn: 1, ownerStatus: 1, app: 1, resource: 1, permission: 1,
     spStatus: 1, target: 1, targetType: 1, id: 1, roleCount: 1, pw: 1, keys: 1,
-    status: 1, user: 1, userUpn: 1, roles: 1, privApps: 1, capGroups: 1,
+    status: 1, user: 1, userUpn: 1, roles: 1, eligible: 1, privApps: 1, capGroups: 1,
     grpOwned: 1, hybrid: 1, userStatus: 1, caExcl: 1, group: 1, grpType: 1,
     grpRoles: 1, grpMembers: 1, grpPriv: 1, grpOwners: 1, severity: 1,
     polName: 1, polState: 1, polScope: 1, polApps: 1, polControls: 1,
@@ -4968,7 +5102,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
       idTd.textContent = a.id;
       tr.appendChild(idTd);
       var assignTd = document.createElement('td');
-      assignTd.textContent = a.path ? ('via ' + a.path.join(' \u2192 ')) : 'Direct';
+      assignTd.textContent = (a.eligible ? '(eligible) ' : '') + (a.path ? ('via ' + a.path.join(' \u2192 ')) : 'Direct');
       tr.appendChild(assignTd);
       appsTbody.appendChild(tr);
       var tdr = document.createElement('tr');
@@ -5180,6 +5314,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     var dirRolesHtml = (prof.dir_roles && prof.dir_roles.length)
         ? '<p>' + prof.dir_roles.map(function(r) {{
             var tag = pSev(r.severity) + ' ' + pEsc(r.name);
+            if (r.eligible) tag += ' <span class="muted">(eligible)</span>';
             if (r.path) tag += ' <span class="muted">via ' + pEsc(r.path.join(' \u2192 ')) + '</span>';
             return tag;
           }}).join(' &nbsp;&middot;&nbsp; ') + '</p>'
@@ -5358,6 +5493,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     var dirRolesHtml = (g.dir_roles && g.dir_roles.length)
         ? '<p>' + g.dir_roles.map(function(r) {{ return pSev(r.severity) + ' ' + pEsc(r.name); }}).join(' &nbsp;&middot;&nbsp; ') + '</p>'
         : '<p class="muted">No directory roles assigned to this group.</p>';
+    var eligRolesHtml = (g.eligible_roles && g.eligible_roles.length)
+        ? '<p>' + g.eligible_roles.map(function(r) {{ return pSev(r.severity) + ' ' + pEsc(r.name) + ' <span class="muted">(PIM eligible)</span>'; }}).join(' &nbsp;&middot;&nbsp; ') + '</p>'
+        : '';
     var ownersHtml = (g.owners && g.owners.length)
         ? '<p>' + g.owners.map(function(o) {{ return pEsc(o); }}).join(', ') + '</p>'
         : '<p class="muted">No owners recorded.</p>';
@@ -5384,6 +5522,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     var overview = kv
         + dynHtml
         + pSection('Directory roles (' + ((g.dir_roles || []).length) + ')', dirRolesHtml)
+        + (eligRolesHtml ? pSection('Eligible (PIM) roles (' + g.eligible_roles.length + ')', eligRolesHtml) : '')
         + pSection('Owners (' + ((g.owners || []).length) + ')', ownersHtml)
         + pSection('Membership', membershipHtml);
     var allMembers = g.members || [];
@@ -6218,7 +6357,8 @@ SERVE_FIELD_LABELS = {
     "resource": "Resource", "permission": "Permission", "spStatus": "SP Status",
     "target": "Target", "targetType": "Target Type", "id": "Object ID",
     "status": "Target Status", "pw": "Passwords", "keys": "Keys", "roleCount": "Role assignment",
-    "userUpn": "UPN", "roles": "Directory roles", "privApps": "Privileged apps owned",
+    "userUpn": "UPN", "roles": "Directory roles", "eligible": "Eligible roles",
+    "privApps": "Privileged apps owned",
     "capGroups": "Role-capable group memberships", "grpOwned": "Groups owned",
     "hybrid": "Account Source", "caExcl": "CA exclusions", "userStatus": "Status",
     "group": "Group", "grpType": "Type", "grpRoles": "Directory roles",
@@ -6239,6 +6379,7 @@ SERVE_DRILLDOWN_COLUMNS = {
     "permission": ["app", "ownerUpn", "resource", "severity", "spStatus"],
     "target":     ["targetType", "id", "roleCount", "pw", "keys", "severity", "status"],
     "roles":      ["userUpn", "privApps", "capGroups", "grpOwned", "severity"],
+    "eligible":   ["userUpn", "group", "severity"],
     "group":      ["group", "grpType", "grpRoles", "grpMembers", "grpPriv", "grpOwners", "severity"],
     "grpRoles":   ["group", "grpMembers", "grpPriv", "severity"],
     "polName":    ["polState", "polScope", "polApps", "polControls", "polInc", "polExc", "severity"],
@@ -6248,7 +6389,7 @@ SERVE_DRILLDOWN_COLUMNS = {
     "dynMods":    ["dynGroup", "dynRule", "dynAttrs"],
 }
 
-SERVE_CONTAINS_FIELDS = {"roles", "grpRoles", "dynMods", "dynAttrs"}
+SERVE_CONTAINS_FIELDS = {"roles", "eligible", "grpRoles", "dynMods", "dynAttrs"}
 
 
 def build_serve_records(results):
@@ -6270,6 +6411,7 @@ def build_serve_records(results):
             if res["id"] == "privileged_users":
                 add({"user": f.get("user_display") or "", "userUpn": f.get("user_upn") or "",
                      "roles": ", ".join(r["name"] for r in f.get("roles", [])),
+                     "eligible": ", ".join(r["name"] for r in f.get("eligible_roles", [])),
                      "privApps": str(len(f.get("priv_apps", []))),
                      "capGroups": str(len(f.get("cap_member", []))),
                      "grpOwned": str(f.get("owned_count", 0)),
@@ -6283,6 +6425,7 @@ def build_serve_records(results):
                 add({"group": f.get("group_name") or "",
                      "grpType": ", ".join(f.get("types", [])),
                      "grpRoles": ", ".join(r["name"] for r in f.get("dir_roles", [])),
+                     "eligible": ", ".join(r["name"] for r in f.get("eligible_roles", [])),
                      "grpMembers": str(f.get("member_count", 0)),
                      "grpPriv": str(f.get("priv_member_count", 0)),
                      "grpOwners": str(len(f.get("owners", []))),
