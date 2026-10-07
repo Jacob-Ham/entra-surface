@@ -259,6 +259,337 @@ def is_privileged(severity):
 
 
 # ---------------------------------------------------------------------------
+# Advanced filter query language (shared semantics with the report JS — the
+# JS side implements the same grammar in the filter module; both are pinned
+# against the same test vectors in tests/filter_cases.json).
+#
+#   expr      := and ("OR" and)*
+#   and       := term ("AND" term)*
+#   term      := "(" expr ")" | "NOT" term | predicate
+#   predicate := field:value | field:contains:value | contains:value | text
+#
+# Operators are case-insensitive; values can be quoted for spaces. Equality on
+# comma-list fields means membership. Bare text / contains: matches substrings
+# anywhere in the row.
+# ---------------------------------------------------------------------------
+
+ADV_LIST_FIELDS = {
+    "roles", "eligible", "grpRoles", "dynmods", "dynattrs",
+    "azroles", "azusrroles", "azsproles", "adtags", "appdirroles",
+    # serve-side owned-table rows merge all owners into one map
+    "owner", "ownerupn", "ownerstatus",
+}
+
+
+class AdvancedParseError(ValueError):
+    pass
+
+
+# Column-name aliases for the filter language: users write the names shown in
+# the report (or the short internal names); both resolve to one or more DOM
+# field names, matched with any-of semantics. Mirrored in the JS filter module.
+ADV_COLUMN_ALIASES = {
+    "privileges": ["severity"], "severity": ["severity"], "sev": ["severity"],
+    "roles": ["roles", "grproles", "appdirroles"],
+    "grproles": ["grproles"], "appdirroles": ["appdirroles"],
+    "eligible": ["eligible"],
+    "user": ["user"], "upn": ["userupn"], "userupn": ["userupn"],
+    "privapps": ["privapps"], "capablegrp": ["capgroups"], "capgroups": ["capgroups"],
+    "groupsowned": ["grpowned"], "grpowned": ["grpowned"], "caexcl": ["caexcl"],
+    "accountsource": ["hybrid"], "hybrid": ["hybrid"],
+    "status": ["userstatus", "status", "spstatus", "ownerstatus", "adstatus"],
+    "userstatus": ["userstatus"], "spstatus": ["spstatus"],
+    "ownerstatus": ["ownerstatus"], "adstatus": ["adstatus"],
+    "target": ["target"], "targettype": ["targettype"],
+    "objectid": ["id"], "id": ["id"],
+    "passwords": ["pw"], "pw": ["pw"], "keys": ["keys"],
+    "roleassignment": ["rolecount"], "rolecount": ["rolecount"],
+    "group": ["group"], "type": ["grptype"], "grptype": ["grptype"],
+    "members": ["grpmembers"], "grpmembers": ["grpmembers"],
+    "privmembers": ["grppriv"], "grppriv": ["grppriv"],
+    "owners": ["grpowners"], "grpowners": ["grpowners"],
+    "policy": ["polname"], "polname": ["polname"],
+    "state": ["polstate"], "polstate": ["polstate"],
+    "scope": ["polscope"], "polscope": ["polscope"],
+    "apps": ["polapps"], "polapps": ["polapps"],
+    "controls": ["polcontrols"], "polcontrols": ["polcontrols"],
+    "included": ["polinc"], "polinc": ["polinc"],
+    "excluded": ["polexc"], "polexc": ["polexc"],
+    "application": ["app"], "app": ["app"],
+    "owner": ["owner"], "ownerupn": ["ownerupn"],
+    "resource": ["resource"], "permission": ["permission"],
+    "membershiprule": ["dynrule"], "dynrule": ["dynrule"],
+    "referencedattributes": ["dynattrs"], "dynattrs": ["dynattrs"],
+    "modifiableby": ["dynmods"], "dynmods": ["dynmods"],
+    "aduser": ["aduser"], "adupn": ["adupn"],
+    "adcn": ["adcn"], "addn": ["addn"],
+    "sid": ["adsid"], "adsid": ["adsid"],
+    "onprempwchange": ["adpw"], "adpw": ["adpw"],
+    "targetingtags": ["adtags"], "adtags": ["adtags"],
+    "check": ["check"], "category": ["category"],
+}
+
+# Multi-word display columns, rewritten to their canonical shortname only when
+# followed by ':' (so values containing the phrase stay untouched).
+ADV_DISPLAY_PHRASES = [
+    ("Directory roles", "roles"), ("Priv. members", "privmembers"),
+    ("Priv apps", "privapps"), ("Capable grp", "capablegrp"),
+    ("Groups owned", "groupsowned"), ("CA excl.", "caexcl"),
+    ("Account Source", "accountsource"), ("Target Type", "targettype"),
+    ("Target Status", "status"), ("Object ID", "objectid"),
+    ("Role assignment", "roleassignment"), ("SP Status", "spstatus"),
+    ("Owner UPN", "ownerupn"), ("Owner Status", "ownerstatus"),
+    ("Membership rule", "membershiprule"),
+    ("Referenced attributes", "referencedattributes"),
+    ("attribute modifiable by", "modifiableby"),
+    ("AD CN", "adcn"), ("AD DN", "addn"),
+    ("On-prem pw change", "onprempwchange"), ("Targeting tags", "targetingtags"),
+]
+ADV_PHRASE_RES = [
+    (re.compile(r"\b" + re.escape(phrase) + r"(?=\s*:)", re.IGNORECASE), canonical)
+    for phrase, canonical in ADV_DISPLAY_PHRASES
+]
+
+
+def _rewrite_column_phrases(text):
+    for pattern, canonical in ADV_PHRASE_RES:
+        text = pattern.sub(canonical, text)
+    return text
+
+
+def _normalize_field(name):
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+ADV_PHRASE_CANON = {_normalize_field(phrase): canonical
+                    for phrase, canonical in ADV_DISPLAY_PHRASES}
+
+
+def resolve_advanced_fields(name):
+    """Map a query field (column name or internal name) to the internal DOM
+    field names it matches; raises AdvancedParseError for unknown names."""
+    canonical = _normalize_field(name)
+    fields = ADV_COLUMN_ALIASES.get(canonical)
+    if fields is None:
+        phrase_canon = ADV_PHRASE_CANON.get(canonical)
+        fields = ADV_COLUMN_ALIASES.get(phrase_canon) if phrase_canon else None
+    if fields is None:
+        raise AdvancedParseError(
+            f"unknown field '{name}' (try privileges, roles, target, check, category&hellip;)")
+    return fields
+
+
+def tokenize_advanced(text):
+    """Yield (kind, value) tokens: 'word', 'quoted', 'lparen', 'rparen'."""
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch in "()":
+            yield ("lparen" if ch == "(" else "rparen", ch)
+            i += 1
+            continue
+        if ch == '"':
+            j = i + 1
+            buf = []
+            while j < n and text[j] != '"':
+                buf.append(text[j])
+                j += 1
+            if j >= n:
+                raise AdvancedParseError(f"unterminated quote at position {i}")
+            yield ("quoted", "".join(buf))
+            i = j + 1
+            continue
+        j = i
+        while j < n and not text[j].isspace() and text[j] not in "()\"":
+            j += 1
+        yield ("word", text[i:j])
+        i = j
+
+
+def parse_advanced_query(text):
+    """Parse an advanced filter expression into an AST dict, or raise
+    AdvancedParseError with a human-readable message.
+
+    AST nodes: {"op": "and"|"or", "children": [...]}, {"op": "not", "child"},
+    {"op": "eq"|"contains", "fields": [dom fields], "value"}, {"op": "text", "value"}."""
+    text = _rewrite_column_phrases(text or "")
+    tokens = list(tokenize_advanced(text))
+    if not tokens:
+        return {"op": "text", "value": ""}
+    pos = 0
+
+    def peek():
+        return tokens[pos] if pos < len(tokens) else None
+
+    def advance():
+        nonlocal pos
+        tok = tokens[pos]
+        pos += 1
+        return tok
+
+    def expect(kind):
+        tok = peek()
+        if tok is None or tok[0] != kind:
+            raise AdvancedParseError(
+                f"expected {kind} near '{tok[1] if tok else '<end>'}'")
+        return advance()
+
+    def is_operator(tok, op):
+        return (tok is not None and tok[0] == "word"
+                and tok[1].upper() == op)
+
+    def is_any_operator(tok):
+        return (tok is not None and tok[0] == "word"
+                and tok[1].upper() in ("AND", "OR", "NOT"))
+
+    def consume_value_words(value):
+        """Append following plain words to an unquoted value so that values
+        with spaces work without quotes: `roles:Global Administrator AND ...`."""
+        while True:
+            tok = peek()
+            if tok is None or tok[0] != "word" or is_any_operator(tok):
+                return value
+            advance()
+            value += " " + tok[1]
+
+    def resolve_field(name):
+        if name.upper() == "CONTAINS":
+            return None  # bare contains: prefix handled by the caller
+        return resolve_advanced_fields(name)
+
+    def parse_or():
+        children = [parse_and()]
+        while is_operator(peek(), "OR"):
+            advance()
+            children.append(parse_and())
+        return children[0] if len(children) == 1 else {"op": "or", "children": children}
+
+    def parse_and():
+        children = [parse_term()]
+        while is_operator(peek(), "AND"):
+            advance()
+            children.append(parse_term())
+        return children[0] if len(children) == 1 else {"op": "and", "children": children}
+
+    def parse_term():
+        tok = peek()
+        if tok is None:
+            raise AdvancedParseError("unexpected end of query")
+        if tok[0] == "rparen":
+            raise AdvancedParseError(f"unexpected ')' near '{tok[1]}'")
+        if tok[0] == "lparen":
+            advance()
+            node = parse_or()
+            expect("rparen")
+            return node
+        if is_operator(tok, "NOT"):
+            advance()
+            return {"op": "not", "child": parse_term()}
+        if tok[0] == "quoted":
+            advance()
+            return {"op": "text", "value": tok[1]}
+        # word: operator, field:value, contains:value, or bare text
+        word = advance()[1]
+        if is_operator(("word", word), "AND") or is_operator(("word", word), "OR"):
+            raise AdvancedParseError(f"unexpected operator '{word}'")
+        if word.upper() == "NOT":
+            return {"op": "not", "child": parse_term()}
+        if ":" not in word:
+            return {"op": "text", "value": word}
+        field, _, rest = word.partition(":")
+        if not field:
+            return {"op": "text", "value": word}
+        if not rest:
+            vt = peek()
+            if vt is None or vt[0] not in ("word", "quoted"):
+                raise AdvancedParseError(f"expected value after '{field}:'")
+            advance()
+            return {"op": "eq", "fields": resolve_field(field),
+                    "value": consume_value_words(vt[1])}
+        if rest.upper() == "CONTAINS":
+            vt = peek()
+            if vt is None or vt[0] not in ("word", "quoted"):
+                raise AdvancedParseError(f"expected value after '{field}:contains:'")
+            advance()
+            return {"op": "contains", "fields": resolve_field(field),
+                    "value": consume_value_words(vt[1])}
+        if rest.upper().startswith("CONTAINS:"):
+            value = consume_value_words(rest[len("contains:"):])
+            return {"op": "contains", "fields": resolve_field(field), "value": value}
+        if field.upper() == "CONTAINS":
+            return {"op": "text", "value": rest}
+        return {"op": "eq", "fields": resolve_field(field),
+                "value": consume_value_words(rest)}
+
+    node = parse_or()
+    tok = peek()
+    if tok is not None:
+        raise AdvancedParseError(f"unexpected '{tok[1]}'")
+    return node
+
+
+def _glob_regex(pattern):
+    """Compile a case-insensitive glob pattern ('*' wildcards) into a regex."""
+    return re.compile(".*".join(re.escape(part) for part in pattern.split("*")),
+                      re.IGNORECASE)
+
+
+def _glob_matches(pattern, value, search=False):
+    """Glob pattern match: '*' alone means 'any (non-empty) value'; otherwise
+    '*' wildcards match any sequence. `search` matches anywhere in the value
+    (for contains:), otherwise the whole value must match."""
+    if pattern == "*":
+        return bool(value)
+    regex = _glob_regex(pattern)
+    return regex.search(value) is not None if search else regex.fullmatch(value) is not None
+
+
+def evaluate_advanced(ast, fields, full_text=""):
+    """Evaluate a parsed AST against a field map {field: value string} and the
+    row's full searchable text (for text/contains predicates). Field-map keys
+    are matched case-insensitively (serve-side maps use CamelCase keys). Values
+    support '*' wildcards: '*' alone matches any non-empty value."""
+    fields_l = {str(k).lower(): v for k, v in (fields or {}).items()}
+    op = ast["op"]
+    if op == "text":
+        return ast["value"].lower() in (full_text or "").lower()
+    if op == "not":
+        return not evaluate_advanced(ast["child"], fields_l, full_text)
+    if op in ("and", "or"):
+        results = [evaluate_advanced(c, fields_l, full_text) for c in ast["children"]]
+        return all(results) if op == "and" else any(results)
+    if op in ("eq", "contains"):
+        needle = ast["value"].lower()
+        has_glob = "*" in needle
+        for field in ast["fields"]:
+            value = (fields_l.get(field) or "").lower()
+            if op == "contains":
+                if has_glob:
+                    if _glob_matches(needle, value, search=True):
+                        return True
+                elif needle in value:
+                    return True
+            elif field in ADV_LIST_FIELDS:
+                if has_glob:
+                    for item in value.split(","):
+                        if _glob_matches(needle, item.strip().lower()):
+                            return True
+                elif needle in [item.strip().lower() for item in value.split(",")]:
+                    return True
+            else:
+                if has_glob:
+                    if _glob_matches(needle, value):
+                        return True
+                elif value == needle:
+                    return True
+        return False
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Entity graph
 # ---------------------------------------------------------------------------
 
@@ -3878,6 +4209,339 @@ def realm_card_html(meta):
     return '<div class="realm">' + " \u00b7 ".join(parts) + "</div>"
 
 
+JS_FILTER_MODULE = """<script id="filter-module">
+// Advanced filter query language — mirrors the Python grammar in
+// entra-surface.py (parse_advanced_query); both are pinned against the same
+// test vectors in tests/filter_cases.json.
+(function() {
+  var LIST_FIELDS = {roles:1, eligible:1, grproles:1, dynmods:1, dynattrs:1,
+    azroles:1, azusrroles:1, azsproles:1, adtags:1, appdirroles:1,
+    owner:1, ownerupn:1, ownerstatus:1};
+
+  // column-name aliases -> DOM field names (any-match), mirrored from Python
+  var COLUMN_ALIASES = {
+    privileges: ['severity'], severity: ['severity'], sev: ['severity'],
+    roles: ['roles', 'grproles', 'appdirroles'],
+    grproles: ['grproles'], appdirroles: ['appdirroles'],
+    eligible: ['eligible'],
+    user: ['user'], upn: ['userupn'], userupn: ['userupn'],
+    privapps: ['privapps'], capablegrp: ['capgroups'], capgroups: ['capgroups'],
+    groupsowned: ['grpowned'], grpowned: ['grpowned'], caexcl: ['caexcl'],
+    accountsource: ['hybrid'], hybrid: ['hybrid'],
+    status: ['userstatus', 'status', 'spstatus', 'ownerstatus', 'adstatus'],
+    userstatus: ['userstatus'], spstatus: ['spstatus'],
+    ownerstatus: ['ownerstatus'], adstatus: ['adstatus'],
+    target: ['target'], targettype: ['targettype'],
+    objectid: ['id'], id: ['id'],
+    passwords: ['pw'], pw: ['pw'], keys: ['keys'],
+    roleassignment: ['rolecount'], rolecount: ['rolecount'],
+    group: ['group'], type: ['grptype'], grptype: ['grptype'],
+    members: ['grpmembers'], grpmembers: ['grpmembers'],
+    privmembers: ['grppriv'], grppriv: ['grppriv'],
+    owners: ['grpowners'], grpowners: ['grpowners'],
+    policy: ['polname'], polname: ['polname'],
+    state: ['polstate'], polstate: ['polstate'],
+    scope: ['polscope'], polscope: ['polscope'],
+    apps: ['polapps'], polapps: ['polapps'],
+    controls: ['polcontrols'], polcontrols: ['polcontrols'],
+    included: ['polinc'], polinc: ['polinc'],
+    excluded: ['polexc'], polexc: ['polexc'],
+    application: ['app'], app: ['app'],
+    owner: ['owner'], ownerupn: ['ownerupn'],
+    resource: ['resource'], permission: ['permission'],
+    membershiprule: ['dynrule'], dynrule: ['dynrule'],
+    referencedattributes: ['dynattrs'], dynattrs: ['dynattrs'],
+    modifiableby: ['dynmods'], dynmods: ['dynmods'],
+    aduser: ['aduser'], adupn: ['adupn'],
+    adcn: ['adcn'], addn: ['addn'],
+    sid: ['adsid'], adsid: ['adsid'],
+    onprempwchange: ['adpw'], adpw: ['adpw'],
+    targetingtags: ['adtags'], adtags: ['adtags'],
+    check: ['check'], category: ['category']
+  };
+
+  var DISPLAY_NAMES = {
+    privileges: 'Privileges', roles: 'Directory roles', eligible: 'Eligible',
+    user: 'User', upn: 'UPN', privapps: 'Priv apps', capablegrp: 'Capable grp',
+    groupsowned: 'Groups owned', caexcl: 'CA excl.', accountsource: 'Account Source',
+    status: 'Status', target: 'Target', targettype: 'Target Type',
+    objectid: 'Object ID', passwords: 'Passwords', keys: 'Keys',
+    roleassignment: 'Role assignment', group: 'Group', type: 'Type',
+    members: 'Members', privmembers: 'Priv. members', owners: 'Owners',
+    policy: 'Policy', state: 'State', scope: 'Scope', apps: 'Apps',
+    controls: 'Controls', included: 'Included', excluded: 'Excluded',
+    application: 'Application', owner: 'Owner', ownerupn: 'Owner UPN',
+    ownerstatus: 'Owner Status', resource: 'Resource', permission: 'Permission',
+    spstatus: 'SP Status', membershiprule: 'Membership rule',
+    referencedattributes: 'Referenced attributes', modifiableby: 'Modifiable by',
+    aduser: 'User', adupn: 'UPN', adcn: 'AD CN', addn: 'AD DN', sid: 'SID',
+    onprempwchange: 'On-prem pw change', targetingtags: 'Targeting tags',
+    check: 'Check', category: 'Category'
+  };
+
+  var PHRASES = [
+    ['Directory roles', 'roles'], ['Priv. members', 'privmembers'],
+    ['Priv apps', 'privapps'], ['Capable grp', 'capablegrp'],
+    ['Groups owned', 'groupsowned'], ['CA excl.', 'caexcl'],
+    ['Account Source', 'accountsource'], ['Target Type', 'targettype'],
+    ['Target Status', 'status'], ['Object ID', 'objectid'],
+    ['Role assignment', 'roleassignment'], ['SP Status', 'spstatus'],
+    ['Owner UPN', 'ownerupn'], ['Owner Status', 'ownerstatus'],
+    ['Membership rule', 'membershiprule'],
+    ['Referenced attributes', 'referencedattributes'],
+    ['attribute modifiable by', 'modifiableby'],
+    ['AD CN', 'adcn'], ['AD DN', 'addn'],
+    ['On-prem pw change', 'onprempwchange'], ['Targeting tags', 'targetingtags']
+  ];
+
+  var BS = String.fromCharCode(92);  // backslash, avoids escape-layering with Python strings
+  var REGEX_SPECIALS = '.*+?^$(){}[]|' + BS;
+
+  function escapeRegExp(s) {
+    var out = '';
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charAt(i);
+      out += REGEX_SPECIALS.indexOf(c) !== -1 ? BS + c : c;
+    }
+    return out;
+  }
+
+  var PHRASE_RES = PHRASES.map(function(p) {
+    return [new RegExp(BS + 'b' + escapeRegExp(p[0]) + '(?=' + BS + 's*:)', 'i'), p[1]];
+  });
+  var DISPLAY_CANON = {};
+  PHRASES.forEach(function(p) { DISPLAY_CANON[normalizeField(p[0])] = p[1]; });
+
+  function rewritePhrases(text) {
+    for (var i = 0; i < PHRASE_RES.length; i++) {
+      text = text.replace(PHRASE_RES[i][0], PHRASE_RES[i][1]);
+    }
+    return text;
+  }
+
+  function normalizeField(name) {
+    return (name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  }
+
+  function fieldsFor(name) {
+    var canon = normalizeField(name);
+    var fields = COLUMN_ALIASES[canon];
+    if (!fields) {
+      var mapped = DISPLAY_CANON[canon];
+      if (mapped) fields = COLUMN_ALIASES[mapped];
+    }
+    return fields || null;
+  }
+
+  function columns() {
+    var out = [];
+    Object.keys(DISPLAY_NAMES).forEach(function(canon) {
+      out.push({canonical: canon, display: DISPLAY_NAMES[canon],
+                fields: COLUMN_ALIASES[canon] || []});
+    });
+    out.sort(function(a, b) { return a.display < b.display ? -1 : 1; });
+    return out;
+  }
+
+  function tokenize(text) {
+    var tokens = [], i = 0, n = text.length;
+    while (i < n) {
+      var ch = text[i];
+      if (/\\s/.test(ch)) { i++; continue; }
+      if (ch === '(' || ch === ')') { tokens.push({t: ch === '(' ? 'lparen' : 'rparen', v: ch}); i++; continue; }
+      if (ch === '"') {
+        var j = i + 1, buf = '';
+        while (j < n && text[j] !== '"') { buf += text[j]; j++; }
+        if (j >= n) throw new Error('unterminated quote at position ' + i);
+        tokens.push({t: 'quoted', v: buf});
+        i = j + 1;
+        continue;
+      }
+      var k = i;
+      while (k < n && !/\\s/.test(text[k]) && text[k] !== '(' && text[k] !== ')' && text[k] !== '"') k++;
+      tokens.push({t: 'word', v: text.slice(i, k)});
+      i = k;
+    }
+    return tokens;
+  }
+
+  function isOp(tok, op) {
+    return !!tok && tok.t === 'word' && tok.v.toUpperCase() === op;
+  }
+
+  function parse(text) {
+    try {
+      var rewritten = rewritePhrases(text || '');
+      var tokens = tokenize(rewritten), pos = 0;
+      if (!tokens.length) return {ast: {op: 'text', value: ''}};
+      function isAnyOperator(tok) {
+        return !!tok && tok.t === 'word' &&
+          (tok.v.toUpperCase() === 'AND' || tok.v.toUpperCase() === 'OR' || tok.v.toUpperCase() === 'NOT');
+      }
+      function consumeValueWords(value) {
+        // append following plain words so unquoted values with spaces work
+        while (true) {
+          var tok = pos < tokens.length ? tokens[pos] : null;
+          if (!tok || tok.t !== 'word' || isAnyOperator(tok)) return value;
+          pos++;
+          value += ' ' + tok.v;
+        }
+      }
+      function resolveField(name) {
+        if (name.toUpperCase() === 'CONTAINS') return null;
+        var fields = fieldsFor(name);
+        if (!fields) throw new Error("unknown field '" + name + "' (try privileges, roles, target, check, category)");
+        return fields;
+      }
+      function peek() { return pos < tokens.length ? tokens[pos] : null; }
+      function advance() { return tokens[pos++]; }
+      function expect(kind) {
+        var tok = peek();
+        if (!tok || tok.t !== kind) {
+          throw new Error('expected ' + kind + " near '" + (tok ? tok.v : '<end>') + "'");
+        }
+        return advance();
+      }
+      function parseOr() {
+        var children = [parseAnd()];
+        while (isOp(peek(), 'OR')) { advance(); children.push(parseAnd()); }
+        return children.length === 1 ? children[0] : {op: 'or', children: children};
+      }
+      function parseAnd() {
+        var children = [parseTerm()];
+        while (isOp(peek(), 'AND')) { advance(); children.push(parseTerm()); }
+        return children.length === 1 ? children[0] : {op: 'and', children: children};
+      }
+      function parseTerm() {
+        var tok = peek();
+        if (!tok) throw new Error('unexpected end of query');
+        if (tok.t === 'rparen') throw new Error("unexpected ')' near '" + tok.v + "'");
+        if (tok.t === 'lparen') { advance(); var node = parseOr(); expect('rparen'); return node; }
+        if (isOp(tok, 'NOT')) { advance(); return {op: 'not', child: parseTerm()}; }
+        if (tok.t === 'quoted') { advance(); return {op: 'text', value: tok.v}; }
+        var word = advance().v;
+        if (isOp({t: 'word', v: word}, 'AND') || isOp({t: 'word', v: word}, 'OR')) {
+          throw new Error("unexpected operator '" + word + "'");
+        }
+        if (word.toUpperCase() === 'NOT') return {op: 'not', child: parseTerm()};
+        if (word.indexOf(':') === -1) return {op: 'text', value: word};
+        var idx = word.indexOf(':');
+        var field = word.slice(0, idx), rest = word.slice(idx + 1);
+        if (!field) return {op: 'text', value: word};
+        if (!rest) {
+          var vt = peek();
+          if (!vt || (vt.t !== 'word' && vt.t !== 'quoted')) {
+            throw new Error("expected value after '" + field + ":'");
+          }
+          advance();
+          return {op: 'eq', fields: resolveField(field), value: consumeValueWords(vt.v)};
+        }
+        if (rest.toUpperCase() === 'CONTAINS') {
+          var vt2 = peek();
+          if (!vt2 || (vt2.t !== 'word' && vt2.t !== 'quoted')) {
+            throw new Error("expected value after '" + field + ":contains:'");
+          }
+          advance();
+          return {op: 'contains', fields: resolveField(field), value: consumeValueWords(vt2.v)};
+        }
+        if (rest.toUpperCase().indexOf('CONTAINS:') === 0) {
+          return {op: 'contains', fields: resolveField(field),
+                  value: consumeValueWords(rest.slice('contains:'.length))};
+        }
+        if (field.toUpperCase() === 'CONTAINS') return {op: 'text', value: rest};
+        return {op: 'eq', fields: resolveField(field), value: consumeValueWords(rest)};
+      }
+      var node = parseOr();
+      var extra = peek();
+      if (extra) throw new Error("unexpected '" + extra.v + "'");
+      return {ast: node};
+    } catch (e) {
+      return {error: String(e.message || e)};
+    }
+  }
+
+  function globRegex(pattern) {
+    var parts = pattern.split('*');
+    var out = '';
+    for (var i = 0; i < parts.length; i++) {
+      out += escapeRegExp(parts[i]);
+      if (i < parts.length - 1) out += '.*';
+    }
+    return new RegExp(out, 'i');
+  }
+
+  function globMatches(pattern, value, search) {
+    // '*' alone means "any non-empty value"; otherwise '*' wildcards match
+    // any sequence. search=true matches anywhere in the value.
+    if (pattern === '*') return !!value;
+    var re = globRegex(pattern);
+    if (search) return re.test(value);
+    var m = re.exec(value);
+    return !!(m && m[0] === value);
+  }
+
+  function evaluate(ast, fields, fullText) {
+    // normalize the field map to lowercase keys (DOM maps are already
+    // lowercase; serve-side maps use CamelCase — handle both)
+    var fl = {};
+    Object.keys(fields || {}).forEach(function(k) { fl[k.toLowerCase()] = fields[k]; });
+    var op = ast.op;
+    if (op === 'text') {
+      return (fullText || '').toLowerCase().indexOf(ast.value.toLowerCase()) !== -1;
+    }
+    if (op === 'not') return !evaluate(ast.child, fl, fullText);
+    if (op === 'and' || op === 'or') {
+      for (var i = 0; i < ast.children.length; i++) {
+        var r = evaluate(ast.children[i], fl, fullText);
+        if (op === 'and' && !r) return false;
+        if (op === 'or' && r) return true;
+      }
+      return op === 'and';
+    }
+    if (op === 'eq' || op === 'contains') {
+      var needle = ast.value.toLowerCase();
+      var hasGlob = needle.indexOf('*') !== -1;
+      for (var f = 0; f < ast.fields.length; f++) {
+        var field = ast.fields[f];
+        var value = (fl[field] || '').toLowerCase();
+        if (op === 'contains') {
+          if (hasGlob) {
+            if (globMatches(needle, value, true)) return true;
+          } else if (value.indexOf(needle) !== -1) {
+            return true;
+          }
+        } else if (LIST_FIELDS[field]) {
+          if (hasGlob) {
+            var items = value.split(',');
+            for (var j = 0; j < items.length; j++) {
+              if (globMatches(needle, items[j].trim().toLowerCase())) return true;
+            }
+          } else {
+            for (var j2 = 0; j2 < value.split(',').length; j2++) {
+              if (value.split(',')[j2].trim().toLowerCase() === needle) return true;
+            }
+          }
+        } else {
+          if (hasGlob) {
+            if (globMatches(needle, value)) return true;
+          } else if (value === needle) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+    return false;
+  }
+
+  window.ADV_FILTER = {parse: parse, evaluate: evaluate, listFields: LIST_FIELDS,
+                       fieldsFor: fieldsFor, columns: columns,
+                       normalizeField: normalizeField};
+})();
+</script>
+"""
+
+
 def render_report(results, tenant_name, db_path, config_path, include_disabled, entity_details,
                   min_severity_label, entity_profiles=None, tenant_summary=None, graph=None,
                   serve_mode=False, serve_tables=None, group_roles=None,
@@ -4487,6 +5151,39 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     role_apps_json = json.dumps(
         build_role_applications(graph, group_roles, group_eligible_roles),
         default=str).replace("</", "<\\/")
+    # distinct values per field for advanced-filter autocomplete (capped)
+    SUGGEST_VALUE_FIELDS = {
+        "severity", "category", "check", "roles", "eligible", "grproles",
+        "dynmods", "dynattrs", "adtags", "targettype", "status", "hybrid",
+        "userstatus", "spstatus", "ownerstatus", "adstatus", "polstate",
+        "resource", "permission",
+    }
+    suggest_data = {}
+
+    def _suggest_add(field, value):
+        value = (value or "").strip()
+        if not value:
+            return
+        bucket = suggest_data.setdefault(field, [])
+        if value not in bucket and len(bucket) < 30:
+            bucket.append(value)
+
+    for res in results:
+        for f in res["findings"]:
+            for k, v in serve_field_map(_serve_table_id(res["id"]), f).items():
+                if k.lower() in SUGGEST_VALUE_FIELDS:
+                    for item in v.split(","):
+                        _suggest_add(k.lower(), item)
+            if res["id"] == "groups" and f.get("dyn_rule"):
+                for k, v in serve_field_map("dynamic-groups-table", f).items():
+                    if k.lower() in SUGGEST_VALUE_FIELDS:
+                        for item in v.split(","):
+                            _suggest_add(k.lower(), item)
+    for sev in SEVERITY_ORDER:
+        _suggest_add("severity", sev)
+    for spec in CHECK_SPECS:
+        _suggest_add("check", spec["id"])
+    suggest_json = json.dumps(suggest_data, default=str).replace("</", "<\\/")
 
     # ---- tabs ------------------------------------------------------------
     tabs_html = ['<button type="button" class="tab-btn active" data-category="all">All</button>']
@@ -4644,6 +5341,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
     margin: 10px 0 12px;
   }}
+  .controls .filter-row {{
+    display: flex; flex: 1; gap: 8px; align-items: center; position: relative; min-width: 260px;
+  }}
   .controls input, .controls select {{
     background: var(--surface-1);
     color: var(--text-primary);
@@ -4653,6 +5353,30 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     font-size: 13px;
   }}
   .controls input[type="search"] {{ flex: 1; min-width: 220px; }}
+  .mode-btn {{
+    background: var(--surface-1); color: var(--text-secondary);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 7px 12px; font-size: 13px; cursor: pointer; white-space: nowrap;
+  }}
+  .mode-btn:hover {{ color: var(--text-primary); }}
+  .mode-btn[aria-pressed="true"] {{
+    background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 35%, transparent); font-weight: 600;
+  }}
+  .suggest-wrap {{
+    position: absolute; top: calc(100% + 4px); left: 0; width: 100%; z-index: 40;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+    box-shadow: 0 10px 28px rgba(0,0,0,0.16); overflow: hidden;
+  }}
+  .suggest-wrap ul {{ list-style: none; margin: 0; padding: 4px 0; max-height: 240px; overflow-y: auto; }}
+  .suggest-wrap li {{
+    padding: 6px 12px; font-size: 13px; cursor: pointer;
+  }}
+  .suggest-wrap li.active {{ background: var(--row-hover); color: var(--accent); }}
+  .suggest-wrap li .sugg-hint {{ color: var(--text-muted); font-size: 11px; margin-left: 8px; }}
+  .filter-error {{
+    width: 100%; color: var(--status-critical); font-size: 12px; margin-top: 4px;
+  }}
   section {{ margin-top: 32px; }}
   section[data-category] {{ margin-top: 26px; }}
   section.hidden {{ display: none; }}
@@ -4835,7 +5559,12 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   </div>
 
   <div class="controls">
-    <input type="search" id="filter-input" placeholder="Filter all tables by target, owner, evidence&hellip;">
+    <div class="filter-row">
+      <input type="search" id="filter-input" placeholder="Filter all tables by target, owner, evidence&hellip;" autocomplete="off">
+      <button type="button" id="advanced-toggle" class="mode-btn" aria-pressed="false" title="Toggle advanced filtering: field:value, AND, OR, NOT, contains:">Advanced</button>
+      <div class="suggest-wrap hidden" id="suggest-wrap"><ul id="suggest-list"></ul></div>
+    </div>
+    <div class="filter-error hidden" id="filter-error"></div>
   </div>
 
   {''.join(sections_html)}
@@ -4879,10 +5608,13 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 
 <script type="application/json" id="group-profile-data">{group_profile_json}</script>
 
+<script type="application/json" id="suggest-data">{suggest_json}</script>
+
 <script type="application/json" id="role-apps-data">{role_apps_json}</script>
 
 <script type="application/json" id="policy-profile-data">{policy_profile_json}</script>
 
+{JS_FILTER_MODULE}
 <script>
 (function() {{
   var root = document.documentElement;
@@ -6194,21 +6926,211 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     return Array.prototype.slice.call(document.querySelectorAll('table.findings'));
   }}
   var input = document.getElementById('filter-input');
+  var advToggle = document.getElementById('advanced-toggle');
+  var suggestWrap = document.getElementById('suggest-wrap');
+  var suggestList = document.getElementById('suggest-list');
+  var errorEl = document.getElementById('filter-error');
+  var advOn = false;
+  var suggestionRange = null;
+  var activeSuggestion = -1;
+  var SUGGEST = {{}};
+  try {{ SUGGEST = JSON.parse(document.getElementById('suggest-data').textContent); }} catch (e) {{}}
+  Object.keys(SUGGEST).forEach(function(k) {{ SUGGEST[k.toLowerCase()] = SUGGEST[k]; }});
 
-  input.addEventListener('input', function() {{
-    var q = input.value.toLowerCase();
+  function rowFieldMap(row) {{
+    var map = {{ check: (row.getAttribute('data-check-id') || '').toLowerCase(), category: '' }};
+    var sec = row.closest('section');
+    if (sec) map.category = (sec.getAttribute('data-category') || '').toLowerCase();
+    Array.prototype.forEach.call(row.cells, function(td) {{
+      var f = td.getAttribute('data-field');
+      if (f) map[f.toLowerCase()] = td.getAttribute('data-value') || '';
+    }});
+    return map;
+  }}
+
+  function setRowVisibility(test) {{
     allTables().forEach(function(table) {{
       Array.prototype.forEach.call(table.tBodies[0].rows, function(row) {{
         if (row.classList.contains('drawer')) return;
-        var text = row.textContent.toLowerCase();
-        var hide = q.length > 0 && text.indexOf(q) === -1;
-        row.classList.toggle('hidden', hide);
+        var show = test(row);
+        row.classList.toggle('hidden', !show);
         var next = row.nextElementSibling;
         if (next && next.getAttribute('data-detail-for') === row.getAttribute('data-detail-key')) {{
-          next.classList.toggle('hidden', hide);
+          next.classList.toggle('hidden', !show);
         }}
       }});
     }});
+  }}
+
+  function hideSuggest() {{
+    suggestWrap.classList.add('hidden');
+    suggestList.innerHTML = '';
+    suggestionRange = null;
+    activeSuggestion = -1;
+  }}
+
+  function knownFields() {{
+    var out = [];
+    (ADV_FILTER.columns() || []).forEach(function(c) {{
+      out.push(c.display);
+    }});
+    return out;
+  }}
+
+  function fieldValueSuggest(fieldName, prefix) {{
+    var internal = ADV_FILTER.fieldsFor(fieldName) || [];
+    var seen = {{}}, out = [];
+    internal.forEach(function(f) {{
+      (SUGGEST[f] || []).forEach(function(v) {{
+        if (String(v).toLowerCase().indexOf(prefix.toLowerCase()) === 0 && !seen[v]) {{
+          seen[v] = true;
+          out.push(v);
+        }}
+      }});
+    }});
+    return out;
+  }}
+
+  function tokenRange() {{
+    var value = input.value;
+    var caret = input.selectionStart == null ? value.length : input.selectionStart;
+    var start = caret;
+    while (start > 0 && !/[\\s()]/.test(value[start - 1])) start--;
+    var end = caret;
+    while (end < value.length && !/[\\s()]/.test(value[end])) end++;
+    return {{ start: start, end: end, token: value.slice(start, end) }};
+  }}
+
+  function buildSuggestions() {{
+    if (!advOn || document.activeElement !== input) {{ hideSuggest(); return; }}
+    var r = tokenRange();
+    var token = r.token;
+    var items = [];
+    var ci = token.indexOf(':');
+    if (ci !== -1) {{
+      var field = token.slice(0, ci);
+      var prefix = token.slice(ci + 1).toLowerCase();
+      fieldValueSuggest(field, prefix).slice(0, 8).forEach(function(v) {{
+        items.push({{ text: field + ':' + v, display: field + ':' + v, hint: 'value' }});
+      }});
+    }} else if (token) {{
+      var pre = ADV_FILTER.normalizeField(token);
+      knownFields().forEach(function(display) {{
+        if (ADV_FILTER.normalizeField(display).indexOf(pre) === 0) {{
+          items.push({{ text: display + ':', display: display + ':', hint: 'column' }});
+        }}
+      }});
+    }} else {{
+      ['AND', 'OR', 'NOT', 'contains:'].forEach(function(op) {{
+        items.push({{ text: op, display: op, hint: 'operator' }});
+      }});
+    }}
+    if (!items.length) {{ hideSuggest(); return; }}
+    suggestionRange = r;
+    activeSuggestion = -1;
+    suggestList.innerHTML = '';
+    items.slice(0, 8).forEach(function(it) {{
+      var li = document.createElement('li');
+      li.textContent = it.display;
+      li.dataset.sugg = it.text;
+      var hint = document.createElement('span');
+      hint.className = 'sugg-hint';
+      hint.textContent = it.hint;
+      li.appendChild(hint);
+      suggestList.appendChild(li);
+    }});
+    suggestWrap.classList.remove('hidden');
+  }}
+
+  function acceptSuggestion(item) {{
+    if (!suggestionRange) return;
+    var r = suggestionRange;
+    var value = input.value;
+    input.value = value.slice(0, r.start) + item + ' ' + value.slice(r.end);
+    var pos = r.start + item.length + 1;
+    input.setSelectionRange(pos, pos);
+    hideSuggest();
+    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+  }}
+
+  function applyRowFilter() {{
+    var q = input.value;
+    if (!advOn) {{
+      var needle = q.toLowerCase();
+      setRowVisibility(function(row) {{
+        return q.length === 0 || row.textContent.toLowerCase().indexOf(needle) !== -1;
+      }});
+      errorEl.classList.add('hidden');
+      hideSuggest();
+      return;
+    }}
+    var parsed = ADV_FILTER.parse(q);
+    if (parsed.error) {{
+      errorEl.textContent = 'Filter error: ' + parsed.error;
+      errorEl.classList.remove('hidden');
+      hideSuggest();
+      return;
+    }}
+    errorEl.classList.add('hidden');
+    if (q.trim() === '') {{
+      setRowVisibility(function() {{ return true; }});
+      buildSuggestions();
+      return;
+    }}
+    var ast = parsed.ast;
+    setRowVisibility(function(row) {{
+      return ADV_FILTER.evaluate(ast, rowFieldMap(row), row.textContent);
+    }});
+  }}
+
+  input.addEventListener('input', function() {{
+    applyRowFilter();
+    if (advOn) buildSuggestions();
+  }});
+
+  input.addEventListener('keydown', function(e) {{
+    if (!advOn || suggestWrap.classList.contains('hidden')) return;
+    var items = suggestList.querySelectorAll('li');
+    if (!items.length) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {{
+      e.preventDefault();
+      activeSuggestion += e.key === 'ArrowDown' ? 1 : -1;
+      if (activeSuggestion >= items.length) activeSuggestion = 0;
+      if (activeSuggestion < 0) activeSuggestion = items.length - 1;
+      Array.prototype.forEach.call(items, function(li, i) {{
+        li.classList.toggle('active', i === activeSuggestion);
+      }});
+    }} else if (e.key === 'Enter' || e.key === 'Tab') {{
+      var idx = activeSuggestion >= 0 ? activeSuggestion : 0;
+      if (items[idx]) {{
+        e.preventDefault();
+        acceptSuggestion(items[idx].dataset.sugg);
+      }}
+    }} else if (e.key === 'Escape') {{
+      hideSuggest();
+    }}
+  }});
+
+  suggestList.addEventListener('mousedown', function(e) {{
+    var li = e.target.closest('li');
+    if (!li) return;
+    e.preventDefault();
+    acceptSuggestion(li.dataset.sugg);
+  }});
+
+  input.addEventListener('blur', function() {{
+    setTimeout(hideSuggest, 150);
+  }});
+
+  advToggle.addEventListener('click', function() {{
+    advOn = !advOn;
+    advToggle.setAttribute('aria-pressed', String(advOn));
+    input.placeholder = advOn
+        ? 'Advanced: severity:High AND target:contains:admin&hellip;'
+        : 'Filter all tables by target, owner, evidence&hellip;';
+    hideSuggest();
+    errorEl.classList.add('hidden');
+    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
   }});
 
   allTables().forEach(function(table) {{
@@ -6298,6 +7220,8 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     function load() {{
       var params = 'page=' + state.page + '&size=' + state.size;
       if (state.q) params += '&q=' + encodeURIComponent(state.q);
+      var adv = document.getElementById('advanced-toggle');
+      if (adv && adv.getAttribute('aria-pressed') === 'true') params += '&mode=advanced';
       if (state.sort) params += '&sort=' + state.sort + '&dir=' + state.dir;
       fetch('/api/table/' + encodeURIComponent(table.id) + '?' + params)
         .then(function(r) {{ return r.json(); }})
@@ -6456,6 +7380,110 @@ SERVE_DRILLDOWN_COLUMNS = {
 
 SERVE_CONTAINS_FIELDS = {"roles", "eligible", "grpRoles", "dynMods", "dynAttrs"}
 
+CHECK_ID_CATEGORY = {spec["id"]: spec["category"] for spec in CHECK_SPECS}
+
+
+def _serve_table_id(res_id):
+    return {
+        "privileged_users": "privileged-users-table",
+        "groups": "groups-table",
+        "ad_sync_users": "ad-sync-users-table",
+        "app_dir_roles": "app-dir-roles-table",
+        "ca_exposure": "table-ca_exposure",
+    }.get(res_id, f"table-{res_id}")
+
+
+def serve_field_map(table_id, f, owner=None):
+    """Field map for one finding row in a serve table — mirrors the DOM
+    data-field/data-value model plus the implicit 'check' and 'category'
+    fields. Used by the advanced filter and the serve drilldown records."""
+    fields = {"check": f.get("check_id", ""),
+              "category": CHECK_ID_CATEGORY.get(f.get("check_id", ""), "")}
+    if table_id == "privileged-users-table":
+        fields.update({
+            "user": f.get("user_display") or "", "userUpn": f.get("user_upn") or "",
+            "roles": ", ".join(r["name"] for r in f.get("roles", [])),
+            "eligible": ", ".join(r["name"] for r in f.get("eligible_roles", [])),
+            "privApps": str(len(f.get("priv_apps", []))),
+            "capGroups": str(len(f.get("cap_member", []))),
+            "grpOwned": str(f.get("owned_count", 0)),
+            "caExcl": str(len(f.get("ca_exclusions", []))),
+            "hybrid": "AD" if f.get("hybrid") else "Cloud",
+            "userStatus": "Enabled" if f.get("user_enabled") else "Disabled",
+            "severity": f.get("severity", "Info"),
+        })
+    elif table_id == "groups-table":
+        fields.update({
+            "group": f.get("group_name") or "",
+            "grpType": ", ".join(f.get("types", [])),
+            "grpRoles": ", ".join(r["name"] for r in f.get("dir_roles", [])),
+            "eligible": ", ".join(r["name"] for r in f.get("eligible_roles", [])),
+            "grpMembers": str(f.get("member_count", 0)),
+            "grpPriv": str(f.get("priv_member_count", 0)),
+            "grpOwners": str(len(f.get("owners", []))),
+            "severity": f.get("severity", "Info"),
+        })
+    elif table_id == "dynamic-groups-table":
+        fields.update({
+            "dynGroup": f.get("group_name") or "", "dynRule": f.get("dyn_rule") or "",
+            "dynAttrs": ", ".join(f.get("dyn_attrs", [])),
+            "dynMods": ", ".join(f.get("dyn_mods", [])),
+        })
+    elif table_id in ("owned-table", "unowned-table"):
+        owners = [owner] if owner is not None else f.get("owners", [])
+        fields.update({
+            "owner": ", ".join(o.get("display_name") or "" for o in owners),
+            "ownerUpn": ", ".join(o.get("upn") or "" for o in owners),
+            "ownerStatus": ", ".join("Enabled" if o.get("enabled") else "Disabled"
+                                     for o in owners),
+            "app": f.get("display_name") or "",
+            "pw": str(f.get("pw")) if f.get("pw") is not None else "",
+            "keys": str(f.get("keys")) if f.get("keys") is not None else "",
+            "resource": f.get("resource_name") or "",
+            "permission": f.get("permission") or "",
+            "spStatus": "Enabled" if f.get("sp_enabled") else "Disabled",
+            "severity": f.get("severity", "Info"),
+        })
+    elif table_id == "ad-sync-users-table":
+        fields.update({
+            "adUser": f.get("user_display") or "", "adUpn": f.get("user_upn") or "",
+            "adCn": f.get("ad_cn") or "", "adDn": f.get("ad_dn") or "",
+            "adSid": f.get("ad_sid") or "", "adPw": f.get("pw_change") or "",
+            "adTags": ", ".join(f.get("tags", [])),
+            "caExcl": str(len(f.get("ca_exclusions", []))),
+            "adStatus": "Enabled" if (f.get("status") or {}).get("enabled") else "Disabled",
+        })
+    elif table_id == "table-ca_exposure":
+        fields.update({
+            "polName": f.get("policy_name") or "", "polState": f.get("state") or "",
+            "polScope": f.get("scope") or "",
+            "polApps": ", ".join((f.get("conditions_html") or {}).get("apps") or []),
+            "polControls": ", ".join((f.get("conditions_html") or {}).get("controls") or []),
+            "polInc": str(len(f.get("included", []))),
+            "polExc": str(len(f.get("excluded", []))),
+            "severity": f.get("severity", "Info"),
+        })
+    elif table_id == "app-dir-roles-table":
+        t = f.get("target") or {}
+        fields.update({
+            "app": t.get("name") or "", "id": t.get("id") or "",
+            "appDirRoles": ", ".join(r["name"] for r in f.get("dir_role_tags", [])),
+            "status": (f.get("status") or {}).get("label") or "",
+            "severity": f.get("severity", "Info"),
+        })
+    else:  # generic table-<check_id>
+        t = f.get("target") or {}
+        fields.update({
+            "target": t.get("name") or "", "targetType": t.get("type") or "",
+            "id": t.get("id") or "",
+            "pw": str(f.get("pw")) if f.get("pw") is not None else "",
+            "keys": str(f.get("keys")) if f.get("keys") is not None else "",
+            "roleCount": str(f.get("roles")) if f.get("roles") is not None else "",
+            "status": (f.get("status") or {}).get("label") or "",
+            "severity": f.get("severity", "Info"),
+        })
+    return fields
+
 
 def build_serve_records(results):
     """All findings as drilldown records, mirroring the DOM record model so
@@ -6473,73 +7501,23 @@ def build_serve_records(results):
             sp_id = next(iter(o.get("sp", set())), "")
             app_id = next(iter(o.get("app", set())), "")
             owner_id = next(iter(o.get("user", set())), "")
-            if res["id"] == "privileged_users":
-                add({"user": f.get("user_display") or "", "userUpn": f.get("user_upn") or "",
-                     "roles": ", ".join(r["name"] for r in f.get("roles", [])),
-                     "eligible": ", ".join(r["name"] for r in f.get("eligible_roles", [])),
-                     "privApps": str(len(f.get("priv_apps", []))),
-                     "capGroups": str(len(f.get("cap_member", []))),
-                     "grpOwned": str(f.get("owned_count", 0)),
-                     "caExcl": str(len(f.get("ca_exclusions", []))),
-                     "hybrid": "AD" if f.get("hybrid") else "Cloud",
-                     "userStatus": "Enabled" if f.get("user_enabled") else "Disabled",
-                     "severity": f.get("severity", "Info")},
-                    owner=f.get("user_id", ""))
+            if res["id"] == "priv_app_ownership":
+                for owner in f.get("owners", []):
+                    add(serve_field_map("owned-table", f, owner),
+                        sp=f.get("principal_id", ""), app=f.get("app_object_id") or "",
+                        owner=owner.get("object_id", ""))
             elif res["id"] == "groups":
                 gid = f.get("group_id", "")
-                add({"group": f.get("group_name") or "",
-                     "grpType": ", ".join(f.get("types", [])),
-                     "grpRoles": ", ".join(r["name"] for r in f.get("dir_roles", [])),
-                     "eligible": ", ".join(r["name"] for r in f.get("eligible_roles", [])),
-                     "grpMembers": str(f.get("member_count", 0)),
-                     "grpPriv": str(f.get("priv_member_count", 0)),
-                     "grpOwners": str(len(f.get("owners", []))),
-                     "severity": f.get("severity", "Info")}, gid=gid)
+                add(serve_field_map("groups-table", f), gid=gid)
                 if f.get("dyn_rule"):
-                    add({"dynGroup": f.get("group_name") or "", "dynRule": f.get("dyn_rule") or "",
-                         "dynAttrs": ", ".join(f.get("dyn_attrs", [])),
-                         "dynMods": ", ".join(f.get("dyn_mods", []))}, gid=gid)
-            elif res["id"] == "priv_app_ownership":
-                base = {"app": f.get("display_name") or "",
-                        "pw": str(f.get("pw")) if f.get("pw") is not None else "",
-                        "keys": str(f.get("keys")) if f.get("keys") is not None else "",
-                        "resource": f.get("resource_name") or "",
-                        "permission": f.get("permission") or "",
-                        "spStatus": "Enabled" if f.get("sp_enabled") else "Disabled",
-                        "severity": f.get("severity", "Info")}
-                for owner in f.get("owners", []):
-                    rec = dict(base)
-                    rec.update({"owner": owner.get("display_name") or "",
-                                "ownerUpn": owner.get("upn") or "",
-                                "ownerStatus": "Enabled" if owner.get("enabled") else "Disabled"})
-                    add(rec, sp=f.get("principal_id", ""), app=f.get("app_object_id") or "",
-                        owner=owner.get("object_id", ""))
+                    add(serve_field_map("dynamic-groups-table", f), gid=gid)
             elif res["id"] == "ad_sync_users":
-                add({"adUser": f.get("user_display") or "", "adUpn": f.get("user_upn") or "",
-                     "adCn": f.get("ad_cn") or "", "adDn": f.get("ad_dn") or "",
-                     "adSid": f.get("ad_sid") or "", "adPw": f.get("pw_change") or "",
-                     "adTags": ", ".join(f.get("tags", [])),
-                     "caExcl": str(len(f.get("ca_exclusions", []))),
-                     "adStatus": "Enabled" if (f.get("status") or {}).get("enabled") else "Disabled"},
-                    owner=f.get("user_id", ""))
+                add(serve_field_map("ad-sync-users-table", f), owner=f.get("user_id", ""))
             elif res["id"] == "ca_exposure":
-                add({"polName": f.get("policy_name") or "", "polState": f.get("state") or "",
-                     "polScope": f.get("scope") or "",
-                     "polApps": ", ".join((f.get("conditions_html") or {}).get("apps") or []),
-                     "polControls": ", ".join((f.get("conditions_html") or {}).get("controls") or []),
-                     "polInc": str(len(f.get("included", []))),
-                     "polExc": str(len(f.get("excluded", []))),
-                     "severity": f.get("severity", "Info")},
-                    pid=f.get("policy_id", ""))
+                add(serve_field_map("table-ca_exposure", f), pid=f.get("policy_id", ""))
             else:
                 t = f.get("target") or {}
-                add({"target": t.get("name") or "", "targetType": t.get("type") or "",
-                     "id": t.get("id") or "",
-                     "pw": str(f.get("pw")) if f.get("pw") is not None else "",
-                     "keys": str(f.get("keys")) if f.get("keys") is not None else "",
-                     "roleCount": str(f.get("roles")) if f.get("roles") is not None else "",
-                     "status": (f.get("status") or {}).get("label") or "",
-                     "severity": f.get("severity", "Info")},
+                add(serve_field_map(_serve_table_id(res["id"]), f),
                     sp=sp_id, app=app_id, owner=owner_id,
                     pid=t.get("id", "") if t.get("type") == "Policy" else "")
     return records
@@ -6557,13 +7535,56 @@ def serve_table_response(table_id, qs):
     if not entry:
         return {"error": f"unknown table: {table_id}"}, 404
     q = (qs.get("q") or [""])[0]
+    mode = (qs.get("mode") or [""])[0]
     page = _serve_int(qs, "page", 1, 1, 10 ** 9)
     size = _serve_int(qs, "size", 250, 25, 2000)
     sort = (qs.get("sort") or [""])[0]
     desc = ((qs.get("dir") or ["asc"])[0]).lower() == "desc"
     skmap = entry.get("sort_keys") or {}
     sort_key = skmap.get(sort, sort)
-    rows, total = entry["rows"](entry["findings"], q=q, sort_key=sort_key, desc=desc)
+    findings = entry["findings"]
+    row_q = q
+    if mode == "advanced" and q:
+        try:
+            ast = parse_advanced_query(q)
+        except AdvancedParseError:
+            ast = None  # fall back to substring behaviour below
+        if ast is not None:
+            if table_id == "owned-table":
+                # the owned table renders one row per owner: filter at the
+                # (finding, owner) row level so owner predicates keep only the
+                # matching owner rows (same semantics as the static report)
+                filtered = []
+                for f in findings:
+                    owners = [o for o in f.get("owners", [])
+                              if evaluate_advanced(
+                                  ast, serve_field_map("owned-table", f, o),
+                                  entry["search"](f))]
+                    if owners:
+                        f2 = dict(f)
+                        f2["owners"] = owners
+                        filtered.append(f2)
+                findings = filtered
+            else:
+                findings = [f for f in findings
+                            if evaluate_advanced(ast, serve_field_map(table_id, f),
+                                                 entry["search"](f))]
+            row_q = ""
+    if table_id == "owned-table":
+        # one row per owner: paginate by row, not by finding
+        rows_html, _ = entry["rows"](findings, q=row_q, sort_key=sort_key, desc=desc)
+        total = len(rows_html)
+        pages = max(1, -(-total // size))
+        page = min(page, pages)
+        start = (page - 1) * size
+        return {
+            "rows_html": "".join(rows_html[start:start + size]),
+            "total": total,
+            "page": page,
+            "pages": pages,
+            "size": size,
+        }, 200
+    rows, total = entry["rows"](findings, q=row_q, sort_key=sort_key, desc=desc)
     pages = max(1, -(-total // size))
     page = min(page, pages)
     start = (page - 1) * size
