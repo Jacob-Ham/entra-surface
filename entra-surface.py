@@ -121,7 +121,8 @@ DEFAULT_ROLE_LABELS = {
 CATEGORY_ORDER = ["apps", "users", "ad", "groups", "configs"]
 # Which role class can fabricate membership in a dynamic group by editing the
 # referenced user attribute (Entra's rule grammar: `user.<attribute>`). A group
-# is flagged per category when its rule references ANY attribute in that list.
+# is tagged per category only when EVERY attribute referenced by its rule is
+# modifiable by that role class.
 DYN_USER_MODIFIABLE = {
     "givenName", "surname", "streetAddress", "state", "postalCode", "country",
     "telephoneNumber", "mobile", "otherMails",
@@ -153,7 +154,10 @@ DYNAMIC_RULE_CATEGORIES = [
 
 def classify_dynamic_rule(rule):
     """Extract user-attribute references from an Entra membership rule and map
-    them onto the role classes that could modify those attributes."""
+    them onto the role classes that could modify those attributes.
+
+    A role class is only tagged when it can modify EVERY attribute referenced
+    by the rule; attributes outside all known sets tag nothing."""
     rule = rule or ""
     attrs = set(re.findall(r"user\.([A-Za-z]+)", rule))
     # also catch bare attribute tokens (rules without the user. prefix)
@@ -161,7 +165,8 @@ def classify_dynamic_rule(rule):
         if re.search(rf"(?<![A-Za-z]){re.escape(name)}(?![A-Za-z])", rule):
             attrs.add(name)
     matched = sorted(attrs)
-    mods = [label for label, cat in DYNAMIC_RULE_CATEGORIES if attrs & cat]
+    mods = [label for label, cat in DYNAMIC_RULE_CATEGORIES
+            if attrs and attrs <= cat]
     return matched, mods
 
 
@@ -243,6 +248,14 @@ def truncate(text, width=110):
 
 def severity_rank(severity):
     return SEVERITY_ORDER.get(severity, 9)
+
+
+PRIVILEGED_MAX_RANK = 1  # Critical (0) and High (1)
+
+
+def is_privileged(severity):
+    """True when `severity` is Critical or High."""
+    return severity_rank(severity) <= PRIVILEGED_MAX_RANK
 
 
 # ---------------------------------------------------------------------------
@@ -893,14 +906,11 @@ def check_priv_app_ownership(ctx):
     # SPs holding privileged (Critical/High) directory roles, directly or
     # through group membership — same ownership question as app-role grants.
     # PIM-eligible roles are marker-only and never create ownership findings.
-    role_sev = ctx["check_cfg"]["directory_roles"]
-    group_roles = ctx["group_roles"]
-    group_eligible_roles = ctx.get("group_eligible_roles") or {}
+    resolve_sp = ctx["sp_dir_resolver"]
     for principal_id in sorted(graph["sp"]):
         sp = graph["sp"][principal_id]
-        roles = [r for r in sp_directory_roles(graph, group_roles, principal_id,
-                                               role_sev, group_eligible_roles)
-                 if not r.get("eligible") and severity_rank(r["severity"]) <= severity_rank("High")]
+        roles = [r for r in resolve_sp(principal_id)
+                 if not r.get("eligible") and is_privileged(r["severity"])]
         if not roles:
             continue
         if not include_disabled and (not sp.get("accountEnabled") or sp.get("deletionTimestamp")):
@@ -1174,14 +1184,12 @@ def check_app_directory_roles(ctx):
     critical active directory role per the 'directory_roles' config (unrated =
     Info); PIM-eligible roles are marker-only and never raise the rating."""
     graph = ctx["graph"]
-    group_roles = ctx["group_roles"]
-    group_eligible_roles = ctx.get("group_eligible_roles") or {}
     role_sev = ctx["check_cfg"]["directory_roles"]
+    resolve_sp = ctx["sp_dir_resolver"]
     findings = []
     for sp_oid in sorted(graph["sp"]):
         rec = graph["sp"][sp_oid]
-        roles = sp_directory_roles(graph, group_roles, sp_oid, role_sev,
-                                   group_eligible_roles)
+        roles = resolve_sp(sp_oid)
         if not roles:
             continue
         active = [r for r in roles if not r.get("eligible")]
@@ -1227,10 +1235,6 @@ def check_privileged_users(ctx):
 
     def sev_of(name):
         return role_sev.get(name, "Info")
-
-    def role_name(oid):
-        rec = graph["directory_role"].get(oid)
-        return rec.get("displayName") if rec else oid
 
     def def_name(oid):
         rec = graph["role_definition"].get(oid)
@@ -1315,19 +1319,15 @@ def check_privileged_users(ctx):
             user_devices[uid].append(did)
 
     # ---- direct directory roles ------------------------------------------
-    for role_oid, uid in graph["role_member_user"]:
+    for uid, roles in direct_directory_roles_by_user(graph, role_sev).items():
         p = ensure(uid)
-        name = role_name(role_oid)
-        p["roles"].append({"name": name, "severity": sev_of(name), "source": "role member"})
+        p["roles"].extend(roles)
 
     for ra in graph["directory_role_assigns"]:
         pid = ra["principal_id"]
-        name = def_name(ra["role_definition_id"])
-        if pid in graph["user"]:
-            p = ensure(pid)
-            p["roles"].append({"name": name, "severity": sev_of(name), "source": "role assignment"})
-        elif pid in graph["sp"]:
+        if pid in graph["sp"]:
             sp = graph["sp"][pid]
+            name = def_name(ra["role_definition_id"])
             for owner in graph["sp_owners"].get(pid, set()):
                 ensure(owner)["dir_sp_roles"].append(
                     {"sp_name": sp_name(sp), "role": name, "severity": sev_of(name)})
@@ -1657,10 +1657,10 @@ def check_ad_sync_users(ctx):
         if not app:
             continue
         for sp_oid in graph["sp_by_appid"].get(app.get("appId"), []):
-            if any(severity_rank(g[1]) <= 1 for g in grants_by_sp.get(sp_oid, [])):
+            if any(is_privileged(g[1]) for g in grants_by_sp.get(sp_oid, [])):
                 priv_owner_ids |= uids
     for sp_oid, uids in graph["sp_owners"].items():
-        if any(severity_rank(g[1]) <= 1 for g in grants_by_sp.get(sp_oid, [])):
+        if any(is_privileged(g[1]) for g in grants_by_sp.get(sp_oid, [])):
             priv_owner_ids |= uids
 
     # ---- realm meta --------------------------------------------------------
@@ -2103,6 +2103,74 @@ def resolve_group_role_paths(gid, group_roles, group_member_group, group_label):
     return sorted(found.values(), key=lambda r: severity_rank(r["severity"]))
 
 
+def direct_directory_roles_by_user(graph, role_sev):
+    """{user_id: [{name, severity, source}]} directly-assigned directory roles
+    per user (role memberships + role assignments), deduped by name with merged
+    sources. Shared by the privileged-users and groups checks."""
+    out = defaultdict(list)
+
+    def _role_name(oid):
+        rec = graph["directory_role"].get(oid)
+        return rec.get("displayName") if rec else oid
+
+    def _def_name(oid):
+        rec = graph["role_definition"].get(oid)
+        return rec.get("displayName") if rec else oid
+
+    for role_oid, uid in graph["role_member_user"]:
+        name = _role_name(role_oid)
+        out[uid].append({"name": name, "severity": role_sev.get(name, "Info"),
+                         "source": "role member"})
+    for ra in graph["directory_role_assigns"]:
+        if ra["principal_id"] in graph["user"]:
+            name = _def_name(ra["role_definition_id"])
+            out[ra["principal_id"]].append({"name": name,
+                                            "severity": role_sev.get(name, "Info"),
+                                            "source": "role assignment"})
+    for uid in list(out):
+        merged = {}
+        for r in out[uid]:
+            key = r["name"]
+            if key not in merged:
+                merged[key] = r
+            else:
+                srcs = [s.strip() for s in merged[key]["source"].split("\u00b7")]
+                if r["source"] not in srcs:
+                    srcs.append(r["source"])
+                merged[key]["source"] = " \u00b7 ".join(srcs)
+        out[uid] = sorted(merged.values(), key=lambda r: severity_rank(r["severity"]))
+    return dict(out)
+
+
+def direct_directory_roles_by_sp(graph, role_sev):
+    """{sp_id: [{name, severity}]} directly-assigned directory roles per service
+    principal (lnk_role_member_serviceprincipal + RoleAssignments), deduped by
+    name. Shared by sp_directory_roles and the groups member tags."""
+    out = defaultdict(list)
+
+    def _role_name(oid):
+        rec = graph["directory_role"].get(oid)
+        return rec.get("displayName") if rec else oid
+
+    def _def_name(oid):
+        rec = graph["role_definition"].get(oid)
+        return rec.get("displayName") if rec else oid
+
+    for role_oid, sp_oid in graph["role_member_sp"]:
+        name = _role_name(role_oid)
+        out[sp_oid].append({"name": name, "severity": role_sev.get(name, "Info")})
+    for ra in graph["directory_role_assigns"]:
+        if ra["principal_id"] in graph["sp"]:
+            name = _def_name(ra["role_definition_id"])
+            out[ra["principal_id"]].append({"name": name,
+                                            "severity": role_sev.get(name, "Info")})
+    for sp_oid in list(out):
+        seen = set()
+        out[sp_oid] = [r for r in out[sp_oid]
+                       if not (r["name"] in seen or seen.add(r["name"]))]
+    return dict(out)
+
+
 def compute_group_roles(graph, check_cfg):
     """{group_id: [{"name", "severity"}]} - directory roles carried by each group:
     direct role memberships (lnk_role_member_group) plus role assignments whose
@@ -2136,16 +2204,13 @@ def compute_group_roles(graph, check_cfg):
     return group_roles
 
 
-def sp_directory_roles(graph, group_roles, sp_oid, role_sev, group_eligible_roles=None):
+def sp_directory_roles(graph, group_roles, sp_oid, role_sev, group_eligible_roles=None,
+                       direct_sp_roles=None):
     """Directory roles held by a service principal: direct memberships and
     assignments plus roles inherited through group membership (incl. nesting).
     Each entry carries the group path to the role-bearing group (None when
     assigned directly) and an 'eligible' flag — PIM-eligible roles are marker
     data and never affect severity ratings."""
-    def _dir_role_name(oid):
-        rec = graph["directory_role"].get(oid)
-        return rec.get("displayName") if rec else oid
-
     def _def_name(oid):
         rec = graph["role_definition"].get(oid)
         return rec.get("displayName") if rec else oid
@@ -2154,12 +2219,10 @@ def sp_directory_roles(graph, group_roles, sp_oid, role_sev, group_eligible_role
         rec = graph["group"].get(gid)
         return rec.get("displayName") if rec else gid
 
-    roles = []
-    for role_oid, member in graph["role_member_sp"]:
-        if member == sp_oid:
-            name = _dir_role_name(role_oid)
-            roles.append({"name": name, "severity": role_sev.get(name, "Info"),
-                          "path": None, "eligible": False})
+    if direct_sp_roles is None:
+        direct_sp_roles = direct_directory_roles_by_sp(graph, role_sev)
+    roles = [{"name": r["name"], "severity": r["severity"], "path": None, "eligible": False}
+             for r in direct_sp_roles.get(sp_oid, [])]
     seen = {r["name"] for r in roles}
     for gid, members in graph["group_member_sp"].items():
         if sp_oid not in members:
@@ -2190,6 +2253,23 @@ def sp_directory_roles(graph, group_roles, sp_oid, role_sev, group_eligible_role
                     roles.append({"name": r["name"], "severity": r["severity"],
                                   "path": list(r["path"]), "eligible": True})
     return roles
+
+
+def make_sp_dir_resolver(graph, group_roles, role_sev, group_eligible_roles=None):
+    """Memoized resolver of a service principal's directory roles (active +
+    PIM-eligible, with group paths). Shared across the checks, the severity
+    bump and the entity profiles so the group walks run once per SP per run."""
+    direct_sp_roles = direct_directory_roles_by_sp(graph, role_sev)
+    cache = {}
+
+    def resolve(sp_oid):
+        if sp_oid not in cache:
+            cache[sp_oid] = sp_directory_roles(
+                graph, group_roles, sp_oid, role_sev, group_eligible_roles,
+                direct_sp_roles=direct_sp_roles)
+        return cache[sp_oid]
+
+    return resolve
 
 
 def build_role_applications(graph, group_roles, group_eligible_roles=None):
@@ -2293,30 +2373,8 @@ def check_groups(ctx):
     group_roles = ctx["group_roles"]
     group_eligible_roles = ctx.get("group_eligible_roles") or {}
 
-    def sev_of(name):
-        return role_sev.get(name, "Info")
-
-    def role_name(oid):
-        rec = graph["directory_role"].get(oid)
-        return rec.get("displayName") if rec else oid
-
-    def def_name(oid):
-        rec = graph["role_definition"].get(oid)
-        return rec.get("displayName") if rec else oid
-
-    # directory roles held per USER (drives the privileged-member column)
-    user_roles = defaultdict(list)
-    for role_oid, uid in graph["role_member_user"]:
-        name = role_name(role_oid)
-        user_roles[uid].append({"name": name, "severity": sev_of(name)})
-    for ra in graph["directory_role_assigns"]:
-        if ra["principal_id"] in graph["user"]:
-            name = def_name(ra["role_definition_id"])
-            user_roles[ra["principal_id"]].append({"name": name, "severity": sev_of(name)})
-    for uid in list(user_roles):
-        seen = set()
-        user_roles[uid] = [r for r in user_roles[uid]
-                           if not (r["name"] in seen or seen.add(r["name"]))]
+    # direct directory roles per user (drives the privileged-member column)
+    user_roles = direct_directory_roles_by_user(graph, role_sev)
 
     def user_primary(uid):
         u = graph["user"].get(uid)
@@ -2342,11 +2400,8 @@ def check_groups(ctx):
                 gid, group_roles, graph["group_member_group"], group_label)
         return role_path_cache[gid]
 
-    # direct directory roles per SP (lnk_role_member_serviceprincipal)
-    sp_dir_roles = defaultdict(list)
-    for role_oid, sp_oid in graph["role_member_sp"]:
-        rname = role_name(role_oid)
-        sp_dir_roles[sp_oid].append({"name": rname, "severity": sev_of(rname)})
+    # direct directory roles per SP (memberships + role assignments)
+    sp_dir_roles = direct_directory_roles_by_sp(graph, role_sev)
 
     # privileged app-role assignments per SP, rated by the resources config
     # (same criticality tags as the priv_app_ownership findings)
@@ -2431,7 +2486,7 @@ def check_groups(ctx):
                 "name": u.get("displayName") or uid,
                 "upn": u.get("userPrincipalName") or "",
                 "roles": roles,
-                "privileged": any(severity_rank(r["severity"]) <= 1 for r in roles),
+                "privileged": any(is_privileged(r["severity"]) for r in roles),
             })
         members.sort(key=lambda m: (not m["privileged"], (m["name"] or "").lower()))
         priv_members = [m for m in members if m["privileged"]]
@@ -2769,7 +2824,8 @@ CHECK_SPECS = [
 CHECK_IDS = {spec["id"] for spec in CHECK_SPECS}
 
 
-def run_checks(graph, config_resources, check_cfg, args):
+def run_checks(graph, config_resources, check_cfg, args,
+               group_roles=None, group_eligible_roles=None, sp_dir_resolver=None):
     """Run the selected checks and return the list of {spec, findings} results."""
     opts = {"include_disabled": args.include_disabled}
     check_config = dict(check_cfg)
@@ -2849,12 +2905,18 @@ def run_checks(graph, config_resources, check_cfg, args):
                         capable_groups.add(child)
                         changed = True
 
-    group_roles = compute_group_roles(graph, check_config)
-    group_eligible_roles = compute_group_eligible_roles(graph, check_config)
+    if group_roles is None:
+        group_roles = compute_group_roles(graph, check_config)
+    if group_eligible_roles is None:
+        group_eligible_roles = compute_group_eligible_roles(graph, check_config)
+    if sp_dir_resolver is None:
+        sp_dir_resolver = make_sp_dir_resolver(
+            graph, group_roles, check_config["directory_roles"], group_eligible_roles)
 
     ctx["capable_groups"] = capable_groups
     ctx["group_roles"] = group_roles
     ctx["group_eligible_roles"] = group_eligible_roles
+    ctx["sp_dir_resolver"] = sp_dir_resolver
 
     results = []
     for spec in selected:
@@ -2913,14 +2975,7 @@ def run_checks(graph, config_resources, check_cfg, args):
     # Every finding whose principals include service principals is rated by the
     # SP's directory roles (direct + via group membership): the finding's
     # severity is raised to the most critical directory role it holds.
-    sp_dir_cache = {}
-
-    def sp_dir_tags(sp_oid):
-        if sp_oid not in sp_dir_cache:
-            sp_dir_cache[sp_oid] = sp_directory_roles(
-                graph, group_roles, sp_oid, check_config["directory_roles"],
-                group_eligible_roles)
-        return sp_dir_cache[sp_oid]
+    sp_dir_tags = sp_dir_resolver
 
     for res in results:
         for f in res["findings"]:
@@ -3028,14 +3083,21 @@ def fetch_full_details(cur, sp_ids, app_ids, user_ids, device_ids=None):
     }
 
 
-def build_entity_profiles(graph, check_cfg, sp_ids, app_ids):
+def build_entity_profiles(graph, check_cfg, sp_ids, app_ids,
+                          group_roles=None, group_eligible_roles=None,
+                          sp_dir_resolver=None):
     """Relationship data for the tabbed SP/app 'more info' drawer:
     owners, directory roles, group memberships, and the two app-role views
     (roles this principal grants to others / roles granted to it)."""
     role_sev = check_cfg["directory_roles"]
     role_labels = check_cfg.get("role_labels") or {}
-    group_roles = compute_group_roles(graph, check_cfg)
-    group_eligible_roles = compute_group_eligible_roles(graph, check_cfg)
+    if group_roles is None:
+        group_roles = compute_group_roles(graph, check_cfg)
+    if group_eligible_roles is None:
+        group_eligible_roles = compute_group_eligible_roles(graph, check_cfg)
+    if sp_dir_resolver is None:
+        sp_dir_resolver = make_sp_dir_resolver(graph, group_roles, role_sev,
+                                               group_eligible_roles)
     app_roles_cache = {}  # sp_oid -> {role_id: {value, description}}
 
     def catalog_entry(value, description):
@@ -3079,7 +3141,7 @@ def build_entity_profiles(graph, check_cfg, sp_ids, app_ids):
         return sp_label(pid)
 
     def dir_roles_for(sp_oid):
-        return sp_directory_roles(graph, group_roles, sp_oid, role_sev, group_eligible_roles)
+        return sp_dir_resolver(sp_oid)
 
     def groups_for(sp_oid):
         return [{"name": graph["group"][g].get("displayName") or g}
@@ -3586,6 +3648,23 @@ def app_dir_sort_value(f, key):
 APP_DIR_SORT_KEYS = {str(i): str(i) for i in range(1, 6)}
 
 
+def app_dir_role_chip(r):
+    """Chip for one directory-role entry in the app-dir-roles table; eligible
+    (PIM) entries get a muted (PIM) marker and a tooltip with the path."""
+    if r.get("eligible"):
+        title = r["name"] + " \u2014 PIM eligible"
+        if r.get("path"):
+            title += " \u2014 via " + " \u2192 ".join(r["path"])
+        label = f'{esc(r["name"])} <span class="muted">(PIM)</span>'
+    else:
+        title = (r["name"] + " \u2014 via " + " \u2192 ".join(r["path"])
+                 if r.get("path") else r["name"] + " \u2014 direct assignment")
+        label = esc(r["name"])
+    return (f'<span class="badge {severity_class(r["severity"])} role-badge" '
+            f'data-role="{esc(r["name"])}" data-role-field="roles" '
+            f'title="{esc(title)}">{label}</span> ')
+
+
 def app_dir_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None):
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
                                 app_dir_search_text, app_dir_sort_value)
@@ -3593,22 +3672,7 @@ def app_dir_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=N
     for f in selected:
         key = f"row-{len(out)}"
         tags = f.get("dir_role_tags", [])
-
-        def role_chip(r):
-            if r.get("eligible"):
-                title = r["name"] + " \u2014 PIM eligible"
-                if r.get("path"):
-                    title += " \u2014 via " + " \u2192 ".join(r["path"])
-                label = f'{esc(r["name"])} <span class="muted">(PIM)</span>'
-            else:
-                title = (r["name"] + " \u2014 via " + " \u2192 ".join(r["path"])
-                         if r.get("path") else r["name"] + " \u2014 direct assignment")
-                label = r["name"]
-            return (f'<span class="badge {severity_class(r["severity"])} role-badge" '
-                    f'data-role="{esc(r["name"])}" data-role-field="roles" '
-                    f'title="{esc(title)}">{label}</span> ')
-
-        role_chips = "".join(role_chip(r) for r in tags)
+        role_chips = "".join(app_dir_role_chip(r) for r in tags)
         out.append(f"""
         <tr data-sp-id="{esc(f.get("sp_id") or "")}" data-detail-key="{key}">
           <td class="expand-cell">{EXPAND_BUTTON_HTML}</td>
@@ -3816,7 +3880,8 @@ def realm_card_html(meta):
 
 def render_report(results, tenant_name, db_path, config_path, include_disabled, entity_details,
                   min_severity_label, entity_profiles=None, tenant_summary=None, graph=None,
-                  serve_mode=False, serve_tables=None, check_cfg=None):
+                  serve_mode=False, serve_tables=None, group_roles=None,
+                  group_eligible_roles=None):
     all_findings = [f for res in results for f in res["findings"]]
 
     category_counts = Counter(res["category"] for res in results for _ in res["findings"])
@@ -4420,8 +4485,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     # directory role -> service principals holding it (drilldown 'Applications' tab);
     # small index, embedded in serve mode too
     role_apps_json = json.dumps(
-        build_role_applications(graph, compute_group_roles(graph, check_cfg or {}),
-                                compute_group_eligible_roles(graph, check_cfg or {})),
+        build_role_applications(graph, group_roles, group_eligible_roles),
         default=str).replace("</", "<\\/")
 
     # ---- tabs ------------------------------------------------------------
@@ -5193,6 +5257,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 }})();
 
 (function() {{
+  var MEMBER_CAP = 500;
   var DETAILS = {{ sp: {{}}, app: {{}}, user: {{}}, device: {{}} }};
   try {{ DETAILS = JSON.parse(document.getElementById('entity-details-data').textContent); }} catch (e) {{}}
   var PROFILES = {{}};
@@ -5526,8 +5591,8 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         + pSection('Owners (' + ((g.owners || []).length) + ')', ownersHtml)
         + pSection('Membership', membershipHtml);
     var allMembers = g.members || [];
-    var capped = allMembers.length > 500;
-    var shownMembers = capped ? allMembers.slice(0, 500) : allMembers;
+    var capped = allMembers.length > MEMBER_CAP;
+    var shownMembers = capped ? allMembers.slice(0, MEMBER_CAP) : allMembers;
     var memberRows = shownMembers.map(function(m) {{
       var roleHtml = (m.roles || []).filter(function(r) {{ return r.severity !== 'Info'; }})
           .map(function(r) {{
@@ -5550,10 +5615,10 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
               return '<tr><td>' + pEsc(r.member) + '</td><td>' + pEsc(r.name) + '</td><td>' + r.roles + '</td><td>' + pEsc(r.priv) + '</td></tr>';
             }}).join('') + '</tbody></table>'
         : '<p class="muted">No user members recorded.</p>';
-    if (capped) membersHtml += '<p class="muted">Showing first 500 of ' + allMembers.length + ' members.</p>';
+    if (capped) membersHtml += '<p class="muted">Showing first ' + MEMBER_CAP + ' of ' + allMembers.length + ' members.</p>';
     var allSpMembers = g.sp_members || [];
-    var cappedSp = allSpMembers.length > 500;
-    var shownSpMembers = cappedSp ? allSpMembers.slice(0, 500) : allSpMembers;
+    var cappedSp = allSpMembers.length > MEMBER_CAP;
+    var shownSpMembers = cappedSp ? allSpMembers.slice(0, MEMBER_CAP) : allSpMembers;
     var spMemberRows = shownSpMembers.map(function(m) {{
       var roleHtml = (m.roles || []).filter(function(r) {{ return r.severity !== 'Info'; }})
           .map(function(r) {{
@@ -5578,7 +5643,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
               return '<tr><td>' + r.name + '</td><td class="mono">' + pEsc(r.object_id) + '</td><td>' + r.roles + '</td><td>' + pEsc(r.status) + '</td></tr>';
             }}).join('') + '</tbody></table>'
         : '<p class="muted">No app (service principal) members recorded.</p>';
-    if (cappedSp) spMembersHtml += '<p class="muted">Showing first 500 of ' + allSpMembers.length + ' SP members.</p>';
+    if (cappedSp) spMembersHtml += '<p class="muted">Showing first ' + MEMBER_CAP + ' of ' + allSpMembers.length + ' SP members.</p>';
     var panes = [
       ['overview', 'Overview', overview],
       ['azure', 'Azure roles (' + (g.az_roles ? g.az_roles.length : 0) + ')', azTableHtml(g.az_roles || [], false)],
@@ -6688,7 +6753,20 @@ def main():
     azure_role_sev = load_azure_roles(args.azure_config)
     check_cfg["azure_roles"] = azure_role_sev
     timed("apply_azure_severity", lambda: apply_azure_severity(graph, azure_role_sev))
-    results = timed("run_checks", lambda: run_checks(graph, config_resources, check_cfg, args))
+    # shared role resolution: computed once, reused by the checks, the
+    # severity bump, the entity profiles and the report embed
+    group_roles = timed("compute_group_roles",
+                        lambda: compute_group_roles(graph, check_cfg))
+    group_eligible_roles = timed("compute_group_eligible_roles",
+                                 lambda: compute_group_eligible_roles(graph, check_cfg))
+    sp_dir_resolver = make_sp_dir_resolver(graph, group_roles,
+                                           check_cfg["directory_roles"],
+                                           group_eligible_roles)
+    results = timed("run_checks",
+                    lambda: run_checks(graph, config_resources, check_cfg, args,
+                                       group_roles=group_roles,
+                                       group_eligible_roles=group_eligible_roles,
+                                       sp_dir_resolver=sp_dir_resolver))
 
     sp_ids = set()
     app_ids = set()
@@ -6723,7 +6801,11 @@ def main():
         # in-memory findings on demand) - keep the shell lean
         entity_details["user"] = {}
     entity_profiles = timed("build_entity_profiles",
-                            lambda: build_entity_profiles(graph, check_cfg, sp_ids, app_ids))
+                            lambda: build_entity_profiles(
+                                graph, check_cfg, sp_ids, app_ids,
+                                group_roles=group_roles,
+                                group_eligible_roles=group_eligible_roles,
+                                sp_dir_resolver=sp_dir_resolver))
     tenant_summary = timed("build_tenant_summary",
                            lambda: build_tenant_summary(graph, results))
     conn.close()
@@ -6743,7 +6825,8 @@ def main():
                                               min_severity_label, entity_profiles_render,
                                               tenant_summary, graph=graph,
                                               serve_mode=args.serve, serve_tables=serve_tables,
-                                              check_cfg=check_cfg))
+                                              group_roles=group_roles,
+                                              group_eligible_roles=group_eligible_roles))
 
     total = sum(len(res["findings"]) for res in results)
 
