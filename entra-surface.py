@@ -4564,7 +4564,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
                 '<button type="button" class="icon-btn tp-next">Next &#8594;</button>'
                 '<label class="muted">Rows '
                 '<select class="tp-size">'
-                '<option value="100">100</option><option value="250" selected>250</option>'
+                '<option value="25" selected>25</option><option value="50">50</option><option value="100">100</option><option value="250">250</option>'
                 '<option value="500">500</option><option value="1000">1000</option>'
                 '</select></label></div>')
 
@@ -5045,7 +5045,6 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     <h2>{esc(res["title"])} {severity_badge(f["severity"])}</h2>
     <div class="engine-card">
       <table class="kv-table">{''.join(rows)}</table>
-      <p class="eng-note">&#9888; {esc(f.get("remediation") or "")}</p>
     </div>
   </section>
 """
@@ -5249,52 +5248,52 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     --surface-1:      #fcfcfb;
     --page-plane:     #f9f9f7;
     --text-primary:   #0b0b0b;
-    --text-secondary: #52514e;
-    --text-muted:     #898781;
+    --text-secondary: #46453f;
+    --text-muted:     #6b6961;
     --gridline:       #e1e0d9;
     --border:         rgba(11,11,11,0.10);
-    --status-critical:#b3443f;
-    --status-serious: #cf7a54;
-    --status-medium:  #ab9536;
-    --status-low:     #617fbb;
-    --status-good:    #2e8b57;
-    --row-hover:      #f0efec;
-    --accent:         #3569b4;
+    --status-critical:#a23731;
+    --status-serious: #b95c26;
+    --status-medium:  #8a7a1f;
+    --status-low:     #4a659e;
+    --status-good:    #22703f;
+    --row-hover:      #e8e6df;
+    --accent:         #2f63a8;
   }}
   @media (prefers-color-scheme: dark) {{
     :root:where(:not([data-theme="light"])) {{
       color-scheme: dark;
-      --surface-1:      #1a1a19;
-      --page-plane:     #0d0d0d;
+      --surface-1:      #232321;
+      --page-plane:     #181816;
       --text-primary:   #ffffff;
-      --text-secondary: #c3c2b7;
-      --text-muted:     #898781;
-      --gridline:       #2c2c2a;
-      --border:         rgba(255,255,255,0.10);
+      --text-secondary: #d2d1c6;
+      --text-muted:     #9d9b91;
+      --gridline:       #3a3a36;
+      --border:         rgba(255,255,255,0.13);
       --status-critical:#b3443f;
       --status-serious: #cf7a54;
       --status-medium:  #ab9536;
       --status-low:     #617fbb;
       --status-good:    #2e8b57;
-      --row-hover:      #242422;
+      --row-hover:      #2d2d2a;
       --accent:         #7fa7e0;
     }}
   }}
   :root[data-theme="dark"] {{
     color-scheme: dark;
-    --surface-1:      #1a1a19;
-    --page-plane:     #0d0d0d;
+    --surface-1:      #232321;
+    --page-plane:     #181816;
     --text-primary:   #ffffff;
-    --text-secondary: #c3c2b7;
-    --text-muted:     #898781;
-    --gridline:       #2c2c2a;
-    --border:         rgba(255,255,255,0.10);
+    --text-secondary: #d2d1c6;
+    --text-muted:     #9d9b91;
+    --gridline:       #3a3a36;
+    --border:         rgba(255,255,255,0.13);
     --status-critical:#b3443f;
     --status-serious: #cf7a54;
     --status-medium:  #ab9536;
     --status-low:     #617fbb;
     --status-good:    #2e8b57;
-    --row-hover:      #242422;
+    --row-hover:      #2d2d2a;
     --accent:         #7fa7e0;
   }}
   * {{ box-sizing: border-box; }}
@@ -5377,6 +5376,10 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   .filter-error {{
     width: 100%; color: var(--status-critical); font-size: 12px; margin-top: 4px;
   }}
+  th.col-drag-source {{ opacity: 0.45; }}
+  body.col-dragging {{ cursor: grabbing; user-select: none; }}
+  body.col-dragging th {{ cursor: grabbing; }}
+  th.col-drop-target {{ outline: 2px dashed var(--accent); outline-offset: -3px; }}
   section {{ margin-top: 32px; }}
   section[data-category] {{ margin-top: 26px; }}
   section.hidden {{ display: none; }}
@@ -5428,7 +5431,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   .badge-enabled {{ color: var(--status-good); border-color: color-mix(in srgb, var(--status-good) 45%, transparent); }}
   .badge-disabled {{ color: var(--text-muted); border-color: var(--border); }}
   .badge-guest {{ color: var(--status-serious); border-color: color-mix(in srgb, var(--status-serious) 45%, transparent); }}
-  .badge-hybrid {{ color: var(--status-medium); border-color: color-mix(in srgb, var(--status-medium) 45%, transparent); }}
+  .badge-hybrid {{ color: var(--text-muted); border-color: var(--border); }}
   .tag-chip {{
     display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600;
     border: 1px solid var(--border); color: var(--text-secondary);
@@ -5446,7 +5449,6 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     background: var(--surface-1); margin: 4px 0 6px;
   }}
   .engine-card .kv-table {{ width: 100%; }}
-  .engine-card .eng-note {{ margin: 10px 0 0; color: var(--text-secondary); font-size: 12px; line-height: 1.55; }}
   .perm {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; border-bottom: 1px dotted var(--text-muted); cursor: default; overflow-wrap: anywhere; }}
   .az-count {{ display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; border: 1px solid var(--border); color: var(--text-primary); background: var(--surface-1); margin-right: 4px; vertical-align: 1px; }}
   td.clickable {{ cursor: pointer; }}
@@ -7133,12 +7135,115 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     input.dispatchEvent(new Event('input', {{ bubbles: true }}));
   }});
 
+  // ---- column reordering (drag headers; session only) --------------------
+  var suppressSortClick = 0;
+
+  function stampColumnIds() {{
+    allTables().forEach(function(table) {{
+      Array.prototype.forEach.call(table.tHead.rows[0].cells, function(th, i) {{
+        if (!th.classList.contains('no-sort')) {{
+          if (th.dataset.colidx === undefined) th.dataset.colidx = String(i);
+          th.title = 'Click to sort · drag to reorder';
+        }}
+      }});
+    }});
+  }}
+
+  function applyColumnOrder(table) {{
+    // Rebuild every data row so its cells follow the thead's current order
+    // (clone-based: all interactive handlers are document-delegated).
+    var theadCells = table.tHead.rows[0].cells;
+    var order = [];
+    var identity = true;
+    for (var i = 0; i < theadCells.length; i++) {{
+      var cidx = theadCells[i].dataset.colidx;
+      var o = cidx === undefined ? i : parseInt(cidx, 10);
+      if (o !== i) identity = false;
+      order.push(o);
+    }}
+    if (identity) return;
+    Array.prototype.forEach.call(table.tBodies[0].rows, function(row) {{
+      if (row.classList.contains('drawer')) return;
+      var cells = Array.prototype.slice.call(row.cells);
+      var reordered = [];
+      for (var o = 0; o < order.length; o++) reordered.push(cells[order[o]].cloneNode(true));
+      row.innerHTML = '';
+      for (var c = 0; c < reordered.length; c++) row.appendChild(reordered[c]);
+    }});
+  }}
+
+  function moveColumn(table, sourceTh, targetTh) {{
+    var headerRow = table.tHead.rows[0];
+    var srcIdx = Array.prototype.indexOf.call(headerRow.cells, sourceTh);
+    var tgtIdx = Array.prototype.indexOf.call(headerRow.cells, targetTh);
+    if (srcIdx < 0 || tgtIdx < 0) return;
+    headerRow.insertBefore(sourceTh, targetTh);
+    // keep colgroup widths aligned with the header order
+    var cols = table.querySelectorAll('colgroup col');
+    if (cols.length) {{
+      var srcCol = cols[srcIdx];
+      var tgtCol = cols[tgtIdx];
+      if (srcCol && tgtCol) srcCol.parentNode.insertBefore(srcCol, tgtCol);
+    }}
+    applyColumnOrder(table);
+  }}
+
+  var dragState = null;
+  document.addEventListener('mousedown', function(e) {{
+    if (e.button !== 0) return;
+    var th = e.target.closest('th');
+    if (!th || th.classList.contains('no-sort') || e.target.closest('.col-resizer')) return;
+    var table = th.closest('table.findings');
+    if (!table) return;
+    e.preventDefault();  // avoid text selection while starting a drag
+    dragState = {{ table: table, th: th, startX: e.clientX, moved: false, dropTarget: null }};
+  }});
+
+  document.addEventListener('mousemove', function(e) {{
+    if (!dragState) return;
+    if (!dragState.moved && Math.abs(e.clientX - dragState.startX) < 8) return;
+    if (!dragState.moved) {{
+      dragState.moved = true;
+      document.body.classList.add('col-dragging');
+      dragState.th.classList.add('col-drag-source');
+    }}
+    var over = document.elementFromPoint(e.clientX, e.clientY);
+    var target = over ? over.closest('th') : null;
+    if (target && (target.closest('table') !== dragState.table
+                   || target.classList.contains('no-sort')
+                   || target === dragState.th)) {{
+      target = null;
+    }}
+    var prev = dragState.dropTarget;
+    if (prev && prev !== target) prev.classList.remove('col-drop-target');
+    if (target && target !== prev) target.classList.add('col-drop-target');
+    dragState.dropTarget = target;
+  }});
+
+  document.addEventListener('mouseup', function() {{
+    if (!dragState) return;
+    var st = dragState;
+    dragState = null;
+    document.body.classList.remove('col-dragging');
+    st.th.classList.remove('col-drag-source');
+    if (st.dropTarget) st.dropTarget.classList.remove('col-drop-target');
+    if (!st.moved || !st.dropTarget) return;
+    suppressSortClick = Date.now();  // the following click is a drag, not a sort
+    window.__suppressSortClickUntil = suppressSortClick;
+    moveColumn(st.table, st.th, st.dropTarget);
+  }});
+
+  stampColumnIds();
+  window.__applyColumnOrder = applyColumnOrder;
+
   allTables().forEach(function(table) {{
     var headers = table.tHead.rows[0].cells;
     Array.prototype.forEach.call(headers, function(th, colIndex) {{
       if (th.classList.contains('no-sort')) return;
       var asc = true;
       th.addEventListener('click', function() {{
+        if (suppressSortClick && Date.now() - suppressSortClick < 300) return;
+        var idx = Array.prototype.indexOf.call(table.tHead.rows[0].cells, th);
         var mantissa = Array.prototype.filter.call(table.tBodies[0].rows, function(r) {{
           return !r.classList.contains('drawer');
         }});
@@ -7147,8 +7252,8 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         }});
         drawers.forEach(function(d) {{ d.remove(); }});
         mantissa.sort(function(a, b) {{
-          var av = a.cells[colIndex].textContent.trim().toLowerCase();
-          var bv = b.cells[colIndex].textContent.trim().toLowerCase();
+          var av = a.cells[idx].textContent.trim().toLowerCase();
+          var bv = b.cells[idx].textContent.trim().toLowerCase();
           if (av < bv) return asc ? -1 : 1;
           if (av > bv) return asc ? 1 : -1;
           return 0;
@@ -7174,13 +7279,13 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     var headers = table.tHead.rows[0].cells;
     Array.prototype.forEach.call(headers, function(th, index) {{
       if (index === headers.length - 1 || !cols[index] || th.classList.contains('no-sort')) return;
-      var col = cols[index];
       var handle = document.createElement('span');
       handle.className = 'col-resizer';
       handle.addEventListener('click', function(e) {{ e.stopPropagation(); }});
       handle.addEventListener('mousedown', function(e) {{
         e.preventDefault();
         e.stopPropagation();
+        var col = cols[Array.prototype.indexOf.call(table.tHead.rows[0].cells, th)];
         var startX = e.clientX;
         var startWidth = col.getBoundingClientRect().width;
         handle.classList.add('resizing');
@@ -7210,7 +7315,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   function makeLoader(table) {{
     var pager = table.closest('.table-scroll') ? table.closest('.table-scroll').nextElementSibling : null;
     if (!pager || !pager.classList.contains('table-pager')) return;
-    var state = {{ page: 1, size: 250, q: '', sort: '', dir: 'asc' }};
+    var state = {{ page: 1, size: 25, q: '', sort: '', dir: 'asc' }};
     var tbody = table.tBodies[0];
     var info = pager.querySelector('.tp-info');
     var prev = pager.querySelector('.tp-prev');
@@ -7228,6 +7333,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         .then(function(d) {{
           if (!d || d.rows_html == null) return;
           tbody.innerHTML = d.rows_html;
+          if (window.__applyColumnOrder) window.__applyColumnOrder(table);
           info.textContent = 'Page ' + d.page + ' of ' + d.pages + ' (' + d.total + ' rows)';
           pager.classList.remove('hidden');
           prev.disabled = d.page <= 1;
@@ -7236,7 +7342,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     }}
     prev.addEventListener('click', function() {{ state.page = Math.max(1, state.page - 1); load(); }});
     next.addEventListener('click', function() {{ state.page += 1; load(); }});
-    sizeSel.addEventListener('change', function() {{ state.size = parseInt(sizeSel.value, 10) || 250; state.page = 1; load(); }});
+    sizeSel.addEventListener('change', function() {{ state.size = parseInt(sizeSel.value, 10) || 25; state.page = 1; load(); }});
     filterInput.addEventListener('input', function() {{
       clearTimeout(timer);
       var v = filterInput.value;
@@ -7246,7 +7352,8 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
       var th = e.target.closest('th');
       if (!th || th.classList.contains('no-sort')) return;
       e.stopPropagation();
-      var col = Array.prototype.indexOf.call(table.tHead.rows[0].cells, th);
+      if (window.__suppressSortClickUntil && Date.now() - window.__suppressSortClickUntil < 300) return;
+      var col = th.dataset.colidx || String(Array.prototype.indexOf.call(table.tHead.rows[0].cells, th));
       if (state.sort === String(col)) state.dir = state.dir === 'asc' ? 'desc' : 'asc';
       else {{ state.sort = String(col); state.dir = 'asc'; }}
       state.page = 1;
@@ -7537,7 +7644,7 @@ def serve_table_response(table_id, qs):
     q = (qs.get("q") or [""])[0]
     mode = (qs.get("mode") or [""])[0]
     page = _serve_int(qs, "page", 1, 1, 10 ** 9)
-    size = _serve_int(qs, "size", 250, 25, 2000)
+    size = _serve_int(qs, "size", 25, 25, 2000)
     sort = (qs.get("sort") or [""])[0]
     desc = ((qs.get("dir") or ["asc"])[0]).lower() == "desc"
     skmap = entry.get("sort_keys") or {}
