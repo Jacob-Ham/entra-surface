@@ -51,6 +51,7 @@ import json
 import re
 import sqlite3
 import sys
+import threading
 import time
 import urllib.parse
 from collections import defaultdict, Counter
@@ -4187,6 +4188,19 @@ def ad_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None):
     return out, total
 
 
+def _serve_pager():
+    """Pager markup for serve-mode tables (Prev/Next + rows-per-page select)."""
+    return ('<div class="table-pager hidden">'
+            '<button type="button" class="icon-btn tp-prev">&#8592; Prev</button>'
+            '<span class="tp-info muted"></span>'
+            '<button type="button" class="icon-btn tp-next">Next &#8594;</button>'
+            '<label class="muted">Rows '
+            '<select class="tp-size">'
+            '<option value="25" selected>25</option><option value="50">50</option><option value="100">100</option><option value="250">250</option>'
+            '<option value="500">500</option><option value="1000">1000</option>'
+            '</select></label></div>')
+
+
 def realm_card_html(meta):
     """Realm summary above the AD-synced users table: realm, SID prefix, synced
     count, and DC hosts — hosts are capped at 10 with a dropdown for the rest."""
@@ -4557,16 +4571,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         return (f'<tr class="drawer" data-detail-for="{esc(key)}">'
                 f'<td colspan="{colspan}"><div class="drawer-body"></div></td></tr>')
 
-    def serve_pager():
-        return ('<div class="table-pager hidden">'
-                '<button type="button" class="icon-btn tp-prev">&#8592; Prev</button>'
-                '<span class="tp-info muted"></span>'
-                '<button type="button" class="icon-btn tp-next">Next &#8594;</button>'
-                '<label class="muted">Rows '
-                '<select class="tp-size">'
-                '<option value="25" selected>25</option><option value="50">50</option><option value="100">100</option><option value="250">250</option>'
-                '<option value="500">500</option><option value="1000">1000</option>'
-                '</select></label></div>')
+    serve_pager = _serve_pager
 
     # ---- Azure Roles tables (one per principal section) -------------------
     def az_sub(a):
@@ -5136,6 +5141,23 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
             sections_html.append(ca_section(res))
             if not serve_mode:
                 policy_profile_data = {f["policy_id"]: f for f in res["findings"] if f.get("policy_id")}
+            if serve_mode:
+                sections_html.append("""
+  <section data-category="configs">
+    <h2>CA coverage analysis</h2>
+    <div class="ca-analysis">
+      <p class="sub">On-demand analysis of Conditional Access coverage: policy scope resolution, per-user and per-application coverage, legacy authentication, and exclusions.</p>
+      <div class="ca-controls">
+        <button type="button" class="mode-btn" id="ca-run-btn">Run full analysis</button>
+        <span class="ca-sep muted">or scope to a single user:</span>
+        <input type="text" id="ca-user-input" class="ca-user-input" placeholder="User UPN &mdash; e.g. nic.tooley@core-edge.net" autocomplete="off">
+        <button type="button" class="mode-btn" id="ca-user-btn">Analyze user</button>
+      </div>
+      <div class="ca-status hidden" id="ca-status"><ul id="ca-steps"></ul></div>
+      <div class="ca-results" id="ca-results"></div>
+    </div>
+  </section>
+""")
         elif res["id"] == "ad_sync_summary":
             sections_html.append(ad_summary_card(res))
         elif res["id"] == "ad_sync_users":
@@ -5376,6 +5398,20 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   .filter-error {{
     width: 100%; color: var(--status-critical); font-size: 12px; margin-top: 4px;
   }}
+  .ca-analysis {{ margin: 4px 0; }}
+  .ca-controls {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 4px 0 10px; }}
+  .ca-sep {{ font-size: 12.5px; }}
+  .ca-user-input {{
+    flex: 1; min-width: 240px; max-width: 420px;
+    background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; font-size: 13px;
+  }}
+  .ca-status ul {{ list-style: none; margin: 6px 0 12px; padding: 0; }}
+  .ca-status li {{ padding: 3px 0; font-size: 13px; color: var(--text-muted); }}
+  .ca-status li.done {{ color: var(--text-primary); }}
+  .ca-status li.done::before {{ content: "\\2713 "; color: var(--status-good); }}
+  .ca-status li.error {{ color: var(--status-critical); }}
+  .ca-status li .step-detail {{ color: var(--text-muted); margin-left: 6px; font-size: 12px; }}
   th.col-drag-source {{ opacity: 0.45; }}
   body.col-dragging {{ cursor: grabbing; user-select: none; }}
   body.col-dragging th {{ cursor: grabbing; }}
@@ -7236,9 +7272,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   stampColumnIds();
   window.__applyColumnOrder = applyColumnOrder;
 
-  allTables().forEach(function(table) {{
+  function wireTableSort(table) {{
     var headers = table.tHead.rows[0].cells;
-    Array.prototype.forEach.call(headers, function(th, colIndex) {{
+    Array.prototype.forEach.call(headers, function(th) {{
       if (th.classList.contains('no-sort')) return;
       var asc = true;
       th.addEventListener('click', function() {{
@@ -7271,7 +7307,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         asc = !asc;
       }});
     }});
-  }});
+  }}
+  allTables().forEach(wireTableSort);
+  window.__wireTableSort = wireTableSort;
 
   function makeColumnsResizable(table) {{
     if (!table) return;
@@ -7307,6 +7345,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     }});
   }}
   allTables().forEach(makeColumnsResizable);
+  window.__makeColumnsResizable = makeColumnsResizable;
 }})();
 
 (function() {{
@@ -7362,6 +7401,92 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     load();
   }}
   document.querySelectorAll('table.findings[data-serve="1"]').forEach(makeLoader);
+  window.__makeLoader = makeLoader;
+
+  // ---- on-demand CA coverage analysis ----------------------------------
+  var caRun = document.getElementById('ca-run-btn');
+  var caUserBtn = document.getElementById('ca-user-btn');
+  var caUserInput = document.getElementById('ca-user-input');
+  if (caRun || caUserBtn) {{
+    var caStatusEl = document.getElementById('ca-status');
+    var caStepsEl = document.getElementById('ca-steps');
+    var caResultsEl = document.getElementById('ca-results');
+    var caTimer = null;
+    var caButtons = [caRun, caUserBtn].filter(function(b) {{ return !!b; }});
+
+    function caSetBusy(busy) {{
+      caButtons.forEach(function(b) {{ b.disabled = busy; }});
+    }}
+
+    function caStepState(d) {{
+      caStepsEl.innerHTML = '';
+      (d.steps || []).forEach(function(s) {{
+        var li = document.createElement('li');
+        li.className = s.status;
+        li.textContent = s.label;
+        if (s.detail) {{
+          var span = document.createElement('span');
+          span.className = 'step-detail';
+          span.textContent = s.detail;
+          li.appendChild(span);
+        }}
+        caStepsEl.appendChild(li);
+      }});
+      if (d.error) {{
+        var err = document.createElement('li');
+        err.className = 'error';
+        err.textContent = 'Error: ' + d.error;
+        caStepsEl.appendChild(err);
+      }}
+    }}
+
+    function caPoll() {{
+      fetch('/api/ca-analysis/status').then(function(r) {{ return r.json(); }})
+        .then(function(d) {{
+          if (!d || !d.steps) return;
+          caStepState(d);
+          if (d.status === 'running') {{ caTimer = setTimeout(caPoll, 600); return; }}
+          caSetBusy(false);
+          if (d.status === 'done' && d.result) {{
+            caResultsEl.innerHTML = (d.result.summary_html || '') + (d.result.sections_html || '');
+            Array.prototype.forEach.call(
+                caResultsEl.querySelectorAll('table.findings'), function(t) {{
+                  if (window.__wireTableSort) window.__wireTableSort(t);
+                  if (window.__makeLoader) window.__makeLoader(t);
+                }});
+          }}
+        }}).catch(function() {{ caSetBusy(false); }});
+    }}
+
+    function startCa(upn) {{
+      caSetBusy(true);
+      caResultsEl.innerHTML = '';
+      caStatusEl.classList.remove('hidden');
+      caStepsEl.innerHTML = '';
+      var body = JSON.stringify({{ upn: upn || '' }});
+      fetch('/api/ca-analysis', {{
+        method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: body
+      }})
+        .then(function(r) {{ return r.json(); }})
+        .then(function(d) {{
+          if (d && d.status === 'running') {{
+            caTimer = setTimeout(caPoll, 600);
+          }} else {{
+            caSetBusy(false);
+          }}
+        }}).catch(function() {{ caSetBusy(false); }});
+    }}
+
+    if (caRun) caRun.addEventListener('click', function() {{ startCa(''); }});
+    if (caUserBtn) caUserBtn.addEventListener('click', function() {{
+      startCa(caUserInput ? caUserInput.value.trim() : '');
+    }});
+    if (caUserInput) {{
+      caUserInput.addEventListener('keydown', function(e) {{
+        if (e.key === 'Enter' && caUserBtn) caUserBtn.click();
+      }});
+    }}
+  }}
 }})();
 </script>
 </body>
@@ -7443,7 +7568,7 @@ def build_tenant_summary(graph, results=None):
 SERVE_STATE = {"shell": "", "user_findings": [], "tables": {},
                "profiles2": {"sp": {}, "app": {}}, "group_profiles": {},
                "policy_profiles": {}, "details": {"sp": {}, "app": {}, "device": {}},
-               "records": []}
+               "records": [], "db_path": None, "ca_analysis": None}
 
 # ---- server-side drilldown (mirrors the DOM record model + DRILLDOWN_COLUMNS) --
 
@@ -7506,6 +7631,10 @@ def serve_field_map(table_id, f, owner=None):
     fields. Used by the advanced filter and the serve drilldown records."""
     fields = {"check": f.get("check_id", ""),
               "category": CHECK_ID_CATEGORY.get(f.get("check_id", ""), "")}
+    if table_id.startswith("ca-"):
+        # CA-analysis rows carry their own field map
+        fields.update(f.get("fields") or {})
+        return fields
     if table_id == "privileged-users-table":
         fields.update({
             "user": f.get("user_display") or "", "userUpn": f.get("user_upn") or "",
@@ -7766,6 +7895,627 @@ def serve_drilldown_response(qs):
     }, 200
 
 
+# ---------------------------------------------------------------------------
+# On-demand CA coverage analysis (--serve mode, runs on button click)
+# ---------------------------------------------------------------------------
+
+CA_ANALYSIS_STEPS = [
+    ("load", "Load CA policy and directory data"),
+    ("scopes", "Resolve policy scopes (users / groups / roles)"),
+    ("users", "Analyze per-user coverage"),
+    ("apps", "Analyze application coverage"),
+    ("legacy", "Analyze legacy authentication"),
+    ("exclusions", "Analyze privileged-user exclusions"),
+    ("render", "Render results"),
+]
+
+CA_GUEST_TOKENS = {
+    "AllGuestUsers", "AllExternalUsers", "GuestOrExternalUsers",
+    "GuestsOrExternalUsers", "GuestsAndExternalUsers",
+}
+
+CA_LEGACY_CLIENT_TYPES = {
+    "EasSupported", "EasUnsupported", "OtherLegacy", "LegacySmtp", "LegacyPop",
+    "LegacyImap", "LegacyMapi", "LegacyOffice",
+}
+
+
+def _ca_policy_inner(detail):
+    parsed = json_safe_value(detail)
+    try:
+        inner = json.loads(parsed[0]) if parsed and isinstance(parsed, list) \
+            and isinstance(parsed[0], str) else (parsed[0] if parsed else None)
+        return inner if isinstance(inner, dict) else {}
+    except (json.JSONDecodeError, ValueError, TypeError, IndexError):
+        return {}
+
+
+def _ca_blocks(inner, section, key):
+    return ((inner.get("Conditions") or {}).get(section) or {}).get(key) or []
+
+
+def load_ca_dataset(db_path):
+    """Read-only slices of the roadrecon DB needed for the CA analysis."""
+    data = {
+        "policies": [], "users": {}, "sps": {},
+        "group_member_user": defaultdict(set),
+        "group_member_group": defaultdict(set),
+        "role_member_user": defaultdict(set),
+    }
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT objectId, displayName, policyDetail FROM Policys WHERE policyType = 18")
+        for oid, name, detail in cur.fetchall():
+            data["policies"].append(
+                {"id": oid, "name": name or oid, "inner": _ca_policy_inner(detail)})
+        cur.execute("SELECT objectId, userPrincipalName, displayName, userType, accountEnabled FROM Users")
+        for oid, upn, disp, utype, enabled in cur.fetchall():
+            data["users"][oid] = {"upn": upn or "", "name": disp or upn or oid,
+                                  "type": utype or "Member", "enabled": bool(enabled)}
+        cur.execute("SELECT objectId, displayName, appId FROM ServicePrincipals")
+        for oid, disp, app_id in cur.fetchall():
+            data["sps"][oid] = {"name": disp or oid, "appId": app_id or ""}
+        for table, left, right, target in (
+                ("lnk_group_member_user", "Group", "User", "group_member_user"),
+                ("lnk_group_member_group", "Group", "childGroup", "group_member_group"),
+                ("lnk_role_member_user", "DirectoryRole", "User", "role_member_user")):
+            try:
+                cur.execute(f'SELECT "{left}", "{right}" FROM {table}')
+                bucket = data[target]
+                for a, b in cur.fetchall():
+                    if a and b:
+                        bucket[a].add(b)
+            except sqlite3.OperationalError:
+                pass
+    finally:
+        conn.close()
+    return data
+
+
+def run_ca_analysis(db_path, progress, target_upn=None):
+    """Conditional Access coverage analysis. `progress(step_id, detail)` marks
+    each step complete as it finishes. When `target_upn` is given, the analysis
+    is scoped to that single user. Returns {summary_html, sections_html}."""
+    progress("load")
+    data = load_ca_dataset(db_path)
+    if target_upn:
+        needle = (target_upn or "").strip().lower()
+        target_uid = None
+        for uid, rec in data["users"].items():
+            if (rec.get("upn") or "").lower() == needle:
+                target_uid = uid
+                break
+        if target_uid is None:
+            raise ValueError(f"user '{target_upn}' not found in the collected users")
+
+    progress("scopes")
+
+    def _expand_group(gid, memo):
+        if gid in memo:
+            return memo[gid]
+        out = set(data["group_member_user"].get(gid, ()))
+        for child in data["group_member_group"].get(gid, ()):
+            out |= _expand_group(child, memo)
+        memo[gid] = out
+        return out
+
+    policies = []
+    group_memo = {}
+    for p in data["policies"]:
+        inner = p["inner"]
+        controls = [c for block in inner.get("Controls") or []
+                    for c in (block.get("Control") or []) if isinstance(c, str)]
+        state = (inner.get("State") or "").strip() or "Unknown"
+        inc_users, inc_all, inc_guest = set(), False, False
+        for block in _ca_blocks(inner, "Users", "Include"):
+            for uid in block.get("Users") or []:
+                if uid == "All":
+                    inc_all = True
+                elif uid in CA_GUEST_TOKENS:
+                    inc_guest = True
+                else:
+                    inc_users.add(uid)
+            for gid in block.get("Groups") or []:
+                inc_users |= _expand_group(gid, group_memo)
+            for rid in block.get("Roles") or []:
+                inc_users |= data["role_member_user"].get(rid, set())
+        exc_users = set()
+        for block in _ca_blocks(inner, "Users", "Exclude"):
+            for uid in block.get("Users") or []:
+                if uid not in CA_GUEST_TOKENS and uid != "All":
+                    exc_users.add(uid)
+            for gid in block.get("Groups") or []:
+                exc_users |= _expand_group(gid, group_memo)
+            for rid in block.get("Roles") or []:
+                exc_users |= data["role_member_user"].get(rid, set())
+        apps_inc, apps_exc = [], []
+        for block in _ca_blocks(inner, "Applications", "Include"):
+            apps_inc.extend(block.get("Applications") or [])
+        for block in _ca_blocks(inner, "Applications", "Exclude"):
+            apps_exc.extend(block.get("Applications") or [])
+        # client types (legacy auth etc.) — modern 'ClientTypes' section,
+        # with fallback to the older 'ClientApplications' shape
+        client_inc, client_exc = [], []
+        for block in _ca_blocks(inner, "ClientTypes", "Include"):
+            client_inc.extend(block.get("ClientTypes") or [])
+        for block in _ca_blocks(inner, "ClientTypes", "Exclude"):
+            client_exc.extend(block.get("ClientTypes") or [])
+        for block in _ca_blocks(inner, "ClientApplications", "Include"):
+            client_inc.extend(block.get("IncludeClientApplications") or [])
+        for block in _ca_blocks(inner, "ClientApplications", "Exclude"):
+            client_exc.extend(block.get("ExcludeClientApplications") or [])
+        # device platforms + device states (live under DevicePlatforms)
+        platforms_inc, platforms_exc = [], []
+        device_states_inc, device_states_exc = [], []
+        for block in _ca_blocks(inner, "DevicePlatforms", "Include"):
+            platforms_inc.extend(block.get("DevicePlatforms") or [])
+            device_states_inc.extend(block.get("IncludeDeviceStates") or [])
+        for block in _ca_blocks(inner, "DevicePlatforms", "Exclude"):
+            platforms_exc.extend(block.get("DevicePlatforms") or [])
+            device_states_exc.extend(block.get("ExcludeDeviceStates") or [])
+        # named locations + trusted locations
+        locations_inc, locations_exc, trusted_locations = [], [], False
+        for block in _ca_blocks(inner, "Locations", "Include"):
+            locations_inc.extend(block.get("IncludeLocations") or [])
+            if block.get("IncludeTrustedLocations"):
+                trusted_locations = True
+        for block in _ca_blocks(inner, "Locations", "Exclude"):
+            locations_exc.extend(block.get("ExcludeLocations") or [])
+            if block.get("ExcludeTrustedLocations"):
+                trusted_locations = True
+        # risk-level conditions
+        conds = inner.get("Conditions") or {}
+        risk_signin = conds.get("SignInRiskLevels") or []
+        risk_user = conds.get("UserRiskLevels") or []
+        auth_strength = bool(sum((b.get("AuthStrengthIds") or [] for b in inner.get("Controls") or []), []))
+        policies.append({
+            "id": p["id"], "name": p["name"], "state": state,
+            "enabled": state == "Enabled",
+            "controls": controls,
+            "mfa": "Mfa" in controls,
+            "block": "Block" in controls,
+            "compliant": "RequireCompliantDevice" in controls,
+            "auth_strength": auth_strength,
+            "inc_users": inc_users, "inc_all": inc_all, "inc_guest": inc_guest,
+            "exc_users": exc_users,
+            "apps_inc": apps_inc, "apps_exc": apps_exc,
+            "client_inc": client_inc, "client_exc": client_exc,
+            "platforms_inc": platforms_inc, "platforms_exc": platforms_exc,
+            "device_states_inc": device_states_inc, "device_states_exc": device_states_exc,
+            "locations_inc": locations_inc, "locations_exc": locations_exc,
+            "trusted_locations": trusted_locations,
+            "risk_signin": risk_signin, "risk_user": risk_user,
+        })
+    enabled = [p for p in policies if p["enabled"]]
+    progress("scopes", f"{len(policies)} policy(ies), {len(enabled)} enabled")
+
+    def applies_to(p, uid):
+        if not (p["inc_all"] or uid in p["inc_users"] or p["inc_guest"]):
+            return False
+        return uid not in p["exc_users"]
+
+    # privileged roster comes from the already-computed user findings; in
+    # single-user mode the target is analyzed regardless of privilege level
+    priv_users = {}
+    if target_upn:
+        rec = data["users"].get(target_uid) or {}
+        sev = "Info"
+        for f in SERVE_STATE.get("user_findings", []):
+            if f.get("user_id") == target_uid:
+                sev = f.get("severity", "Info")
+                break
+        priv_users[target_uid] = {"uid": target_uid,
+                                  "upn": rec.get("upn") or target_upn,
+                                  "name": rec.get("name") or target_upn,
+                                  "severity": sev}
+    else:
+        for f in SERVE_STATE.get("user_findings", []):
+            if is_privileged(f.get("severity", "Info")):
+                uid = f.get("user_id")
+                if not uid:
+                    continue
+                rec = data["users"].get(uid) or {}
+                priv_users[uid] = {"uid": uid,
+                                   "upn": rec.get("upn") or f.get("user_upn") or uid,
+                                   "name": rec.get("name") or f.get("user_display") or uid,
+                                   "severity": f.get("severity", "Info")}
+
+    progress("users")
+    zero_coverage, no_mfa, no_compliant = [], [], []
+    for uid in sorted(priv_users, key=lambda u: (severity_rank(priv_users[u]["severity"]),
+                                                 priv_users[u]["upn"].lower())):
+        applying = [p for p in enabled if applies_to(p, uid)]
+        if not applying:
+            zero_coverage.append(priv_users[uid])
+        else:
+            if not any(p["mfa"] for p in applying):
+                no_mfa.append(priv_users[uid])
+            if not any(p["compliant"] for p in applying):
+                no_compliant.append(priv_users[uid])
+    progress("users", f"{len(zero_coverage)} zero coverage, "
+                      f"{len(no_mfa)} without MFA, {len(no_compliant)} without compliant-device policy")
+
+    progress("apps")
+    priv_sp_ids = {}
+    for rec in SERVE_STATE.get("records", []):
+        if is_privileged(rec.get("severity", "Info")):
+            sid = (rec.get("__ids") or {}).get("sp")
+            if sid and sid not in priv_sp_ids:
+                priv_sp_ids[sid] = rec.get("severity", "Info")
+    app_gaps = []
+    for sid in sorted(priv_sp_ids):
+        sp = data["sps"].get(sid) or {"name": sid, "appId": ""}
+        app_id = (sp.get("appId") or "").lower()
+        covered = any(
+            "All" in p["apps_inc"] or "Office365" in p["apps_inc"]
+            or any(str(a).lower() == app_id for a in p["apps_inc"] if a)
+            for p in enabled)
+        if not covered:
+            app_gaps.append({"sp_id": sid, "name": sp.get("name") or sid,
+                             "severity": priv_sp_ids[sid]})
+    progress("apps", f"{len(app_gaps)} privileged app(s) without coverage")
+
+    progress("legacy")
+    legacy_blockers = [p for p in enabled if p["block"] and (
+        any(t in CA_LEGACY_CLIENT_TYPES for t in p["client_inc"])
+        or "All" in p["client_inc"])]
+    legacy_gap = sorted(
+        (priv_users[uid] for uid in priv_users
+         if not any(applies_to(p, uid) for p in legacy_blockers)),
+        key=lambda u: (severity_rank(u["severity"]), u["upn"].lower()))
+    progress("legacy",
+             f"{len(legacy_blockers)} legacy-auth block policy(ies), "
+             f"{len(legacy_gap)} privileged user(s) outside them")
+
+    progress("exclusions")
+    excl_rows = []
+    for uid in sorted(priv_users, key=lambda u: (severity_rank(priv_users[u]["severity"]),
+                                                 priv_users[u]["upn"].lower())):
+        exclusions = [p for p in enabled if uid in p["exc_users"]]
+        if exclusions:
+            excl_rows.append({
+                **priv_users[uid],
+                "count": len(exclusions),
+                "policies": ", ".join(p["name"] for p in exclusions),
+            })
+    progress("exclusions", f"{len(excl_rows)} privileged user(s) with exclusions")
+
+    progress("render")
+
+    def build_table(tid, title, cols, rows, sort_fields, subtitle=""):
+        """cols: [(label, width), ...] for data columns (expand col implicit);
+        rows: list of {'_html', '_text', 'fields'}; sort_fields: {col_idx: field}."""
+        cells = ['<th class="no-sort"></th>']
+        for label, _w in cols:
+            cells.append(f'<th data-type="text">{esc(label)}</th>')
+        colgroup = '<col style="width:44px">' + "".join(
+            f'<col style="width:{width}">' for _, width in cols)
+        return {
+            "id": tid, "title": title, "subtitle": subtitle,
+            "cols": cols, "rows": rows, "sort_fields": sort_fields,
+            "colspan": len(cols) + 1,
+            "section": f"""
+  <section data-category="configs">
+    <h2>{esc(title)}</h2>
+    {subtitle}
+    <div class="table-scroll">
+    <table id="{esc(tid)}" class="findings" data-serve="1">
+      <colgroup>{colgroup}</colgroup>
+      <thead><tr>{''.join(cells)}</tr></thead>
+      <tbody></tbody>
+    </table>
+    </div>
+    {_serve_pager()}
+  </section>
+""",
+        }
+
+    def user_row(r, key, extra_cell=""):
+        sev = r.get("severity") or "Info"
+        text = f"{r['name']} {r['upn']} {sev}".lower()
+        html = (f'<tr data-profile-id="{esc(r["uid"])}" data-detail-key="{key}">'
+                f'<td class="expand-cell">{EXPAND_BUTTON_HTML}</td>'
+                f'<td data-field="severity" data-value="{sev}">{severity_badge(sev)}</td>'
+                f'<td class="clickable" data-field="user" data-value="{esc(r["name"])}">{esc(r["name"])}</td>'
+                f'<td class="clickable" data-field="userUpn" data-value="{esc(r["upn"])}">{esc(r["upn"])}</td>'
+                f'{extra_cell}</tr>{drawer_for_html(key, 4 + (1 if extra_cell else 0))}')
+        return {"_html": html, "_text": text,
+                "fields": {"severity": sev, "user": r["name"], "upn": r["upn"]}}
+
+    user_cols = [("Privileges", "100px"), ("User", "220px"), ("UPN", "260px")]
+    user_sort = {"1": "severity", "3": "upn"}
+
+    def user_rows_for(entries, key_prefix, extra=None):
+        out = []
+        for i, r in enumerate(entries):
+            extra_cell = ""
+            if extra:
+                extra_cell = (f'<td data-field="caExcl" data-value="{esc(str(r["count"]))}">'
+                              f'<span class="perm" title="{esc(r["policies"])}">{r["count"]}</span></td>')
+            out.append(user_row(r, f"{key_prefix}-{i}", extra_cell))
+        return out
+
+    app_rows = []
+    for i, r in enumerate(app_gaps):
+        sev = r.get("severity") or "High"
+        app_rows.append({
+            "_html": (f'<tr data-sp-id="{esc(r["sp_id"])}" data-detail-key="ca-apps-{i}">'
+                      f'<td class="expand-cell">{EXPAND_BUTTON_HTML}</td>'
+                      f'<td data-field="severity" data-value="{sev}">{severity_badge(sev)}</td>'
+                      f'<td class="clickable" data-field="app" data-value="{esc(r["name"])}">{esc(r["name"])}</td>'
+                      f'</tr>{drawer_for_html("ca-apps-" + str(i), 3)}'),
+            "_text": f"{r['name']} {sev}".lower(),
+            "fields": {"severity": sev, "app": r["name"]},
+        })
+
+    legacy_rows = []
+    if legacy_blockers:
+        legacy_rows = user_rows_for(legacy_gap, "ca-legacy")
+
+    def conds_row(p, key):
+        def fmt(items, all_label="All"):
+            if not items:
+                return "—"
+            items = sorted(str(x) for x in items if x)
+            if "All" in items:
+                return all_label
+            return ", ".join(items)
+        controls = []
+        if p["mfa"]:
+            controls.append("MFA")
+        if p["compliant"]:
+            controls.append("Compliant device")
+        if p["block"]:
+            controls.append("Block")
+        if p["auth_strength"]:
+            controls.append("Auth strength")
+        platforms = fmt(p["platforms_inc"])
+        if p["platforms_exc"]:
+            platforms += f" (excl. {', '.join(sorted(p['platforms_exc']))})"
+        device_states = fmt(p["device_states_inc"], "Any device state")
+        if p["device_states_exc"]:
+            device_states += f" (excl. {', '.join(sorted(p['device_states_exc']))})"
+        locations = ", ".join(sorted(p["locations_inc"])) or ("Trusted locations" if p["trusted_locations"] else "—")
+        if p["locations_exc"]:
+            locations += f" (excl. {', '.join(sorted(p['locations_exc']))})"
+        risks = " + ".join([", ".join(p["risk_signin"]), ", ".join(p["risk_user"])]).strip(" +")
+        clients = fmt(p["client_inc"]) if p["client_inc"] else "—"
+        fields = {"polname": p["name"], "polstate": p["state"],
+                  "polcontrols": ", ".join(controls), "polapps": fmt(p["apps_inc"]),
+                  "platforms": platforms, "devicestates": device_states,
+                  "locations": locations, "risk": risks or "—", "clients": clients}
+        text = " ".join(fields.values()).lower()
+        cells = (
+            f'<td class="clickable" data-field="polName" data-value="{esc(p["name"])}">{esc(p["name"])}</td>'
+            f'<td data-field="polState" data-value="{esc(p["state"])}">{esc(p["state"])}</td>'
+            f'<td data-field="polControls" data-value="{esc(", ".join(controls))}">{esc(", ".join(controls) or "—")}</td>'
+            f'<td data-field="polApps" data-value="{esc(fmt(p["apps_inc"]))}">{esc(fmt(p["apps_inc"]))}</td>'
+            f'<td>{esc(platforms)}</td><td>{esc(device_states)}</td><td>{esc(locations)}</td>'
+            f'<td>{esc(risks or "—")}</td><td>{esc(clients)}</td>')
+        html = (f'<tr data-policy-id="{esc(p["id"])}" data-detail-key="{key}">'
+                f'<td class="expand-cell">{EXPAND_BUTTON_HTML}</td>{cells}</tr>'
+                f'{drawer_for_html(key, 10)}')
+        return {"_html": html, "_text": text, "fields": fields}
+
+    conds_rows = [conds_row(p, f"ca-conds-{i}") for i, p in enumerate(enabled)]
+
+    tables = []
+    if zero_coverage:
+        tables.append(build_table("ca-zero-table", "Privileged users with no CA coverage",
+                                  user_cols, user_rows_for(zero_coverage, "ca-zero"), user_sort))
+    if no_mfa:
+        tables.append(build_table("ca-mfa-table", "Privileged users without MFA policy coverage",
+                                  user_cols, user_rows_for(no_mfa, "ca-mfa"), user_sort))
+    if no_compliant:
+        tables.append(build_table("ca-compliant-table", "Privileged users without compliant-device policy coverage",
+                                  user_cols, user_rows_for(no_compliant, "ca-compliant"), user_sort))
+    if app_rows:
+        tables.append(build_table("ca-apps-table", "Privileged apps with no CA coverage",
+                                  [("Privileges", "100px"), ("Application", "240px")],
+                                  app_rows, {"1": "severity", "2": "app"}))
+    if legacy_blockers:
+        tables.append(build_table("ca-legacy-table",
+                                  "Legacy-auth block coverage (privileged users outside)",
+                                  user_cols, legacy_rows, user_sort,
+                                  subtitle=f'<p class="sub">Blocking policies: '
+                                           f'{esc(", ".join(p["name"] for p in legacy_blockers))}</p>'))
+    if excl_rows:
+        excl_table_rows = []
+        for i, r in enumerate(excl_rows):
+            extra = (f'<td data-field="caExcl" data-value="{esc(str(r["count"]))}">'
+                     f'<span class="perm" title="{esc(r["policies"])}">{r["count"]}</span></td>')
+            row = user_row(r, f"ca-excl-{i}", extra)
+            row["fields"]["caexcl"] = str(r["count"])
+            excl_table_rows.append(row)
+        tables.append(build_table("ca-excl-table", "CA exclusions (privileged users)",
+                                  [("Privileges", "100px"), ("User", "220px"), ("UPN", "260px"), ("Exclusions", "80px")],
+                                  excl_table_rows, {"1": "severity", "3": "upn", "4": "caexcl"}))
+    if enabled:
+        tables.append(build_table("ca-conditions-table", "Enabled CA policy conditions",
+                                  [("Policy", "240px"), ("State", "90px"), ("Controls", "150px"),
+                                   ("Apps", "130px"), ("Platforms", "150px"), ("Device states", "130px"),
+                                   ("Locations", "150px"), ("Risk", "120px"), ("Client types", "160px")],
+                                  conds_rows, {"1": "polname", "2": "polstate"}))
+
+    sections_html = "".join(t["section"] for t in tables if t)
+    if not legacy_blockers:
+        sections_html += ('  <section data-category="configs"><h2>Legacy authentication</h2>'
+                          '<p class="sub">No enabled policy blocks legacy authentication.</p></section>')
+
+    if target_upn:
+        target = priv_users[target_uid]
+        applying = [p for p in enabled if applies_to(p, target_uid)]
+        excl_pols = [p for p in enabled if target_uid in p["exc_users"]]
+
+        apply_rows = []
+        for i, p in enumerate(applying):
+            controls = []
+            if p["mfa"]:
+                controls.append("MFA")
+            if p["compliant"]:
+                controls.append("Compliant device")
+            if p["block"]:
+                controls.append("Block")
+            if p["auth_strength"]:
+                controls.append("Auth strength")
+            platforms = ", ".join(sorted(p["platforms_inc"])) or "All"
+            if p["platforms_exc"]:
+                platforms += f" (excl. {', '.join(sorted(p['platforms_exc']))})"
+            clients = ", ".join(sorted(p["client_inc"])) or "—"
+            fields = {"polname": p["name"], "controls": ", ".join(controls),
+                      "mfa": "Yes" if p["mfa"] else "—",
+                      "compliant": "Yes" if p["compliant"] else "—",
+                      "platforms": platforms, "clients": clients}
+            cells = (f'<td class="clickable" data-field="polName" data-value="{esc(p["name"])}">{esc(p["name"])}</td>'
+                     f'<td>{esc(", ".join(controls) or "—")}</td>'
+                     f'<td>{esc("Yes" if p["mfa"] else "—")}</td>'
+                     f'<td>{esc("Yes" if p["compliant"] else "—")}</td>'
+                     f'<td>{esc(platforms)}</td><td>{esc(clients)}</td>')
+            apply_rows.append({
+                "_html": (f'<tr data-policy-id="{esc(p["id"])}" data-detail-key="ca-apply-{i}">'
+                          f'<td class="expand-cell">{EXPAND_BUTTON_HTML}</td>{cells}</tr>'
+                          f'{drawer_for_html("ca-apply-" + str(i), 7)}'),
+                "_text": " ".join(fields.values()).lower(),
+                "fields": fields,
+            })
+        tables = [build_table("ca-apply-table", f"Policies applying to {target['upn']}",
+                              [("Policy", "260px"), ("Controls", "160px"), ("MFA", "60px"),
+                               ("Compliant", "80px"), ("Platforms", "180px"), ("Client types", "180px")],
+                              apply_rows, {"1": "polname"})]
+
+        flags = []
+        if not applying:
+            flags.append("no CA policy applies")
+        else:
+            if not any(p["mfa"] for p in applying):
+                flags.append("no MFA policy")
+            if not any(p["compliant"] for p in applying):
+                flags.append("no compliant-device policy")
+        if legacy_blockers and not any(applies_to(p, target_uid) for p in legacy_blockers):
+            flags.append("outside legacy-auth block")
+        if excl_pols:
+            flags.append(f"excluded from {len(excl_pols)} policy(ies)")
+        summary_html = f"""
+  <section data-category="configs">
+    <h2>CA coverage analysis</h2>
+    <div class="engine-card"><table class="kv-table">
+      <tr><th>User</th><td>{esc(target['name'])} <span class="muted">({esc(target['upn'])})</span></td></tr>
+      <tr><th>Privileges</th><td>{severity_badge(target['severity'])}</td></tr>
+      <tr><th>Enabled CA policies applying</th><td>{len(applying)}</td></tr>
+      <tr><th>MFA policies applying</th><td>{sum(1 for p in applying if p['mfa'])}</td></tr>
+      <tr><th>Compliant-device policies applying</th><td>{sum(1 for p in applying if p['compliant'])}</td></tr>
+      <tr><th>Exclusions</th><td>{len(excl_pols)}</td></tr>
+      <tr><th>Assessment</th><td>{esc(' · '.join(flags)) if flags else 'all coverage controls apply'}</td></tr>
+    </table></div>
+  </section>
+"""
+        if excl_pols:
+            items = "".join(
+                f'<li>{esc(p["name"])} <span class="muted">({esc(p["state"])})</span></li>'
+                for p in excl_pols)
+            excl_html = (f'  <section data-category="configs"><h2>Policies excluding '
+                         f'{esc(target["upn"])}</h2><ul class="profile-list">{items}</ul></section>')
+        else:
+            excl_html = ""
+        sections_html = "".join(t["section"] for t in tables) + excl_html
+        progress("render", f"{len(applying)} applying policy(ies), {len(excl_pols)} exclusion(s)")
+        return {"summary_html": summary_html, "sections_html": sections_html, "tables": tables}
+
+    summary_html = f"""
+  <section data-category="configs">
+    <h2>CA coverage analysis</h2>
+    <div class="engine-card"><table class="kv-table">
+      <tr><th>CA policies</th><td>{len(policies)} ({len(enabled)} enabled, {len(policies) - len(enabled)} report-only/disabled)</td></tr>
+      <tr><th>MFA-requiring policies</th><td>{sum(1 for p in policies if p['mfa'])}</td></tr>
+      <tr><th>Compliant-device policies</th><td>{sum(1 for p in policies if p['compliant'])}</td></tr>
+      <tr><th>Block policies</th><td>{sum(1 for p in policies if p['block'])}</td></tr>
+      <tr><th>Location-based policies</th><td>{sum(1 for p in policies if p['locations_inc'] or p['trusted_locations'])}</td></tr>
+      <tr><th>Risk-based policies</th><td>{sum(1 for p in policies if p['risk_signin'] or p['risk_user'])}</td></tr>
+      <tr><th>Privileged users analyzed</th><td>{len(priv_users)}</td></tr>
+      <tr><th>Zero CA coverage</th><td>{len(zero_coverage)}</td></tr>
+      <tr><th>No MFA policy coverage</th><td>{len(no_mfa)}</td></tr>
+      <tr><th>No compliant-device policy coverage</th><td>{len(no_compliant)}</td></tr>
+      <tr><th>Privileged apps without coverage</th><td>{len(app_gaps)}</td></tr>
+      <tr><th>Legacy-auth block policies</th><td>{len(legacy_blockers)}</td></tr>
+      <tr><th>Privileged users with CA exclusions</th><td>{len(excl_rows)}</td></tr>
+    </table></div>
+  </section>
+"""
+    progress("render", f"{len(zero_coverage) + len(no_mfa) + len(no_compliant) + len(app_gaps) + len(legacy_gap) + len(excl_rows)} finding row(s)")
+    return {"summary_html": summary_html, "sections_html": sections_html, "tables": tables}
+
+
+def make_ca_rows_fn():
+    """Rows function for CA-analysis result tables: substring q filtering,
+    optional single-field sorting, pagination handled by the caller."""
+    def rows_fn(rows, q="", sort_key=None, desc=False, start=0, stop=None):
+        items = rows
+        if q:
+            needle = q.lower()
+            items = [r for r in items if needle in (r.get("_text") or "")]
+        if sort_key:
+            if sort_key == "severity":
+                items = sorted(items, key=lambda r: severity_rank(
+                    (r.get("fields") or {}).get("severity", "Info")), reverse=desc)
+            else:
+                items = sorted(items, key=lambda r: str(
+                    (r.get("fields") or {}).get(sort_key, "")).lower(), reverse=desc)
+        return [r["_html"] for r in items], len(items)
+    return rows_fn
+
+
+def register_ca_tables(tables):
+    """Register (or refresh) the CA-analysis result tables in the serve table
+    pipeline so they paginate/sort/filter like the built-in tables."""
+    for tid in SERVE_STATE.get("ca_table_ids") or []:
+        SERVE_STATE["tables"].pop(tid, None)
+    ids = []
+    for t in tables:
+        if not t:
+            continue
+        ids.append(t["id"])
+        SERVE_STATE["tables"][t["id"]] = {
+            "findings": t["rows"],
+            "rows": make_ca_rows_fn(),
+            "search": lambda f: (f or {}).get("_text", ""),
+            "sort_keys": {str(i): field for i, field in (t.get("sort_fields") or {}).items()},
+            "colspan": t.get("colspan", 4),
+        }
+    SERVE_STATE["ca_table_ids"] = ids
+
+
+def start_ca_analysis(upn=None):
+    """Kick off the analysis in a background thread; returns the status dict."""
+    state = SERVE_STATE["ca_analysis"]
+    if state and state.get("status") == "running":
+        return state
+    steps = [{"id": sid, "label": label, "status": "pending", "detail": ""}
+             for sid, label in CA_ANALYSIS_STEPS]
+    state = {"status": "running", "steps": steps, "result": None, "error": None}
+    SERVE_STATE["ca_analysis"] = state
+
+    def progress(sid, detail=""):
+        for step in steps:
+            if step["id"] == sid:
+                step["status"] = "done"
+                step["detail"] = detail
+
+    def worker():
+        try:
+            result = run_ca_analysis(SERVE_STATE["db_path"], progress, target_upn=upn)
+            register_ca_tables(result.get("tables") or [])
+            state["result"] = {"summary_html": result.get("summary_html", ""),
+                               "sections_html": result.get("sections_html", "")}
+            state["status"] = "done"
+        except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+            state["status"] = "error"
+            state["error"] = str(exc)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return state
+
+
 class AuditServeHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -7806,9 +8556,38 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                 data, code = serve_profile_response("user", uid)
                 self._send(json.dumps(data, default=str).encode("utf-8"),
                            "application/json; charset=utf-8", code)
+            elif path == "/api/ca-analysis/status":
+                state = SERVE_STATE.get("ca_analysis")
+                if state is None:
+                    self._send(b'{"status": "idle", "steps": []}',
+                               "application/json; charset=utf-8")
+                else:
+                    self._send(json.dumps(state, default=str).encode("utf-8"),
+                               "application/json; charset=utf-8")
             else:
                 self._send(b'{"error": "not found"}', "application/json; charset=utf-8", 404)
         except Exception as exc:  # noqa: BLE001 - surface errors for debugging
+            self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                       "application/json; charset=utf-8", 500)
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        try:
+            if parsed.path == "/api/ca-analysis":
+                upn = ""
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length:
+                        payload = json.loads(self.rfile.read(length) or b"{}")
+                        upn = (payload or {}).get("upn") or ""
+                except (ValueError, json.JSONDecodeError):
+                    upn = ""
+                state = start_ca_analysis(upn=upn.strip())
+                self._send(json.dumps({"status": state["status"]}).encode("utf-8"),
+                           "application/json; charset=utf-8")
+            else:
+                self._send(b'{"error": "not found"}', "application/json; charset=utf-8", 404)
+        except Exception as exc:  # noqa: BLE001
             self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
                        "application/json; charset=utf-8", 500)
 
@@ -7960,6 +8739,8 @@ def main():
 
     if args.serve:
         SERVE_STATE["shell"] = report_html
+        SERVE_STATE["db_path"] = str(db_path)
+        SERVE_STATE["ca_analysis"] = None
         SERVE_STATE["tables"] = serve_tables or {}
         SERVE_STATE["user_findings"] = next(
             (res["findings"] for res in results if res["id"] == "privileged_users"), [])
