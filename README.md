@@ -1,11 +1,11 @@
 # Entra Surface
 
-Entra ID (Azure AD) attack surface parser. Reads a [roadrecon](https://github.com/dirkjanm/ROADtools) SQLite database and produces a report of dangerous users, applications, service principals, groups, Conditional Access policies, and AD sync configuration.
+Entra ID attack-surface report from a [ROADrecon](https://github.com/dirkjanm/ROADtools) database. Runs a registry of checks over the tenant data and serves a sortable, filterable HTML report with drilldowns.
 
 ## Requirements
 
-- Python 3 (stdlib only, no dependencies)
-- A roadrecon database from the tenant you want to audit
+- Python 3 (stdlib only)
+- A roadrecon database (`roadrecon.db`) for the tenant you want to audit
 
 ## Usage
 
@@ -13,43 +13,25 @@ Entra ID (Azure AD) attack surface parser. Reads a [roadrecon](https://github.co
 python3 entra-surface.py --db roadrecon.db
 ```
 
-Writes `entra-surface-report.html` (open it in a browser). Optionally serve it instead, which is preferable for large tenants, fetches the users table on demand.
-
-```sh
-python3 entra-surface.py --db roadrecon.db --serve --port 8787
-```
-
-> **_NOTE:_** Server will take 0 - 5 minutes to spin up depending on the size of the tenant.
+Opens `http://127.0.0.1:8787`. Startup takes a few minutes on large tenants.
 
 ### Options
 
 | Option | Description |
 | --- | --- |
-| `--db` | Path to the roadrecon SQLite database (default: `roadrecon.db`) |
-| `--config` | Privileged-roles config JSON (default: `privileged_roles.json`) |
-| `--azure-config` | Azure RBAC role severity config (default: `azure_roles.json`) |
-| `--output` | HTML report path (default: `entra-surface-report.html`) |
-| `--check` | Only run the given checks (comma-separated) |
-| `--exclude-check` | Skip the given checks (comma-separated) |
-| `--min-severity` | Drop findings below this severity (Critical/High/Medium/Low/Info) |
-| `--include-disabled` | Include disabled/soft-deleted service principals |
-| `--serve` | Serve the report over HTTP on 127.0.0.1 instead of writing a file |
-| `--port` | Port for `--serve` (default: 8787) |
+| `--db` | Roadrecon SQLite database (default: `roadrecon.db`) |
+| `--config` | Privileged-roles config (default: `privileged_roles.json`) |
+| `--azure-config` | Azure RBAC role config (default: `azure_roles.json`) |
+| `--port` | Port to serve on (default: `8787`) |
 | `--timing` | Print per-phase timings and peak memory |
 
-## Config
+## Report
 
-- `privileged_roles.json` — which app permissions and directory roles count as privileged, with severities and reasoning. Edit freely per tenant.
-- `azure_roles.json` — Azure RBAC role names (optionally `Role@ScopeType`) to severities.
+- **Tabs:** Apps / Service principals, Users, Active Directory / On-prem, Groups, Conditional Access, Azure Arc.
+- **Column manager:** add, remove, and reorder columns per table (persisted in the browser).
+- **Filters:** free-text, plus an advanced query language — `field:value`, `contains:`, `AND`/`OR`/`NOT`, and `uniq:column` to deduplicate by any column.
+- **Drawers:** per-row detail with roles, owners, Azure RBAC assignments, and a Raw tab with the full captured record.
+- **Sync summary:** engine, password writeback, authentication mode (PHS / PTA / federated), and Desktop SSO.
+- **Azure Arc:** onboarded machines, Arc role holders, onboarding service principals, and resource providers — detected by tenant-independent identifiers (resource-provider namespaces, role-definition GUIDs, first-party appIds).
 
-## Checks
-
-Runs a registry of checks and emits structured findings (check id, category, severity, evidence, object ids). See the module docstring in `entra-surface.py` for the full list, including:
-
-- privileged app (app-only) permissions resolved to human owners
-- credential-bearing service principals holding role assignments
-- apps with `appRoleAssignmentRequired` disabled, implicit flow, or public clients with privileged roles
-- foreign (cross-tenant) privileged service principals
-- privileged users and role-capable groups
-- Conditional Access exposure (policy scopes, MFA exclusions)
-- AD sync summary and attack surface (ADSync groups, sync SPs, hybrid auth, Windows devices)
+Checks are enabled/disabled via the `checks` block in `privileged_roles.json`; the tool always serves the full report.
