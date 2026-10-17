@@ -329,6 +329,15 @@ ADV_COLUMN_ALIASES = {
     "onprempwchange": ["adpw"], "adpw": ["adpw"],
     "targetingtags": ["adtags"], "adtags": ["adtags"],
     "check": ["check"], "category": ["category"],
+    "azapp": ["azapp"], "azgroup": ["azgroup"], "azuser": ["azuser"],
+    "azroles": ["azroles"], "azsproles": ["azsproles"], "azusrroles": ["azusrroles"],
+    "azscopetype": ["azscopetype"], "azsub": ["azsub"], "azrg": ["azrg"],
+    "azprovider": ["azprovider"], "azresource": ["azresource"],
+    "arcmachine": ["arcmachine"], "arcsub": ["arcsub"], "arcrg": ["arcrg"],
+    "arcresourceid": ["arcresourceid"], "arcstatus": ["arcstatus"],
+    "arcprincipal": ["arcprincipal"], "arcprincipaltype": ["arcprincipaltype"],
+    "arctag": ["arctag"], "arcazroles": ["arcazroles"], "arcprovider": ["arcprovider"],
+    "pwlastset": ["pwlastset"],
 }
 
 # Multi-word display columns, rewritten to their canonical shortname only when
@@ -447,12 +456,18 @@ def parse_advanced_query(text):
         return (tok is not None and tok[0] == "word"
                 and tok[1].upper() in ("AND", "OR", "NOT"))
 
+    def is_value_terminator(tok):
+        """A word token that ends an unquoted value: operators and uniq: clauses."""
+        return (is_any_operator(tok)
+                or (tok is not None and tok[0] == "word"
+                    and tok[1].upper().startswith("UNIQ:")))
+
     def consume_value_words(value):
         """Append following plain words to an unquoted value so that values
         with spaces work without quotes: `roles:Global Administrator AND ...`."""
         while True:
             tok = peek()
-            if tok is None or tok[0] != "word" or is_any_operator(tok):
+            if tok is None or tok[0] != "word" or is_value_terminator(tok):
                 return value
             advance()
             value += " " + tok[1]
@@ -523,6 +538,18 @@ def parse_advanced_query(text):
             return {"op": "contains", "fields": resolve_field(field), "value": value}
         if field.upper() == "CONTAINS":
             return {"op": "text", "value": rest}
+        if field.upper() == "UNIQ":
+            names = [n.strip() for n in rest.split(",") if n.strip()]
+            if not names:
+                vt = peek()
+                if vt is None or vt[0] not in ("word", "quoted"):
+                    raise AdvancedParseError(f"expected field after 'uniq:'")
+                advance()
+                names = [vt[1]]
+            fields = []
+            for n in names:
+                fields.extend(resolve_field(n))
+            return {"op": "uniq", "fields": fields}
         return {"op": "eq", "fields": resolve_field(field),
                 "value": consume_value_words(rest)}
 
@@ -588,7 +615,32 @@ def evaluate_advanced(ast, fields, full_text=""):
                 elif value == needle:
                     return True
         return False
+    if op == "uniq":
+        # dedupe clauses are not predicates; the caller extracts them separately
+        return True
     return False
+
+
+def extract_uniq_fields(ast):
+    """Collect the dedupe key fields from all uniq: clauses (order preserved,
+    duplicates dropped). Empty when the query carries no uniq: clause."""
+    out = []
+
+    def walk(node):
+        if not node:
+            return
+        if node.get("op") == "uniq":
+            for f in node.get("fields") or []:
+                if f not in out:
+                    out.append(f)
+            return
+        for c in node.get("children") or []:
+            walk(c)
+        if node.get("child"):
+            walk(node["child"])
+
+    walk(ast or {})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -5898,6 +5950,15 @@ JS_FILTER_MODULE = """<script id="filter-module">
     sid: ['adsid'], adsid: ['adsid'],
     onprempwchange: ['adpw'], adpw: ['adpw'],
     targetingtags: ['adtags'], adtags: ['adtags'],
+    azapp: ['azapp'], azgroup: ['azgroup'], azuser: ['azuser'],
+    azroles: ['azroles'], azsproles: ['azsproles'], azusrroles: ['azusrroles'],
+    azscopetype: ['azscopetype'], azsub: ['azsub'], azrg: ['azrg'],
+    azprovider: ['azprovider'], azresource: ['azresource'],
+    arcmachine: ['arcmachine'], arcsub: ['arcsub'], arcrg: ['arcrg'],
+    arcresourceid: ['arcresourceid'], arcstatus: ['arcstatus'],
+    arcprincipal: ['arcprincipal'], arcprincipaltype: ['arcprincipaltype'],
+    arctag: ['arctag'], arcazroles: ['arcazroles'], arcprovider: ['arcprovider'],
+    pwlastset: ['pwlastset'],
     appid: ['appid'], spty: ['spty'], servicetype: ['spty'],
     poltype: ['poltype'], polcreated: ['polcreated'], created: ['polcreated'],
     polmodified: ['polmodified'], lastmodified: ['polmodified'],
@@ -6029,11 +6090,15 @@ JS_FILTER_MODULE = """<script id="filter-module">
         return !!tok && tok.t === 'word' &&
           (tok.v.toUpperCase() === 'AND' || tok.v.toUpperCase() === 'OR' || tok.v.toUpperCase() === 'NOT');
       }
+      function isValueTerminator(tok) {
+        return isAnyOperator(tok) ||
+          (!!tok && tok.t === 'word' && tok.v.toUpperCase().indexOf('UNIQ:') === 0);
+      }
       function consumeValueWords(value) {
         // append following plain words so unquoted values with spaces work
         while (true) {
           var tok = pos < tokens.length ? tokens[pos] : null;
-          if (!tok || tok.t !== 'word' || isAnyOperator(tok)) return value;
+          if (!tok || tok.t !== 'word' || isValueTerminator(tok)) return value;
           pos++;
           value += ' ' + tok.v;
         }
@@ -6100,6 +6165,23 @@ JS_FILTER_MODULE = """<script id="filter-module">
                   value: consumeValueWords(rest.slice('contains:'.length))};
         }
         if (field.toUpperCase() === 'CONTAINS') return {op: 'text', value: rest};
+        if (field.toUpperCase() === 'UNIQ') {
+          var names = rest.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+          if (!names.length) {
+            var vt3 = peek();
+            if (!vt3 || (vt3.t !== 'word' && vt3.t !== 'quoted')) {
+              throw new Error("expected field after 'uniq:'");
+            }
+            advance();
+            names = [vt3.v];
+          }
+          var ufields = [];
+          names.forEach(function(n) {
+            var resolved = resolveField(n);
+            if (resolved) ufields = ufields.concat(resolved);
+          });
+          return {op: 'uniq', fields: ufields};
+        }
         return {op: 'eq', fields: resolveField(field), value: consumeValueWords(rest)};
       }
       var node = parseOr();
@@ -6182,12 +6264,30 @@ JS_FILTER_MODULE = """<script id="filter-module">
       }
       return false;
     }
+    if (op === 'uniq') return true;
     return false;
+  }
+
+  function uniqFields(ast) {
+    var out = [];
+    function walk(node) {
+      if (!node) return;
+      if (node.op === 'uniq') {
+        (node.fields || []).forEach(function(f) {
+          if (out.indexOf(f) === -1) out.push(f);
+        });
+        return;
+      }
+      (node.children || []).forEach(walk);
+      if (node.child) walk(node.child);
+    }
+    walk(ast);
+    return out;
   }
 
   window.ADV_FILTER = {parse: parse, evaluate: evaluate, listFields: LIST_FIELDS,
                        fieldsFor: fieldsFor, columns: columns,
-                       normalizeField: normalizeField};
+                       normalizeField: normalizeField, uniqFields: uniqFields};
 })();
 </script>
 """
@@ -7260,7 +7360,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   <div class="controls">
     <div class="filter-row">
       <input type="search" id="filter-input" placeholder="Filter all tables by target, owner, evidence&hellip;" autocomplete="off">
-      <button type="button" id="advanced-toggle" class="mode-btn" aria-pressed="false" title="Toggle advanced filtering: field:value, AND, OR, NOT, contains:">Advanced</button>
+      <button type="button" id="advanced-toggle" class="mode-btn" aria-pressed="false" title="Toggle advanced filtering: field:value, AND, OR, NOT, contains:, uniq:column">Advanced</button>
       <div class="suggest-wrap hidden" id="suggest-wrap"><ul id="suggest-list"></ul></div>
     </div>
     <div class="filter-error hidden" id="filter-error"></div>
@@ -8657,14 +8757,37 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
       var f = td.getAttribute('data-field');
       if (f) map[f.toLowerCase()] = td.getAttribute('data-value') || '';
     }});
+    // merge extras-blob values so uniq/filters cover non-rendered columns too
+    var tbl = row.closest('table');
+    if (tbl && window.__columns && window.__columns.extras) {{
+      var blob = window.__columns.extras(tbl.id);
+      var key = row.getAttribute('data-detail-key');
+      if (blob && key && blob[key]) {{
+        Object.keys(blob[key]).forEach(function(f) {{
+          if (!Object.prototype.hasOwnProperty.call(map, f.toLowerCase())) {{
+            map[f.toLowerCase()] = (blob[key][f] && blob[key][f][1]) || '';
+          }}
+        }});
+      }}
+    }}
     return map;
   }}
 
-  function setRowVisibility(test) {{
+  function setRowVisibility(test, uniqFields) {{
+    var seenByTable = {{}};
     allTables().forEach(function(table) {{
+      var seen = (uniqFields && uniqFields.length) ? (seenByTable[table.id] = {{}}) : null;
       Array.prototype.forEach.call(table.tBodies[0].rows, function(row) {{
         if (row.classList.contains('drawer')) return;
         var show = test(row);
+        if (show && seen) {{
+          var map = rowFieldMap(row);
+          var key = uniqFields.map(function(f) {{
+            return (map[f] || '').toLowerCase();
+          }}).join('\\u0001');
+          if (Object.prototype.hasOwnProperty.call(seen, key)) show = false;
+          else seen[key] = true;
+        }}
         row.classList.toggle('hidden', !show);
         var next = row.nextElementSibling;
         if (next && next.getAttribute('data-detail-for') === row.getAttribute('data-detail-key')) {{
@@ -8722,9 +8845,17 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     if (ci !== -1) {{
       var field = token.slice(0, ci);
       var prefix = token.slice(ci + 1).toLowerCase();
-      fieldValueSuggest(field, prefix).slice(0, 8).forEach(function(v) {{
-        items.push({{ text: field + ':' + v, display: field + ':' + v, hint: 'value' }});
-      }});
+      if (field.toLowerCase() === 'uniq') {{
+        knownFields().forEach(function(display) {{
+          if (ADV_FILTER.normalizeField(display).indexOf(prefix) === 0) {{
+            items.push({{ text: 'uniq:' + display, display: 'uniq:' + display, hint: 'column' }});
+          }}
+        }});
+      }} else {{
+        fieldValueSuggest(field, prefix).slice(0, 8).forEach(function(v) {{
+          items.push({{ text: field + ':' + v, display: field + ':' + v, hint: 'value' }});
+        }});
+      }}
     }} else if (token) {{
       var pre = ADV_FILTER.normalizeField(token);
       knownFields().forEach(function(display) {{
@@ -8733,7 +8864,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         }}
       }});
     }} else {{
-      ['AND', 'OR', 'NOT', 'contains:'].forEach(function(op) {{
+      ['AND', 'OR', 'NOT', 'contains:', 'uniq:'].forEach(function(op) {{
         items.push({{ text: op, display: op, hint: 'operator' }});
       }});
     }}
@@ -8790,9 +8921,10 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
       return;
     }}
     var ast = parsed.ast;
+    var uf = ADV_FILTER.uniqFields ? ADV_FILTER.uniqFields(ast) : [];
     setRowVisibility(function(row) {{
       return ADV_FILTER.evaluate(ast, rowFieldMap(row), row.textContent);
-    }});
+    }}, uf);
   }}
 
   input.addEventListener('input', function() {{
@@ -8838,7 +8970,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     advOn = !advOn;
     advToggle.setAttribute('aria-pressed', String(advOn));
     input.placeholder = advOn
-        ? 'Advanced: severity:High AND target:contains:admin&hellip;'
+        ? 'Advanced: severity:High AND target:contains:admin, uniq:owner&hellip;'
         : 'Filter all tables by target, owner, evidence&hellip;';
     hideSuggest();
     errorEl.classList.add('hidden');
@@ -9335,6 +9467,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   window.__columns = {{
     catalog: COLUMN_CATALOG,
     isManaged: isManagedColumnTable,
+    extras: columnExtras,
     getFields: function(table) {{
       if (table.__pendingCols) return table.__pendingCols.slice();
       return table.__columnFields ? table.__columnFields.slice() : columnFields(table);
@@ -9929,16 +10062,34 @@ def serve_table_response(table_id, qs):
         except AdvancedParseError:
             ast = None  # fall back to substring behaviour below
         if ast is not None:
+            uniq_fields = extract_uniq_fields(ast)
+
+            def _uniq_key(field_map):
+                return tuple((field_map.get(f) or "").lower()
+                             for f in uniq_fields)
+
             if table_id == "owned-table":
                 # the owned table renders one row per owner: filter at the
                 # (finding, owner) row level so owner predicates keep only the
                 # matching owner rows (same semantics as the static report)
                 filtered = []
+                seen = set()
                 for f in findings:
                     owners = [o for o in f.get("owners", [])
                               if evaluate_advanced(
                                   ast, serve_field_map("owned-table", f, o),
                                   entry["search"](f))]
+                    if uniq_fields:
+                        deduped_owners = []
+                        for o in owners:
+                            key = _uniq_key(
+                                {k.lower(): v for k, v in
+                                 serve_field_map("owned-table", f, o).items()})
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            deduped_owners.append(o)
+                        owners = deduped_owners
                     if owners:
                         f2 = dict(f)
                         f2["owners"] = owners
@@ -9948,6 +10099,17 @@ def serve_table_response(table_id, qs):
                 findings = [f for f in findings
                             if evaluate_advanced(ast, serve_field_map(table_id, f),
                                                  entry["search"](f))]
+                if uniq_fields:
+                    seen = set()
+                    deduped = []
+                    for f in findings:
+                        key = _uniq_key(
+                            {k.lower(): v for k, v in serve_field_map(table_id, f).items()})
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        deduped.append(f)
+                    findings = deduped
             row_q = ""
     payload = {}
     if thead_html is not None:
