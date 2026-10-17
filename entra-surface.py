@@ -119,7 +119,7 @@ DEFAULT_ROLE_LABELS = {
     "TermStore.ReadWrite.All": "Edit the managed term store",
 }
 
-CATEGORY_ORDER = ["apps", "users", "ad", "groups", "configs"]
+CATEGORY_ORDER = ["apps", "users", "ad", "groups", "configs", "arc"]
 # Which role class can fabricate membership in a dynamic group by editing the
 # referenced user attribute (Entra's rule grammar: `user.<attribute>`). A group
 # is tagged per category only when EVERY attribute referenced by its rule is
@@ -177,6 +177,7 @@ CATEGORY_LABELS = {
     "ad": "Active Directory / On-prem",
     "groups": "Groups",
     "configs": "Conditional Access Policies",
+    "arc": "Azure Arc",
 }
 
 # ---------------------------------------------------------------------------
@@ -599,6 +600,7 @@ SP_GRAPH_FIELDS = [
     "deletionTimestamp", "servicePrincipalType", "appOwnerTenantId",
     "microsoftFirstParty", "appRoleAssignmentRequired", "passwordCredentials",
     "keyCredentials", "appRoles", "publicClient",
+    "tags", "managedIdentityResourceId", "alternativeNames", "publisherName",
 ]
 APP_GRAPH_FIELDS = [
     "objectId", "appId", "displayName", "publicClient", "oauth2AllowImplicitFlow",
@@ -658,6 +660,7 @@ def build_graph(cur):
     """
     graph = {"tenant": {}, "sp": {}, "app": {}, "user": {}, "group": {}, "device": {}, "policy": {},
              "directory_role": {}, "role_definition": {}, "appref_roles": {},
+             "directory_settings": {},
              "app_by_appid": defaultdict(list), "sp_by_appid": defaultdict(list), "app_owners": defaultdict(set),
              "sp_owners": defaultdict(set), "role_assigns": [],
              "role_member_user": [], "role_member_sp": [], "role_member_group": [],
@@ -748,6 +751,8 @@ def build_graph(cur):
         "DirectoryRoles", "objectId", ["objectId", "displayName", "isSystem", "roleDisabled"])
     graph["role_definition"] = load_table(
         "RoleDefinitions", "objectId", ["objectId", "displayName", "isBuiltIn", "isEnabled", "resourceScopes"])
+    graph["directory_settings"] = load_table(
+        "DirectorySettings", "id", ["id", "displayName", "templateId", "values"])
 
     def load_member_links(table, left_col, right_col):
         out = []
@@ -821,6 +826,7 @@ def build_graph(cur):
             sub_names = {sid: disp for sid, disp in cur.fetchall() if sid and disp}
     except sqlite3.OperationalError:
         pass
+    graph["az_sub_names"] = sub_names
 
     def az_role_label(role_def_id):
         guid = (role_def_id or "").rsplit("/", 1)[-1]
@@ -885,6 +891,7 @@ def build_graph(cur):
         p = az_scope_parse(extra.get("scope"))
         entry = {
             "role": az_role_label(extra.get("role_definition_id")),
+            "role_def_id": (extra.get("role_definition_id") or "").rsplit("/", 1)[-1],
             "scope": extra.get("scope") or "",
             "scope_type": p["type"],
             "scope_sub": p["sub"],
@@ -2247,6 +2254,17 @@ def check_ad_sync_infra(ctx):
     return findings
 
 
+# ---- sync authentication mode (PHS / PTA / federation) markers -------------
+# The EnforceCloudPasswordPolicyForPasswordSyncedUsers value only exists in
+# tenants using Password Hash Sync; the PTA agent and ADFS surface as
+# well-known first-party service principals. Template/name constants are
+# stable across tenants (never user-controlled display text).
+PASSWORD_RULE_SETTINGS_TEMPLATE_ID = "5cf42378-d67d-4f36-ba46-e8b86229381d"
+PHS_ENFORCE_SETTING = "EnforceCloudPasswordPolicyForPasswordSyncedUsers"
+PTA_AGENT_SP_NAMES = {"Microsoft Azure AD Connect Authentication Agent"}
+FEDERATION_SP_NAMES = {"Active Directory Federation Services", "ADFS"}
+
+
 def check_ad_sync_summary(ctx):
     """Assess which sync engine is in use and surface the dangerous channels.
 
@@ -2302,6 +2320,24 @@ def check_ad_sync_summary(ctx):
         if sso:
             break
 
+    # ---- authentication mode: PHS / PTA / federation -----------------------
+    # PHS is an on-prem connector setting with no direct Entra-side flag; the
+    # only PHS-specific marker visible from collected data is the
+    # EnforceCloudPasswordPolicyForPasswordSyncedUsers directory setting
+    # (present solely in PHS tenants). Writeback alone only proves PHS or PTA.
+    phs_present, phs_enforce = False, None
+    for rec in graph.get("directory_settings", {}).values():
+        if (rec.get("templateId") or "") != PASSWORD_RULE_SETTINGS_TEMPLATE_ID:
+            continue
+        for v in json_list(rec.get("values")):
+            if isinstance(v, dict) and v.get("name") == PHS_ENFORCE_SETTING:
+                phs_present = True
+                phs_enforce = str(v.get("value") or "").lower() in ("true", "1")
+    pta = any(rec.get("displayName") in PTA_AGENT_SP_NAMES
+              for rec in graph["sp"].values())
+    federated = any(rec.get("displayName") in FEDERATION_SP_NAMES
+                    for rec in graph["sp"].values())
+
     sync_fabric = next((rec.get("displayName") for rec in graph["sp"].values()
                         if rec.get("displayName") == "Microsoft.Azure.SyncFabric"), None)
     o365_dir_sync = bool(next((rec for rec in graph["sp"].values()
@@ -2314,6 +2350,34 @@ def check_ad_sync_summary(ctx):
         verdict = "Likely Entra Cloud Sync"
     else:
         verdict = "Undetermined (no sync observed)"
+
+    if phs_present:
+        auth_mode = ("Password Hash Sync (PHS)"
+                     + (" \u00b7 enforcing cloud password policy for synced users"
+                        if phs_enforce else ""))
+        auth_short = "PHS"
+        auth_detail = (f"{PHS_ENFORCE_SETTING} = "
+                       + ("True" if phs_enforce else "False"))
+    elif pta:
+        auth_mode = "Pass-through Authentication (PTA)"
+        auth_short = "PTA"
+        auth_detail = "PTA agent service principal present"
+    elif federated:
+        auth_mode = "Federated (ADFS)"
+        auth_short = "Federated"
+        auth_detail = "ADFS service principal present"
+    elif onprem or writeback["count"]:
+        auth_mode = "PHS or PTA"
+        auth_short = "PHS / PTA"
+        auth_detail = ("writeback requires the AD DS connector; collected data "
+                       "does not distinguish PHS from PTA")
+    else:
+        auth_mode = "Unknown"
+        auth_short = ""
+        auth_detail = "no sync observed"
+    auth = {"mode": auth_mode, "short": auth_short, "detail": auth_detail,
+            "phs_present": phs_present, "phs_enforce": phs_enforce,
+            "pta": pta, "federated": federated}
 
     indicators = []
     indicators.append({
@@ -2338,6 +2402,10 @@ def check_ad_sync_summary(ctx):
     indicators.append({
         "label": "Password writeback channel", "present": writeback["count"] > 0,
         "detail": wb_txt,
+    })
+    indicators.append({
+        "label": "Authentication mode", "present": bool(auth_short),
+        "detail": f"{auth_mode} \u2014 {auth_detail}",
     })
     indicators.append({
         "label": "SyncFabric sync identity", "present": bool(sync_fabric),
@@ -2378,6 +2446,7 @@ def check_ad_sync_summary(ctx):
     f["verdict"] = verdict
     f["connector_host"] = sorted({c["host"] for c in connectors if c["host"]})
     f["writeback"] = writeback
+    f["auth_mode"] = auth
     f["desktop_sso"] = sso
     f["indicators"] = indicators
     f["sync_count"] = sync_count
@@ -3026,6 +3095,266 @@ def check_ca_exposure(ctx):
     return findings
 
 
+# ---------------------------------------------------------------------------
+# Azure Arc detection
+# ---------------------------------------------------------------------------
+#
+# Every signal below is a tenant-independent identifier, not display text:
+#   - Azure RBAC built-in role-definition GUIDs (identical in every tenant)
+#   - first-party Microsoft Arc service-principal appIds (global constants)
+#   - the "AzureArcSPN" tag the Arc deployment wizard stamps on the SP it creates
+#   - the Microsoft.HybridCompute managed-identity resource path of Arc servers
+#
+# Research references:
+#   - IBM X-Force: "Identifying and abusing Azure Arc for hybrid escalation
+#     and persistence" (ROADrecon hunting recipes for exactly these fields)
+
+ARC_RBAC_ROLE_GUIDS = {
+    "b64e21ea-ac4e-4cdf-9dc9-5b892992bee7": "Azure Connected Machine Onboarding",
+    "cd570a14-e51a-42ad-bac8-bafd67325302": "Azure Connected Machine Resource Administrator",
+    "f5819b54-e033-4d82-ac66-4fec3cbf3f4c": "Azure Connected Machine Resource Manager",
+    "34e09817-6cbe-4d01-b1a2-e0eac5743d41": "Kubernetes Cluster - Azure Arc Onboarding",
+    "00493d72-78f6-4148-b6c5-d3ce8e4799dd": "Azure Arc Enabled Kubernetes Cluster User Role",
+    "63f0a09d-1495-4db4-a681-037d84835eb4": "Azure Arc Kubernetes Viewer",
+    "5b999177-9696-4545-85c7-50de3797e5a1": "Azure Arc Kubernetes Writer",
+    "8393591c-06b9-48a2-a542-1bd6b377f6a2": "Azure Arc Kubernetes Cluster Admin",
+    "dffb1e0c-446f-4dde-a09f-99eb5cc68b96": "Azure Arc Kubernetes Admin",
+    "06927065-6e3c-475e-b565-1dd2c3a93b60": "Azure Arc Kubernetes Reader",
+    "5d3f1697-4507-4d08-bb4a-477695db5f82": "Azure Kubernetes Service Arc Contributor Role",
+    "233ca253-b031-42ff-9fba-87ef12d6b55f": "Azure Kubernetes Service Arc Cluster User Role",
+    "b29efa5f-7782-4dc3-9537-4d5bc70a5e9f": "Azure Kubernetes Service Arc Cluster Admin Role",
+    "f6e92014-8af2-414d-9948-9b1abf559285": "Arc Gateway Manager",
+    "53ad7cb7-33cc-4509-b36b-03d40643c499": "Microsoft Cloud Security Arc Machine Operator",
+    "ee99642a-225b-4fe8-a771-9d9036053e87": "Arc Container Storage Contributor",
+    "5d5dddae-e124-4753-972d-aae60b37deb4": "Migrate Arc Discovery Reader - Preview",
+    "b748a06d-6150-4f8a-aaa9-ce3940cd96cb": "Azure Arc VMware VM Contributor",
+    "ce551c02-7c42-47e0-9deb-e3b6fc3a9a83": "Azure Arc VMware Private Cloud User",
+    "ddc140ed-e463-4246-9145-7c664192013f": "Azure Arc VMware Administrator role",
+    "67d33e57-3129-45e6-bb0b-7cc522f762fa": "Azure Arc VMware Private Clouds Onboarding",
+    "e582369a-e17b-42a5-b10c-874c387c530b": "Azure Arc ScVmm VM Contributor",
+    "a92dfd61-77f9-4aec-a531-19858b406c87": "Azure Arc ScVmm Administrator role",
+    "6aac74c4-6311-40d2-bbdd-7d01e7c6e3a9": "Azure Arc ScVmm Private Clouds Onboarding",
+    "c0781e91-8102-4553-8951-97c6d4243cda": "Azure Arc ScVmm Private Cloud User",
+}
+
+ARC_FIRST_PARTY_APP_IDS = {
+    "d00b5d58-cae5-42ad-ae0a-5a2e6f7ee6c9": "Arc Token Service",
+    "aacceff9-8ec3-413c-83eb-cb131aaf55c6": "Arc Public Cloud - Servers",
+    "61414a6b-7050-4d69-8e88-d6c5646bab20": "ArcGatewayApp",
+    "585fc3c3-9a59-4720-8319-53cce041a605": "Azure Arc Appliance Resource Provider",
+    "0000dab9-8b21-4ba2-807f-1743968cef00": "ASE-Arc-Integration",
+    "1459b1f6-7a5b-4300-93a2-44b4a651759f": "Azure Container Apps Arc - Control Plane",
+    "409eb69a-5e20-4e1e-a8bf-c23300057950": "Azure Container Apps Arc - Data Plane",
+    "a0f92522-89de-4c5e-9a75-0044ccf66efd": "ClusterConfigToArcZone",
+}
+
+ARC_SPN_TAG = "AzureArcSPN"
+
+ARC_HYBRIDCOMPUTE_MARK = "/providers/microsoft.hybridcompute/machines/"
+
+
+def _arc_resource_parts(rec):
+    """(resource_id, subscription, resource_group) for an Arc-enabled server's
+    managed-identity SP record; resource id resolved from
+    managedIdentityResourceId or the alternativeNames array (either carries the
+    ARM resource path). Returns ("", "", "") for non-Arc identities."""
+    resid = rec.get("managedIdentityResourceId") or ""
+    if not resid or ARC_HYBRIDCOMPUTE_MARK not in resid.lower():
+        for alt in json_list(rec.get("alternativeNames")):
+            if isinstance(alt, str) and ARC_HYBRIDCOMPUTE_MARK in alt.lower():
+                resid = alt
+                break
+    if ARC_HYBRIDCOMPUTE_MARK not in resid.lower():
+        return "", "", ""
+    parts = [p for p in resid.split("/") if p]
+    pl = [p.lower() for p in parts]
+    sub = parts[pl.index("subscriptions") + 1] if "subscriptions" in pl else ""
+    rg = parts[pl.index("resourcegroups") + 1] if "resourcegroups" in pl else ""
+    return resid, sub, rg
+
+
+def _arc_roles_filtered(roles):
+    """Dedupe + sort the Arc ARM assignments on a principal (same shape as
+    the generic az_roles attach)."""
+    seen, out = set(), []
+    for a in roles or []:
+        if (a.get("role_def_id") or "").lower() not in ARC_RBAC_ROLE_GUIDS:
+            continue
+        key = (a.get("role"), a.get("scope_label"), bool(a.get("eligible")))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(a)
+    out.sort(key=lambda a: (bool(a.get("eligible")), a["role"].lower()))
+    return out
+
+
+def _sp_password_credentials(graph, oid):
+    """Combined password credentials of a service principal and its app
+    registration: (count, most recent start date, per-credential note lines).
+    Defensive against both Graph 'startDateTime' and legacy 'startDate' key
+    spellings, and against SPs without a local app registration."""
+    rec = (graph.get("sp") or {}).get(oid) or {}
+    creds = list(json_list(rec.get("passwordCredentials")))
+    for a_oid in (graph.get("app_by_appid") or {}).get(rec.get("appId")) or []:
+        a_rec = (graph.get("app") or {}).get(a_oid) or {}
+        creds += list(json_list(a_rec.get("passwordCredentials")))
+    starts, lines = [], []
+    for i, c in enumerate(creds):
+        if not isinstance(c, dict):
+            continue
+        start = c.get("startDateTime") or c.get("startDate") or ""
+        end = c.get("endDateTime") or c.get("endDate") or ""
+        name = c.get("displayName") or c.get("customKeyIdentifier") or f"secret {i + 1}"
+        if start:
+            starts.append(start)
+        lines.append(f"{name}: {start or '?'} \u2192 {end or '?'}")
+    last = max(starts) if starts else ""
+    return len(creds), last, "\n".join(lines)
+
+
+def check_azure_arc_machines(ctx):
+    """Arc-enabled servers: ManagedIdentity service principals whose Azure
+    resource path resolves to Microsoft.HybridCompute/machines (system-assigned
+    identities created when a machine is onboarded to Arc)."""
+    graph = ctx["graph"]
+    include_disabled = ctx["include_disabled"]
+    findings = []
+    for oid in sorted(graph["sp"]):
+        rec = graph["sp"][oid]
+        if (rec.get("servicePrincipalType") or "") != "ManagedIdentity":
+            continue
+        resid, sub, rg = _arc_resource_parts(rec)
+        if not resid:
+            continue
+        if not include_disabled and rec.get("deletionTimestamp"):
+            continue
+        name = rec.get("displayName") or (resid.rsplit("/", 1)[-1] if resid else oid)
+        sub_display = (graph.get("az_sub_names") or {}).get(sub) or sub
+        f = make_finding(
+            check_id="azure_arc_machines", category="arc", severity="Info",
+            title=f"Arc-enabled machine {name}",
+            evidence=resid,
+            remediation="Review whether this server still needs Azure Arc management.",
+            primary_id=oid,
+            object_ids={"sp": {oid}},
+            target={"type": "Azure Arc machine", "name": name, "id": oid},
+        )
+        f["machine_name"] = name
+        f["arc_sub"] = sub_display
+        f["arc_rg"] = rg
+        f["arc_resource_id"] = resid
+        f["arc_status"] = {"label": "Enabled" if rec.get("accountEnabled") else "Disabled",
+                           "enabled": bool(rec.get("accountEnabled"))}
+        findings.append(f)
+    findings.sort(key=lambda f: (f["machine_name"] or "").lower())
+    return findings
+
+
+def check_azure_arc_sps(ctx):
+    """Principals (SP/user/group) holding Azure Arc ARM roles — matched by the
+    built-in role-definition GUID — plus service principals carrying the
+    AzureArcSPN tag (created through the Arc deployment wizard)."""
+    graph = ctx["graph"]
+    include_disabled = ctx["include_disabled"]
+    findings = []
+
+    def emit(kind, oid, display, enabled, tagged, arc_roles, object_ids, extra):
+        f = make_finding(
+            check_id="azure_arc_sps", category="arc", severity="Info",
+            title=f"{kind} {display}",
+            evidence=", ".join(f"{a['role']} @ {a.get('scope_label') or a.get('scope') or ''}"
+                               for a in arc_roles) or ("AzureArcSPN tag" if tagged else ""),
+            remediation=("Review the Arc management credentials and scope; deployment "
+                         "scripts commonly embed this principal's secret."),
+            primary_id=oid,
+            object_ids=object_ids,
+            target={"type": kind, "name": display, "id": oid},
+        )
+        f["arc_principal"] = display
+        f["arc_principal_type"] = kind
+        f["arc_tagged"] = bool(tagged)
+        f["arc_roles"] = _arc_roles_filtered(arc_roles)
+        f["arc_status"] = {"label": "Enabled" if enabled else "Disabled",
+                           "enabled": bool(enabled)}
+        f.update(extra)
+        findings.append(f)
+
+    for oid in sorted(graph["sp"]):
+        rec = graph["sp"][oid]
+        tagged = ARC_SPN_TAG in json_list(rec.get("tags"))
+        arc_roles = _arc_roles_filtered(graph["az_sp_roles"].get(oid, []))
+        if not tagged and not arc_roles:
+            continue
+        if not include_disabled and (not rec.get("accountEnabled") or rec.get("deletionTimestamp")):
+            continue
+        pw, pw_last, pw_note = _sp_password_credentials(graph, oid)
+        app_oids = set((graph.get("app_by_appid") or {}).get(rec.get("appId")) or [])
+        emit("Service Principal", oid,
+             rec.get("displayName") or rec.get("appDisplayName") or oid,
+             bool(rec.get("accountEnabled")), tagged, arc_roles,
+             {"sp": {oid}, "app": app_oids}, {"pw": pw, "pw_last_set": pw_last,
+                                               "pw_creds_note": pw_note})
+
+    for uid in sorted(graph["az_user_roles"]):
+        arc_roles = _arc_roles_filtered(graph["az_user_roles"][uid])
+        if not arc_roles:
+            continue
+        u = graph["user"].get(uid)
+        if not u:
+            continue
+        if not include_disabled and (not u.get("accountEnabled") or u.get("deletionTimestamp")):
+            continue
+        emit("User", uid, u.get("displayName") or u.get("userPrincipalName") or uid,
+             bool(u.get("accountEnabled")), False, arc_roles, {"user": {uid}}, {})
+
+    for gid in sorted(graph["az_roles"]):
+        arc_roles = _arc_roles_filtered(graph["az_roles"][gid])
+        if not arc_roles:
+            continue
+        g = graph["group"].get(gid)
+        if not g:
+            continue
+        emit("Group", gid, g.get("displayName") or gid, True, False, arc_roles,
+             {}, {"arc_group_id": gid})
+
+    findings.sort(key=lambda f: (f["arc_principal_type"], (f["arc_principal"] or "").lower()))
+    return findings
+
+
+def check_azure_arc_providers(ctx):
+    """First-party Microsoft Arc service principals present in the tenant
+    (matched by appId) — subscription configured with the Arc resource
+    providers, so Arc can be onboarded from this tenant."""
+    graph = ctx["graph"]
+    include_disabled = ctx["include_disabled"]
+    findings = []
+    for app_id in sorted(ARC_FIRST_PARTY_APP_IDS):
+        for oid in sorted(graph["sp_by_appid"].get(app_id) or []):
+            rec = graph["sp"].get(oid)
+            if not rec:
+                continue
+            if not include_disabled and (not rec.get("accountEnabled") or rec.get("deletionTimestamp")):
+                continue
+            name = (rec.get("displayName") or rec.get("appDisplayName")
+                    or ARC_FIRST_PARTY_APP_IDS[app_id])
+            f = make_finding(
+                check_id="azure_arc_providers", category="arc", severity="Info",
+                title=f"Azure Arc provider {name}",
+                evidence=f"appId {app_id}",
+                remediation="",
+                primary_id=oid,
+                object_ids={"sp": {oid}},
+                target={"type": "Azure Arc provider", "name": name, "id": oid},
+            )
+            f["arc_provider"] = name
+            f["arc_status"] = {"label": "Enabled" if rec.get("accountEnabled") else "Disabled",
+                               "enabled": bool(rec.get("accountEnabled"))}
+            findings.append(f)
+    findings.sort(key=lambda f: (f["arc_provider"] or "").lower())
+    return findings
+
+
 CHECK_SPECS = [
     {
         "id": "priv_app_ownership",
@@ -3130,7 +3459,7 @@ CHECK_SPECS = [
         "id": "ad_sync_summary",
         "category": "ad",
         "title": "Sync summary",
-        "description": "One-line picture of the sync setup: engine in use (Entra Connect on-prem vs likely Cloud Sync), connector host, password-writeback channel, Desktop SSO, and sync coverage.",
+        "description": "One-line picture of the sync setup: engine in use (Entra Connect on-prem vs likely Cloud Sync), connector host, password-writeback channel, authentication mode (PHS / PTA / federated), Desktop SSO, and sync coverage.",
         "run": check_ad_sync_summary,
     },
     {
@@ -3150,6 +3479,34 @@ CHECK_SPECS = [
                         "authentication policies, and registered Windows devices — the "
                         "on-prem attack surface visible from the cloud side."),
         "run": check_ad_sync_infra,
+    },
+    {
+        "id": "azure_arc_machines",
+        "category": "arc",
+        "title": "Azure Arc machines",
+        "description": ("Servers onboarded to Azure Arc, identified by the "
+                        "Microsoft.HybridCompute resource path on their managed identities "
+                        "(resource-provider namespace, never display names)."),
+        "run": check_azure_arc_machines,
+    },
+    {
+        "id": "azure_arc_sps",
+        "category": "arc",
+        "title": "Azure Arc access",
+        "description": ("Principals holding Azure Arc ARM roles — matched by the built-in "
+                        "role-definition GUIDs — and service principals created through the "
+                        "Arc deployment wizard (AzureArcSPN tag). Arc role holders can "
+                        "onboard machines and run commands on onboarded servers."),
+        "run": check_azure_arc_sps,
+    },
+    {
+        "id": "azure_arc_providers",
+        "category": "arc",
+        "title": "Azure Arc resource providers",
+        "description": ("First-party Microsoft Arc service principals present in the tenant "
+                        "(matched by appId) — at least one subscription is configured with "
+                        "the resource providers required for Arc."),
+        "run": check_azure_arc_providers,
     },
 ]
 
@@ -3377,7 +3734,10 @@ USER_DETAIL_FIELDS = [
 
 def fetch_full_details(cur, sp_ids, app_ids, user_ids, device_ids=None):
     """Fetch attributes for the 'expand' drawers. SPs and applications get every
-    captured column (for the Raw tab); users and devices keep a curated set."""
+    captured column (for the Raw tab); users and devices keep a curated set.
+    SP raw records additionally carry the linked Application row and the raw
+    ARM role assignments, so the Raw tab shows everything captured about the
+    principal."""
     def fetch_all(table, id_column, ids, wanted_fields):
         ids = {i for i in ids if i}
         if not ids:
@@ -3407,8 +3767,92 @@ def fetch_full_details(cur, sp_ids, app_ids, user_ids, device_ids=None):
             result[row[id_index]] = record
         return result
 
+    def clean(record):
+        return {c: v for c, v in record.items()
+                if v is not None and v != "" and v != [] and v != {}}
+
+    def enrich_sp_raw(sp_records):
+        """Add 'application' (full Applications row behind the SP) and
+        'azure_roles' (raw ARM role assignments incl. eligibility) to every SP
+        raw record. Defensive: AZ* tables only exist after azgather."""
+        try:
+            cur.execute("PRAGMA table_info(Applications)")
+            app_cols = {r[1] for r in cur.fetchall()}
+            if {"appId", "objectId"}.issubset(app_cols):
+                for rec in sp_records.values():
+                    app_id = rec.get("appId")
+                    if not app_id or "application" in rec:
+                        continue
+                    cur.execute("SELECT * FROM Applications WHERE appId=? LIMIT 1",
+                                (app_id,))
+                    row = cur.fetchone()
+                    if row is None:
+                        continue
+                    cols = [d[0] for d in cur.description]
+                    app = clean({c: json_safe_value(v) for c, v in zip(cols, row)})
+                    if app:
+                        rec["application"] = app
+        except sqlite3.OperationalError:
+            pass
+        rd_roles = {}
+        try:
+            # AZroleDefinitions.name holds the bare GUID while assignment
+            # role_definition_id is the full provider path — map in Python
+            cur.execute("SELECT name, role_name FROM AZroleDefinitions")
+            rd_roles = {guid: rname for guid, rname in cur.fetchall()
+                        if guid and rname}
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cur.execute("PRAGMA table_info(AZroleAssignments)")
+            ra_cols = {r[1] for r in cur.fetchall()}
+            if {"id", "scope", "role_definition_id"}.issubset(ra_cols):
+                cur.execute(
+                    "SELECT sp.ServicePrincipal, ra.id, ra.scope, ra.role_definition_id, "
+                    "ra.created_on, ra.condition "
+                    "FROM lnk_az_roleassignment_serviceprincipal sp "
+                    "JOIN AZroleAssignments ra ON ra.id = sp.AZroleAssignment")
+                for oid, ra_id, scope, rd_id, created, cond in cur.fetchall():
+                    rec = sp_records.get(oid)
+                    if rec is None:
+                        continue
+                    rec.setdefault("azure_roles", []).append(clean({
+                        "id": ra_id, "scope": scope,
+                        "role_definition_id": rd_id,
+                        "role": rd_roles.get((rd_id or "").rsplit("/", 1)[-1], ""),
+                        "created_on": created, "condition": cond,
+                    }))
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cur.execute("PRAGMA table_info(AZroleEligibilityScheduleInstances)")
+            ec_cols = {r[1] for r in cur.fetchall()}
+            if {"id", "scope", "role_definition_id"}.issubset(ec_cols):
+                cur.execute(
+                    "SELECT sp.ServicePrincipal, e.id, e.scope, e.role_definition_id, "
+                    "e.status, e.start_date_time, e.end_date_time "
+                    "FROM lnk_az_roleassignment_eligible_serviceprincipal sp "
+                    "JOIN AZroleEligibilityScheduleInstances e "
+                    "  ON e.id = sp.AZroleEligibilityScheduleInstance")
+                for oid, eid, scope, rd_id, status, start, end in cur.fetchall():
+                    rec = sp_records.get(oid)
+                    if rec is None:
+                        continue
+                    rec.setdefault("azure_roles", []).append(clean({
+                        "id": eid, "scope": scope,
+                        "role_definition_id": rd_id,
+                        "role": rd_roles.get((rd_id or "").rsplit("/", 1)[-1], ""),
+                        "eligible": True, "status": status,
+                        "start": start, "end": end,
+                    }))
+        except sqlite3.OperationalError:
+            pass
+        return sp_records
+
+    sp_records = fetch_all("ServicePrincipals", "objectId", sp_ids, None)
+    sp_records = enrich_sp_raw(sp_records)
     return {
-        "sp": fetch_all("ServicePrincipals", "objectId", sp_ids, None),
+        "sp": sp_records,
         "app": fetch_all("Applications", "objectId", app_ids, None),
         "user": fetch_all("Users", "objectId", user_ids, USER_DETAIL_FIELDS),
         "device": fetch_all("Devices", "objectId", device_ids or set(), DEVICE_DETAIL_FIELDS),
@@ -3683,12 +4127,1057 @@ def cap_annotate(items):
     return out
 
 
-# Column index -> sort key for the privileged-users table (serve mode)
-USER_SORT_KEYS = {
-    "1": "severity", "2": "name", "3": "upn", "4": "roles", "5": "eligible",
-    "6": "privapps", "7": "capgroups", "8": "grpowned", "9": "caexcl",
-    "10": "hybrid", "11": "status",
+# ---------------------------------------------------------------------------
+# Column catalog
+# ---------------------------------------------------------------------------
+# Every main table declares an ordered list of default columns plus add-on
+# columns ("extras"). Each field maps to a renderer returning (inner_html,
+# data_value); cells are assembled by row_html() so the default output stays
+# byte-identical to the legacy per-table templates. The same catalog drives:
+#   * the static report (default columns + an inert data blob for extras),
+#   * --serve mode (the `cols=` request parameter renders any subset/order),
+#   * the client-side column manager (window.__TABLE_CATALOG).
+#
+# Extra families: "sp", "user", "group", "policy" (see COLUMN_FAMILIES).
+
+COLUMN_FAMILIES = {
+    "sp": "SP / application",
+    "user": "User",
+    "group": "Group",
+    "policy": "CA policy",
 }
+
+DASH_INNER = '<span class="muted">&mdash;</span>'
+SORT_TITLE = "Click to sort \u00b7 drag to reorder"
+
+FIELD_META = {
+    # --- SP / application ---------------------------------------------------
+    "severity": {"label": "Privileges", "width": 100},
+    "owner": {"label": "Owner", "width": 150, "cls": "clickable", "extra_cls": ""},
+    "ownerUpn": {"label": "Owner UPN", "width": 190, "cls": "clickable", "extra_cls": ""},
+    "ownerStatus": {"label": "Owner Status", "width": 100},
+    "ownerSource": {"label": "Owner Source", "width": 110},
+    "ownerAdDn": {"label": "Owner AD DN", "width": 200},
+    "ownerAdSid": {"label": "Owner SID", "width": 100},
+    "ownerImmutableId": {"label": "Owner Immutable ID", "width": 200},
+    "app": {"label": "Application", "width": 210, "cls": "clickable"},
+    "pw": {"label": "Passwords", "width": 70},
+    "keys": {"label": "Keys", "width": 60},
+    "resource": {"label": "Resource", "width": 150, "cls": "clickable"},
+    "permission": {"label": "Permission", "width": 220, "cls": "clickable"},
+    "spStatus": {"label": "SP Status", "width": 100},
+    "appId": {"label": "App ID", "width": 170, "cls": "mono"},
+    "spType": {"label": "SP type", "width": 120},
+    "target": {"label": "Target", "width": 200, "cls": "clickable"},
+    "targetType": {"label": "Target Type", "width": 120},
+    "id": {"label": "Object ID", "width": 180, "cls": "mono"},
+    "roleCount": {"label": "Role assignment", "width": 120},
+    "status": {"label": "Status", "width": 110},
+    "appDirRoles": {"label": "Directory roles", "width": 260},
+    # --- CA policy ----------------------------------------------------------
+    "polName": {"label": "Policy", "width": 220, "cls": "clickable"},
+    "polState": {"label": "State", "width": 90},
+    "polScope": {"label": "Scope", "width": 130},
+    "polApps": {"label": "Apps", "width": 160},
+    "polControls": {"label": "Controls", "width": 130},
+    "polInc": {"label": "Included", "width": 90},
+    "polExc": {"label": "Excluded", "width": 90},
+    "polType": {"label": "Policy type", "width": 110},
+    "polCreated": {"label": "Created", "width": 170},
+    "polModified": {"label": "Last modified", "width": 170},
+    # --- group --------------------------------------------------------------
+    "group": {"label": "Group", "width": 220, "cls": "clickable"},
+    "grpType": {"label": "Type", "width": 180},
+    "grpRoles": {"label": "Directory roles", "width": 200},
+    "grpMembers": {"label": "Members", "width": 80},
+    "grpPriv": {"label": "Priv. members", "width": 110},
+    "grpOwners": {"label": "Owners", "width": 90},
+    "dynGroup": {"label": "Group", "width": 220, "cls": "clickable"},
+    "dynRule": {"label": "Membership rule", "width": 280, "cls": "mono"},
+    "dynAttrs": {"label": "Referenced attributes", "width": 220},
+    "dynMods": {"label": "attribute modifiable by", "width": 340},
+    # --- user ---------------------------------------------------------------
+    "user": {"label": "User", "width": 170, "cls": "clickable"},
+    "userUpn": {"label": "UPN", "width": 190, "cls": "clickable"},
+    "roles": {"label": "Directory roles", "width": 200},
+    "eligible": {"label": "Eligible", "width": 70, "cls": "clickable"},
+    "privApps": {"label": "Priv apps", "width": 80},
+    "capGroups": {"label": "Capable grp", "width": 90},
+    "grpOwned": {"label": "Groups owned", "width": 110},
+    "caExcl": {"label": "CA excl.", "width": 80},
+    "hybrid": {"label": "Account Source", "width": 110},
+    "userStatus": {"label": "Status", "width": 80},
+    "immutableId": {"label": "Immutable ID", "width": 200},
+    "adUser": {"label": "User", "width": 180, "cls": "clickable"},
+    "adUpn": {"label": "UPN", "width": 200, "cls": "clickable"},
+    "adCn": {"label": "AD CN", "width": 140},
+    "adDn": {"label": "AD DN", "width": 200},
+    "adSid": {"label": "SID", "width": 100},
+    "adPw": {"label": "On-prem pw change", "width": 140},
+    "adTags": {"label": "Targeting tags", "width": 150},
+    "adStatus": {"label": "Status", "width": 80},
+    # --- azure role assignments ---------------------------------------------
+    "azApp": {"label": "Application / SP", "width": 170, "cls": "clickable"},
+    "azGroup": {"label": "Group", "width": 170, "cls": "clickable"},
+    "azUser": {"label": "User", "width": 170, "cls": "clickable"},
+    "azRoles": {"label": "Role", "width": 210, "cls": "clickable"},
+    "azSpRoles": {"label": "Role", "width": 210, "cls": "clickable"},
+    "azUsrRoles": {"label": "Role", "width": 210, "cls": "clickable"},
+    "azScopeType": {"label": "Scope Type", "width": 110},
+    "azSub": {"label": "Subscription", "width": 230},
+    "azRg": {"label": "Resource Group", "width": 120},
+    "azProvider": {"label": "Provider", "width": 150},
+    "azResource": {"label": "Resource", "width": 170},
+    # --- azure arc ----------------------------------------------------------
+    "arcMachine": {"label": "Machine", "width": 150},
+    "arcSub": {"label": "Subscription", "width": 220},
+    "arcRg": {"label": "Resource Group", "width": 130},
+    "arcResourceId": {"label": "Resource ID", "width": 300, "cls": "mono"},
+    "arcStatus": {"label": "Status", "width": 90},
+    "arcPrincipal": {"label": "Principal", "width": 180},
+    "arcPrincipalType": {"label": "Type", "width": 120},
+    "arcTag": {"label": "Arc marker", "width": 120},
+    "arcAzRoles": {"label": "Azure roles", "width": 320},
+    "pwLastSet": {"label": "Password last set", "width": 130},
+    "arcProvider": {"label": "Provider service", "width": 210},
+}
+
+
+def _dash_pair():
+    return DASH_INNER, ""
+
+
+def _graph_of(r):
+    return (r or {}).get("graph") or {}
+
+
+def graph_user_record(graph, uid):
+    return ((graph or {}).get("user") or {}).get(uid) if uid else None
+
+
+def row_owner_dict(f, ctx=None):
+    """Normalized owner (display_name/upn/enabled) for generic rows reached via
+    object_ids.user; None when the row has no user handle."""
+    o = f.get("object_ids") or {}
+    uid = next(iter(o.get("user", ()) or ()), "")
+    rec = graph_user_record((ctx or {}).get("graph"), uid)
+    if not rec:
+        return None
+    return {"display_name": rec.get("displayName") or "",
+            "upn": rec.get("userPrincipalName") or "",
+            "enabled": rec.get("accountEnabled") in (1, True),
+            "object_id": uid}
+
+
+def sp_owner_dict(sp_id, graph):
+    """First owner of a service principal (deterministic order)."""
+    for uid in sorted(((graph or {}).get("sp_owners") or {}).get(sp_id) or ()):
+        rec = graph_user_record(graph, uid)
+        if rec:
+            return {"display_name": rec.get("displayName") or "",
+                    "upn": rec.get("userPrincipalName") or "",
+                    "enabled": rec.get("accountEnabled") in (1, True),
+                    "object_id": uid}
+    return None
+
+
+def sp_app_id(sp_id, app_id, graph):
+    g = graph or {}
+    rec = (g.get("sp") or {}).get(sp_id) if sp_id else None
+    if rec is None and app_id:
+        rec = (g.get("app") or {}).get(app_id)
+    return (rec or {}).get("appId") or ""
+
+
+def _graph_user(r, uid=None):
+    g = _graph_of(r)
+    uid = uid or (r or {}).get("user_id")
+    return graph_user_record(g, uid)
+
+
+def _owner_user_record(r):
+    """Graph user record for the row's resolved owner, if any (owned/generic/
+    app-dir/azure-apps rows all carry a normalized rctx owner dict)."""
+    o = (r or {}).get("owner") or {}
+    return graph_user_record(_graph_of(r), o.get("object_id"))
+
+
+# ---- cell renderers (inner html, data_value) -------------------------------
+
+def _cell_severity(f, r):
+    return severity_badge(f["severity"]), f["severity"]
+
+
+def _cell_user(f, r):
+    guest = (' <span class="badge badge-guest" title="Guest / external user">Guest</span>'
+             if f["user_type"] == "Guest" else "")
+    return esc(f["user_display"]) + guest, f["user_display"]
+
+
+def _cell_user_upn(f, r):
+    return esc(f["user_upn"]), f["user_upn"]
+
+
+def _cell_roles(f, r):
+    chips = "".join(
+        f'<span class="badge {severity_class(x["severity"])} role-badge" data-role="{esc(x["name"])}" data-role-field="roles" title="{esc(x["source"])}">{esc(x["name"])}</span> '
+        for x in f["roles"])
+    return chips, ", ".join(x["name"] for x in f["roles"])
+
+
+def _cell_eligible(f, r):
+    elig = f.get("eligible_roles") or []
+    if "group_id" in f:  # groups table flavour: dash inside the count span
+        titles = "\n".join(f"{x['name']} (PIM eligible)" for x in elig)
+        inner = (f'<span class="perm" title="{esc(titles or "")}">'
+                 f'{len(elig) if elig else DASH_INNER}</span>')
+    else:
+        titles = "\n".join(f"{x['name']} ({x['source']})" for x in elig)
+        inner = (f'<span class="perm" title="{esc(titles)}">{len(elig)}</span>'
+                 if elig else DASH_INNER)
+    return inner, ", ".join(x["name"] for x in elig)
+
+
+def _cell_priv_apps(f, r):
+    priv = f["priv_apps"]
+    titles = []
+    for app in priv:
+        perms = ", ".join(g["permission"] for g in app["grants"])
+        titles.append(f"{app['app_name']}: {perms}")
+    return (f'<span class="perm" title="{esc(chr(10).join(titles))}">{len(priv)}</span>',
+            str(len(priv)))
+
+
+def _cell_cap_groups(f, r):
+    cap = f["cap_member"]
+    titles = "\n".join(cap_annotate(cap)) if cap else ""
+    return f'<span class="perm" title="{esc(titles)}">{len(cap)}</span>', str(len(cap))
+
+
+def _cell_grp_owned(f, r):
+    owned = f["owned_cap"]
+    titles = "\n".join(cap_annotate(owned)) if owned else ""
+    return (f'<span class="perm" title="{esc(titles or "")}">{f["owned_count"]}</span>',
+            str(f["owned_count"]))
+
+
+def _cell_ca_excl(f, r):
+    titles = "\n".join(x["name"] for x in f.get("ca_exclusions", []))
+    count = len(f.get("ca_exclusions", []))
+    cell = (f'<span class="tag-chip tag-divergence" title="{esc(titles)}">{count}</span>'
+            if count else '<span class="muted">0</span>')
+    return f'<span class="perm" title="{esc(titles)}">{cell}</span>', str(count)
+
+
+def _source_badge(synced):
+    badge = ('<span class="badge badge-hybrid" title="Synced from on-prem Active Directory">AD</span>'
+             if synced else
+             '<span class="badge badge-disabled" title="Cloud-only account">Cloud</span>')
+    return badge, ("AD" if synced else "Cloud")
+
+
+def _cell_hybrid(f, r):
+    hyb = f.get("hybrid")
+    if hyb is None:  # rows without a finding flag: resolve via the graph user
+        rec = _graph_user(r)
+        if rec is None:
+            return _dash_pair()
+        hyb = rec.get("dirSyncEnabled") in (1, True)
+    return _source_badge(bool(hyb))
+
+
+def _cell_user_status(f, r):
+    if "user_enabled" in f:
+        enabled = bool(f["user_enabled"])
+    else:
+        enabled = bool((_graph_user(r) or {}).get("accountEnabled"))
+    return bool_badge(enabled), "Enabled" if enabled else "Disabled"
+
+
+def _cell_immutable_id(f, r):
+    v = (_graph_user(r) or {}).get("immutableId") or ""
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_ad_user(f, r):
+    return esc(f["user_display"]), f["user_display"]
+
+
+def _cell_ad_upn(f, r):
+    return esc(f["user_upn"]), f["user_upn"]
+
+
+def _cell_ad_cn(f, r):
+    v = f.get("ad_cn") or ""
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_ad_dn(f, r):
+    v = f.get("ad_dn") or ""
+    if not v:
+        v = (_graph_user(r) or {}).get("onPremisesDistinguishedName") or ""
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_ad_sid(f, r):
+    sid = f.get("ad_sid") or ""
+    if not sid:
+        sid = (_graph_user(r) or {}).get("onPremisesSecurityIdentifier") or ""
+    tail = f.get("sid_rid") or (sid.rsplit("-", 1)[-1] if sid else "")
+    if tail:
+        return f'<span class="perm" title="{esc(sid)}">{esc(tail)}</span>', sid
+    return DASH_INNER, sid
+
+
+def _cell_ad_pw(f, r):
+    v = f.get("pw_change") or ""
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_ad_tags(f, r):
+    tags = f["tags"]
+    return ad_tag_chips(tags), ", ".join(tags)
+
+
+def _cell_ad_status(f, r):
+    enabled = bool((f.get("status") or {}).get("enabled"))
+    return bool_badge(enabled), "Enabled" if enabled else "Disabled"
+
+
+def _cell_owner(f, r):
+    o = (r or {}).get("owner")
+    if not o:
+        return _dash_pair()
+    v = o.get("display_name") or ""
+    return esc(v), v
+
+
+def _cell_owner_upn(f, r):
+    o = (r or {}).get("owner")
+    if not o:
+        return _dash_pair()
+    v = o.get("upn") or ""
+    return esc(v), v
+
+
+def _cell_owner_status(f, r):
+    o = (r or {}).get("owner")
+    if not o:
+        return _dash_pair()
+    enabled = bool(o.get("enabled"))
+    return bool_badge(enabled), "Enabled" if enabled else "Disabled"
+
+
+# User-attribute columns resolved through the row's owner (SP tables).
+OWNER_USER_FIELDS = ("ownerSource", "ownerAdDn", "ownerAdSid", "ownerImmutableId")
+
+
+def _cell_owner_source(f, r):
+    rec = _owner_user_record(r)
+    if rec is None:
+        return _dash_pair()
+    return _source_badge(rec.get("dirSyncEnabled") in (1, True))
+
+
+def _cell_owner_ad_dn(f, r):
+    v = ((_owner_user_record(r) or {}).get("onPremisesDistinguishedName") or "")
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_owner_ad_sid(f, r):
+    v = ((_owner_user_record(r) or {}).get("onPremisesSecurityIdentifier") or "")
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_owner_immutable_id(f, r):
+    v = ((_owner_user_record(r) or {}).get("immutableId") or "")
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_app(f, r):
+    tid = (r or {}).get("tid")
+    if tid == "app-dir-roles-table":
+        v = (f.get("target") or {}).get("name") or ""
+        return esc(v), v
+    v = f.get("display_name") or ""
+    note = (' <span class="muted">(foreign SP, no local app registration)</span>'
+            if tid == "owned-table" and f.get("is_foreign") else "")
+    return esc(v) + note, v
+
+
+def _cell_pw(f, r):
+    v = f.get("pw")
+    return count_cell(v), (str(v) if v is not None else "")
+
+
+def _cell_keys(f, r):
+    v = f.get("keys")
+    return count_cell(v), (str(v) if v is not None else "")
+
+
+def _cell_resource(f, r):
+    v = f.get("resource_name") or ""
+    return esc(v), v
+
+
+def _cell_permission(f, r):
+    return (f'<span class="perm" title="{esc(f.get("reason") or "")}">'
+            f'{esc(f.get("permission") or "")}</span>', f.get("permission") or "")
+
+
+def _cell_sp_status(f, r):
+    enabled = bool(f.get("sp_enabled"))
+    return bool_badge(enabled), "Enabled" if enabled else "Disabled"
+
+
+def _cell_app_id(f, r):
+    v = sp_app_id((r or {}).get("sp_id"), (r or {}).get("app_id"), _graph_of(r))
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_sp_type(f, r):
+    sid = (r or {}).get("sp_id")
+    rec = (_graph_of(r).get("sp") or {}).get(sid) if sid else None
+    v = (rec or {}).get("servicePrincipalType") or ""
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_target(f, r):
+    v = (f.get("target") or {}).get("name") or ""
+    return esc(v), v
+
+
+def _cell_target_type(f, r):
+    v = (f.get("target") or {}).get("type") or ""
+    return esc(v), v
+
+
+def _cell_obj_id(f, r):
+    v = (f.get("target") or {}).get("id") or ""
+    return esc(v), v
+
+
+def _cell_role_count(f, r):
+    v = f.get("roles")
+    return count_cell(v), (str(v) if v is not None else "")
+
+
+def _cell_status(f, r):
+    return status_cell(f.get("status")), ((f.get("status") or {}).get("label") or "")
+
+
+def _cell_app_dir_roles(f, r):
+    tags = f.get("dir_role_tags", [])
+    chips = "".join(app_dir_role_chip(x) for x in tags)
+    return (chips or DASH_INNER), ", ".join(x["name"] for x in tags)
+
+
+def _cell_pol_name(f, r):
+    v = f.get("policy_name") or ""
+    return esc(v), v
+
+
+def _cell_pol_state(f, r):
+    return status_cell(f.get("status")), (f.get("state") or "")
+
+
+def _cell_pol_scope(f, r):
+    v = f.get("scope") or ""
+    return esc(v), v
+
+
+def _cell_pol_apps(f, r):
+    joined = ", ".join((f.get("conditions_html") or {}).get("apps") or [])
+    shown = joined or "\u2014"
+    return f'<span class="perm" title="{esc(joined)}">{esc(shown)}</span>', shown
+
+
+def _cell_pol_controls(f, r):
+    joined = ", ".join((f.get("conditions_html") or {}).get("controls") or [])
+    shown = joined or "\u2014"
+    return f'<span class="perm" title="{esc(joined)}">{esc(shown)}</span>', shown
+
+
+def _cell_pol_inc(f, r):
+    items = f.get("included", [])
+    return (f'<span class="perm" title="{esc(chr(10).join(items))}">{len(items)}</span>',
+            str(len(items)))
+
+
+def _cell_pol_exc(f, r):
+    items = f.get("excluded", [])
+    return (f'<span class="perm" title="{esc(chr(10).join(items))}">{len(items)}</span>',
+            str(len(items)))
+
+
+def _cell_pol_type(f, r):
+    v = f.get("policy_type")
+    v = "" if v is None else str(v)
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_pol_created(f, r):
+    v = f.get("created") or ""
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_pol_modified(f, r):
+    v = f.get("modified") or ""
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_group(f, r):
+    v = f.get("group_name") or ""
+    return esc(v), v
+
+
+def _cell_grp_type(f, r):
+    types = f.get("types", [])
+    chips = [f'<span class="tag-chip">{esc(t)}</span>' for t in types]
+    if f.get("is_public"):
+        chips.append('<span class="tag-chip">Public</span>')
+    if f.get("dynamic"):
+        chips.append('<span class="tag-chip tag-spray">Auto-membership</span>')
+    if f.get("assignable"):
+        chips.append('<span class="tag-chip tag-divergence">Assignable</span>')
+    if f.get("mail"):
+        chips.append('<span class="tag-chip">Mail</span>')
+    value = ", ".join(types
+                      + (["Public"] if f.get("is_public") else [])
+                      + (["assignable"] if f.get("assignable") else [])
+                      + (["dynamic"] if f.get("dynamic") else []))
+    return ("".join(chips) or DASH_INNER), value
+
+
+def _cell_grp_roles(f, r):
+    chips = "".join(
+        f'<span class="badge {severity_class(x["severity"])} role-badge" data-role="{esc(x["name"])}" data-role-field="grpRoles" title="{esc(x["name"])}">{esc(x["name"])}</span> '
+        for x in f["dir_roles"])
+    return (chips or DASH_INNER), ", ".join(x["name"] for x in f["dir_roles"])
+
+
+def _cell_grp_members(f, r):
+    if "member_count" in f:
+        titles = "\n".join(
+            ((m["upn"] or m["name"])
+             + (" \u2014 " + ", ".join(x["name"] for x in m["roles"] if x["severity"] != "Info")
+                if any(x["severity"] != "Info" for x in m["roles"]) else ""))
+            for m in f["members"])
+        if f["sp_members"]:
+            titles += (("\n" if titles else "")
+                       + f"{len(f['sp_members'])} SP member(s): "
+                       + ", ".join(m["name"] for m in f["sp_members"]))
+        return (f'<span class="perm" title="{esc(titles or "")}">{f["member_count"]}</span>',
+                str(f["member_count"]))
+    return _cell_grp_members_graph(f, r)
+
+
+def _cell_grp_members_graph(f, r):
+    gid = (r or {}).get("group_id")
+    g = _graph_of(r)
+    users = (g.get("group_member_user") or {}).get(gid) or () if gid else ()
+    sps = (g.get("group_member_sp") or {}).get(gid) or () if gid else ()
+    names = []
+    for uid in sorted(users):
+        u = graph_user_record(g, uid) or {}
+        names.append(u.get("userPrincipalName") or u.get("displayName") or uid)
+    for sid in sorted(sps):
+        names.append(((g.get("sp") or {}).get(sid) or {}).get("displayName") or sid)
+    return (f'<span class="perm" title="{esc(chr(10).join(names))}">{len(names)}</span>',
+            str(len(names)))
+
+
+def _cell_grp_priv(f, r):
+    titles = "\n".join(
+        ((m["upn"] or m["name"]) + " \u2014 " + ", ".join(x["name"] for x in m["roles"]))
+        for m in f["members"] if m["privileged"])
+    return (f'<span class="perm" title="{esc(titles or "")}">{f["priv_member_count"]}</span>',
+            str(f["priv_member_count"]))
+
+
+def _cell_grp_owners(f, r):
+    if "owners" in f:
+        owners = f["owners"]
+        return (f'<span class="perm" title="{esc(chr(10).join(owners) or "")}">{len(owners)}</span>',
+                str(len(owners)))
+    return _cell_grp_owners_graph(f, r)
+
+
+def _cell_grp_owners_graph(f, r):
+    gid = (r or {}).get("group_id")
+    g = _graph_of(r)
+    owners = (g.get("group_owner_user") or {}).get(gid) or () if gid else ()
+    names = []
+    for uid in sorted(owners):
+        u = graph_user_record(g, uid) or {}
+        names.append(u.get("userPrincipalName") or u.get("displayName") or uid)
+    return (f'<span class="perm" title="{esc(chr(10).join(names))}">{len(names)}</span>',
+            str(len(names)))
+
+
+def _cell_dyn_group(f, r):
+    v = f.get("group_name") or ""
+    return esc(v), v
+
+
+def _cell_dyn_rule(f, r):
+    rule = f.get("dyn_rule") or ""
+    if not rule:
+        gid = (r or {}).get("group_id")
+        rec = (_graph_of(r).get("group") or {}).get(gid) if gid else None
+        rule = (rec or {}).get("membershipRule") or ""
+    if not rule:
+        return _dash_pair()
+    return (f'<span class="perm" title="{esc(rule)}">{esc(truncate(rule, 60))}</span>',
+            rule)
+
+
+def _cell_dyn_attrs(f, r):
+    attrs = f.get("dyn_attrs", [])
+    chips = "".join(
+        f'<span class="tag-chip filter-tag" data-filter-field="dynAttrs" data-filter-value="{esc(a)}">{esc(a)}</span> '
+        for a in attrs)
+    return (chips or DASH_INNER), ", ".join(attrs)
+
+
+def _cell_dyn_mods(f, r):
+    mods = f.get("dyn_mods", [])
+    chips = "".join(
+        f'<span class="tag-chip {"tag-spray" if m == "User modifiable" else "tag-divergence" if m == "User Administrator" else "tag-privileged" if m == "Directory Writer" else ""} filter-tag" data-filter-field="dynMods" data-filter-value="{esc(m)}">{esc(m)}</span> '
+        for m in mods)
+    return (chips or DASH_INNER), ", ".join(mods)
+
+
+def _cell_az_principal(f, r):
+    v = f.get("principal") or ""
+    return esc(v), v
+
+
+def _cell_az_role(f, r):
+    role = f.get("role") or ""
+    return esc(role + (" (eligible)" if f.get("eligible") else "")), role
+
+
+def _cell_az_scope_type(f, r):
+    v = f.get("scope_type") or ""
+    return (esc(v) if v else "\u2014"), v
+
+
+def _cell_az_sub(f, r):
+    v = f.get("sub") or "\u2014"
+    return esc(v), v
+
+
+def _cell_az_rg(f, r):
+    v = f.get("scope_rg") or ""
+    return (esc(v) if v else "\u2014"), v
+
+
+def _cell_az_provider(f, r):
+    v = f.get("scope_provider") or ""
+    return (esc(v) if v else "\u2014"), v
+
+
+def _cell_az_resource(f, r):
+    v = f.get("scope_resource") or ""
+    return (esc(v) if v else "\u2014"), v
+
+
+# ---- azure arc cells --------------------------------------------------------
+
+def _cell_arc_machine(f, r):
+    v = f.get("machine_name") or ""
+    return esc(v), v
+
+
+def _cell_arc_sub(f, r):
+    v = f.get("arc_sub") or ""
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_arc_rg(f, r):
+    v = f.get("arc_rg") or ""
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_arc_resource_id(f, r):
+    v = f.get("arc_resource_id") or ""
+    return ((f'<span class="perm" title="{esc(v)}">{esc(truncate(v, 64))}</span>')
+            if v else DASH_INNER), v
+
+
+def _cell_arc_status(f, r):
+    st = f.get("arc_status") or {}
+    label = st.get("label") or ""
+    if not label:
+        return _dash_pair()
+    return bool_badge(bool(st.get("enabled"))), label
+
+
+def _cell_arc_principal(f, r):
+    v = f.get("arc_principal") or ""
+    return esc(v), v
+
+
+def _cell_arc_principal_type(f, r):
+    v = f.get("arc_principal_type") or ""
+    return esc(v), v
+
+
+def _cell_arc_tag(f, r):
+    if f.get("arc_tagged"):
+        return ('<span class="badge badge-info" '
+                'title="Service principal created through the Azure Arc deployment wizard">'
+                'AzureArcSPN</span>', "AzureArcSPN")
+    return _dash_pair()
+
+
+def _cell_arc_az_roles(f, r):
+    roles = f.get("arc_roles") or []
+    chips = "".join(
+        f'<span class="badge badge-info role-badge" '
+        f'title="{esc((a.get("scope_label") or a.get("scope") or ""))}">'
+        f'{esc(a.get("role") or "")}{" (eligible)" if a.get("eligible") else ""}</span> '
+        for a in roles)
+    return chips or DASH_INNER, ", ".join(a.get("role", "") for a in roles)
+
+
+def _cell_pw_last_set(f, r):
+    v = f.get("pw_last_set") or ""
+    if not v:
+        return _dash_pair()
+    note = f.get("pw_creds_note") or v
+    return (f'<span class="perm" title="{esc(note)}">{esc(v[:10])}</span>', v[:10])
+
+
+def _cell_arc_provider(f, r):
+    v = f.get("arc_provider") or ""
+    return esc(v), v
+
+
+FIELD_RENDERERS = {
+    "severity": _cell_severity,
+    "user": _cell_user,
+    "userUpn": _cell_user_upn,
+    "roles": _cell_roles,
+    "eligible": _cell_eligible,
+    "privApps": _cell_priv_apps,
+    "capGroups": _cell_cap_groups,
+    "grpOwned": _cell_grp_owned,
+    "caExcl": _cell_ca_excl,
+    "hybrid": _cell_hybrid,
+    "userStatus": _cell_user_status,
+    "immutableId": _cell_immutable_id,
+    "owner": _cell_owner,
+    "ownerUpn": _cell_owner_upn,
+    "ownerStatus": _cell_owner_status,
+    "ownerSource": _cell_owner_source,
+    "ownerAdDn": _cell_owner_ad_dn,
+    "ownerAdSid": _cell_owner_ad_sid,
+    "ownerImmutableId": _cell_owner_immutable_id,
+    "app": _cell_app,
+    "pw": _cell_pw,
+    "keys": _cell_keys,
+    "resource": _cell_resource,
+    "permission": _cell_permission,
+    "spStatus": _cell_sp_status,
+    "appId": _cell_app_id,
+    "spType": _cell_sp_type,
+    "target": _cell_target,
+    "targetType": _cell_target_type,
+    "id": _cell_obj_id,
+    "roleCount": _cell_role_count,
+    "status": _cell_status,
+    "appDirRoles": _cell_app_dir_roles,
+    "polName": _cell_pol_name,
+    "polState": _cell_pol_state,
+    "polScope": _cell_pol_scope,
+    "polApps": _cell_pol_apps,
+    "polControls": _cell_pol_controls,
+    "polInc": _cell_pol_inc,
+    "polExc": _cell_pol_exc,
+    "polType": _cell_pol_type,
+    "polCreated": _cell_pol_created,
+    "polModified": _cell_pol_modified,
+    "group": _cell_group,
+    "grpType": _cell_grp_type,
+    "grpRoles": _cell_grp_roles,
+    "grpMembers": _cell_grp_members,
+    "grpPriv": _cell_grp_priv,
+    "grpOwners": _cell_grp_owners,
+    "dynGroup": _cell_dyn_group,
+    "dynRule": _cell_dyn_rule,
+    "dynAttrs": _cell_dyn_attrs,
+    "dynMods": _cell_dyn_mods,
+    "adUser": _cell_ad_user,
+    "adUpn": _cell_ad_upn,
+    "adCn": _cell_ad_cn,
+    "adDn": _cell_ad_dn,
+    "adSid": _cell_ad_sid,
+    "adPw": _cell_ad_pw,
+    "adTags": _cell_ad_tags,
+    "adStatus": _cell_ad_status,
+    "azApp": _cell_az_principal,
+    "azGroup": _cell_az_principal,
+    "azUser": _cell_az_principal,
+    "azRoles": _cell_az_role,
+    "azSpRoles": _cell_az_role,
+    "azUsrRoles": _cell_az_role,
+    "azScopeType": _cell_az_scope_type,
+    "azSub": _cell_az_sub,
+    "azRg": _cell_az_rg,
+    "azProvider": _cell_az_provider,
+    "azResource": _cell_az_resource,
+    "arcMachine": _cell_arc_machine,
+    "arcSub": _cell_arc_sub,
+    "arcRg": _cell_arc_rg,
+    "arcResourceId": _cell_arc_resource_id,
+    "arcStatus": _cell_arc_status,
+    "arcPrincipal": _cell_arc_principal,
+    "arcPrincipalType": _cell_arc_principal_type,
+    "arcTag": _cell_arc_tag,
+    "arcAzRoles": _cell_arc_az_roles,
+    "pwLastSet": _cell_pw_last_set,
+    "arcProvider": _cell_arc_provider,
+}
+
+
+# ---- per-table specs -------------------------------------------------------
+
+# User-attribute columns a row can resolve through its owner (SP tables).
+USER_OWNER_EXTRAS = [("ownerSource", "user"), ("ownerAdDn", "user"),
+                     ("ownerAdSid", "user"), ("ownerImmutableId", "user")]
+
+GENERIC_SPEC = {
+    "family": "sp",
+    "defaults": ["severity", "target", "targetType", "id", "pw", "keys",
+                 "roleCount", "status"],
+    "extras": [("owner", "user"), ("ownerUpn", "user"), ("ownerStatus", "user")]
+              + USER_OWNER_EXTRAS + [("appId", "sp"), ("spType", "sp")],
+}
+
+TABLE_SPECS = {
+    "owned-table": {
+        "family": "sp",
+        "defaults": ["severity", "owner", "ownerUpn", "ownerStatus", "app",
+                     "pw", "keys", "resource", "permission", "spStatus"],
+        "extras": [("appId", "sp"), ("spType", "sp")] + USER_OWNER_EXTRAS,
+    },
+    "unowned-table": {
+        "family": "sp",
+        "defaults": ["severity", "app", "pw", "keys", "resource",
+                     "permission", "spStatus"],
+        "extras": [("appId", "sp"), ("spType", "sp")],
+    },
+    "table-ca_exposure": {
+        "family": "policy",
+        "defaults": ["severity", "polName", "polState", "polScope", "polApps",
+                     "polControls", "polInc", "polExc"],
+        "extras": [("polType", "policy"), ("polCreated", "policy"),
+                   ("polModified", "policy")],
+    },
+    "groups-table": {
+        "family": "group",
+        "defaults": ["severity", "group", "grpType", "grpRoles", "eligible",
+                     "grpMembers", "grpPriv", "grpOwners"],
+        "extras": [("dynRule", "group")],
+    },
+    "dynamic-groups-table": {
+        "family": "group",
+        "defaults": ["dynGroup", "dynRule", "dynAttrs", "dynMods"],
+        "extras": [("grpMembers", "group"), ("grpOwners", "group")],
+    },
+    "privileged-users-table": {
+        "family": "user",
+        "defaults": ["severity", "user", "userUpn", "roles", "eligible",
+                     "privApps", "capGroups", "grpOwned", "caExcl", "hybrid",
+                     "userStatus"],
+        "extras": [("adDn", "user"), ("adSid", "user"), ("immutableId", "user")],
+    },
+    "app-dir-roles-table": {
+        "family": "sp",
+        "defaults": ["severity", "app", "id", "appDirRoles", "status"],
+        "extras": [("owner", "user"), ("ownerUpn", "user"), ("ownerStatus", "user")]
+                  + USER_OWNER_EXTRAS + [("appId", "sp"), ("spType", "sp")],
+    },
+    "ad-sync-users-table": {
+        "family": "user",
+        "defaults": ["adUser", "adUpn", "adCn", "adDn", "adSid", "adPw",
+                     "adTags", "caExcl", "adStatus"],
+        "extras": [("immutableId", "user")],
+    },
+    "azure-roles-apps": {
+        "family": "sp",
+        "defaults": ["severity", "azApp", "azSpRoles", "azScopeType", "azSub",
+                     "azRg", "azProvider", "azResource"],
+        "extras": [("owner", "user"), ("ownerUpn", "user"), ("ownerStatus", "user")]
+                  + USER_OWNER_EXTRAS + [("appId", "sp"), ("spType", "sp")],
+    },
+    "azure-roles-groups": {
+        "family": "group",
+        "defaults": ["severity", "azGroup", "azRoles", "azScopeType", "azSub",
+                     "azRg", "azProvider", "azResource"],
+        "extras": [("grpMembers", "group"), ("grpOwners", "group")],
+    },
+    "azure-roles-users": {
+        "family": "user",
+        "defaults": ["severity", "azUser", "azUsrRoles", "azScopeType", "azSub",
+                     "azRg", "azProvider", "azResource"],
+        "extras": [("userStatus", "user"), ("hybrid", "user"), ("adDn", "user"),
+                   ("adSid", "user"), ("immutableId", "user")],
+    },
+    "azure-roles-ad": {
+        "family": "user",
+        "defaults": ["severity", "azUser", "azUsrRoles", "azScopeType", "azSub",
+                     "azRg", "azProvider", "azResource"],
+        "extras": [("userStatus", "user"), ("hybrid", "user"), ("adDn", "user"),
+                   ("adSid", "user"), ("immutableId", "user")],
+    },
+    "arc-machines-table": {
+        "family": "arc",
+        "defaults": ["arcMachine", "arcSub", "arcRg", "arcResourceId", "arcStatus"],
+        "extras": [("appId", "sp"), ("id", "sp")],
+    },
+    "arc-principals-table": {
+        "family": "arc",
+        "defaults": ["arcPrincipal", "arcPrincipalType", "arcTag", "arcAzRoles",
+                     "pw", "pwLastSet", "arcStatus"],
+        "extras": [("appId", "sp"), ("owner", "user"), ("ownerUpn", "user"),
+                   ("ownerStatus", "user")],
+    },
+    "arc-providers-table": {
+        "family": "arc",
+        "defaults": ["arcProvider", "appId", "arcStatus"],
+        "extras": [("id", "sp")],
+    },
+}
+
+
+def table_spec(table_id):
+    spec = TABLE_SPECS.get(table_id)
+    if spec is not None:
+        return spec
+    if table_id and table_id.startswith("table-"):
+        return GENERIC_SPEC
+    return None
+
+
+def field_label(table_id, field):
+    spec = table_spec(table_id) or {}
+    return (spec.get("labels") or {}).get(field) or FIELD_META[field]["label"]
+
+
+def cell_cls(table_id, field, is_extra):
+    meta = FIELD_META[field]
+    if is_extra and "extra_cls" in meta:
+        return meta["extra_cls"]
+    return meta.get("cls") or ""
+
+
+def allowed_fields(table_id):
+    spec = table_spec(table_id)
+    if spec is None:
+        return None
+    return list(spec["defaults"]) + [f for f, _ in spec["extras"]]
+
+
+def default_fields(table_id):
+    spec = table_spec(table_id)
+    return list(spec["defaults"]) if spec is not None else []
+
+
+def parse_cols_param(raw, table_id):
+    """Validate a `cols=` request parameter against the table's catalog."""
+    allowed = allowed_fields(table_id)
+    if allowed is None:
+        return None
+    fields = []
+    for tok in (raw or "").split(","):
+        tok = tok.strip()
+        if tok and tok in allowed and tok not in fields:
+            fields.append(tok)
+        if len(fields) >= 40:
+            break
+    return fields if fields else default_fields(table_id)
+
+
+def row_html(table_id, tr_attrs, key, fields, f, r, collect=None):
+    """One <tr> plus its drawer row; cells follow `fields` in order. When
+    `collect` is a dict, every extra column's (inner, value) pair is recorded
+    under the row key so the static report can render it on demand."""
+    spec = table_spec(table_id) or GENERIC_SPEC
+    extras = {e[0] for e in spec["extras"]}
+    cells = [f'<td class="expand-cell">{EXPAND_BUTTON_HTML}</td>']
+    blob = collect.setdefault(key, {}) if collect is not None else None
+    render_list = list(fields)
+    if blob is not None:
+        render_list += [e[0] for e in spec["extras"] if e[0] not in fields]
+    for field in render_list:
+        renderer = FIELD_RENDERERS.get(field)
+        if renderer is None:
+            continue
+        inner, value = renderer(f, r)
+        if field in fields:
+            cls = cell_cls(table_id, field, field in extras)
+            cls_attr = f' class="{cls}"' if cls else ""
+            cells.append(
+                f'<td{cls_attr} data-field="{field}" data-value="{esc(value)}">{inner}</td>')
+        if blob is not None and field in extras \
+                and not (value == "" and inner == DASH_INNER):
+            blob[field] = [inner, value]
+    body = "\n          ".join(cells)
+    return (f'\n        <tr {tr_attrs} data-detail-key="{key}">\n          {body}\n        </tr>'
+            + drawer_for_html(key, len(cells)))
+
+
+def table_head_html(table_id, fields=None):
+    """Server-rendered <colgroup> + <thead> for one table (defaults by default)."""
+    spec = table_spec(table_id)
+    if spec is None:
+        return ""
+    fields = list(spec["defaults"] if fields is None else fields)
+    cols = ['<col style="width:44px">']
+    ths = ['<th class="no-sort"></th>']
+    for field in fields:
+        cols.append(f'<col style="width:{FIELD_META[field]["width"]}px">')
+        ths.append(f'<th data-type="text" data-field="{field}" title="{SORT_TITLE}">'
+                   f'{esc(field_label(table_id, field))}</th>')
+    return ('<colgroup>\n        ' + '\n        '.join(cols)
+            + '\n      </colgroup>\n      <thead>\n        <tr>\n          '
+            + '\n          '.join(ths) + '\n        </tr>\n      </thead>')
+
+
+def table_thead_row_html(table_id, fields):
+    """Inner HTML of the header row (used by the serve JSON endpoint)."""
+    ths = [f'<th class="no-sort"></th>']
+    ths += [f'<th data-type="text" data-field="{field}" title="{SORT_TITLE}">'
+            f'{esc(field_label(table_id, field))}</th>' for field in fields]
+    return "\n          ".join(ths)
+
+
+def table_colgroup_inner_html(fields):
+    """Inner HTML of the <colgroup> (used by the serve JSON endpoint)."""
+    cols = ['<col style="width:44px">']
+    cols += [f'<col style="width:{FIELD_META[field]["width"]}px">' for field in fields]
+    return "".join(cols)
+
+
+def catalog_entry(table_id):
+    spec = table_spec(table_id)
+    if spec is None:
+        return None
+    fields = []
+    for field in spec["defaults"]:
+        fields.append({"id": field, "label": field_label(table_id, field),
+                       "family": spec["family"], "default": True,
+                       "cls": cell_cls(table_id, field, False),
+                       "width": FIELD_META[field]["width"]})
+    for field, family in spec["extras"]:
+        fields.append({"id": field, "label": field_label(table_id, field),
+                       "family": family, "default": False,
+                       "cls": cell_cls(table_id, field, True),
+                       "width": FIELD_META[field]["width"]})
+    return {"family": spec["family"], "fields": fields}
 
 
 def user_search_text(f):
@@ -3702,41 +5191,53 @@ def user_search_text(f):
     return " ".join(parts).lower()
 
 
-def user_sort_value(f, key):
+def user_sort_value(f, key, ctx=None):
     if key == "severity":
         return SEVERITY_ORDER.get(f.get("severity", "Info"), 4)
-    if key == "name":
+    if key == "user":
         return (f.get("user_display") or "").lower()
-    if key == "upn":
+    if key == "userUpn":
         return (f.get("user_upn") or "").lower()
     if key == "roles":
         return ", ".join(r["name"] for r in f.get("roles", [])).lower()
     if key == "eligible":
         return len(f.get("eligible_roles", []))
-    if key == "privapps":
+    if key == "privApps":
         return len(f.get("priv_apps", []))
-    if key == "capgroups":
+    if key == "capGroups":
         return len(f.get("cap_member", []))
-    if key == "grpowned":
+    if key == "grpOwned":
         return f.get("owned_count", 0)
-    if key == "caexcl":
+    if key == "caExcl":
         return len(f.get("ca_exclusions", []))
     if key == "hybrid":
         return "AD" if f.get("hybrid") else "Cloud"
-    if key == "status":
+    if key == "userStatus":
         return 0 if f.get("user_enabled") else 1
+    if key in ("adDn", "adSid", "immutableId"):
+        rec = graph_user_record((ctx or {}).get("graph"), f.get("user_id")) or {}
+        if key == "adDn":
+            return (rec.get("onPremisesDistinguishedName") or "").lower()
+        if key == "adSid":
+            return (rec.get("onPremisesSecurityIdentifier") or "").lower()
+        return (rec.get("immutableId") or "").lower()
     return 0
 
 
-def user_rows_html(findings, start=0, stop=None, q="", sort_key=None, desc=False):
+def user_rows_html(findings, start=0, stop=None, q="", sort_key=None, desc=False,
+                   columns=None, ctx=None, collect=None):
     """Pre-rendered <tr> html for the privileged-users table (shared by the
     static report and the --serve mode)."""
+    tid = "privileged-users-table"
+    spec = table_spec(tid)
+    fields = list(columns) if columns else list(spec["defaults"])
     items = findings
     if q:
         q = q.lower()
         items = [f for f in items if q in user_search_text(f)]
     if sort_key:
-        items = sorted(items, key=lambda f: user_sort_value(f, sort_key), reverse=bool(desc))
+        items = sorted(items, key=lambda f: user_sort_value(f, sort_key, ctx),
+                       reverse=bool(desc))
     else:
         items = sorted(items, key=lambda f: (SEVERITY_ORDER.get(f.get("severity", "Info"), 4),
                                              (f.get("user_display") or "").lower()))
@@ -3745,42 +5246,11 @@ def user_rows_html(findings, start=0, stop=None, q="", sort_key=None, desc=False
     out = []
     for f in items[start:stop]:
         key = f"row-{len(out)}"
-        guest = (' <span class="badge badge-guest" title="Guest / external user">Guest</span>'
-                 if f["user_type"] == "Guest" else "")
-        role_chips = "".join(
-            f'<span class="badge {severity_class(r["severity"])} role-badge" data-role="{esc(r["name"])}" data-role-field="roles" title="{esc(r["source"])}">{esc(r["name"])}</span> '
-            for r in f["roles"])
-        elig = f.get("eligible_roles") or []
-        elig_titles = "\n".join(f"{r['name']} ({r['source']})" for r in elig)
-        elig_cell = (f'<span class="perm" title="{esc(elig_titles)}">{len(elig)}</span>'
-                     if elig else '<span class="muted">&mdash;</span>')
-        priv_titles = []
-        for app in f["priv_apps"]:
-            perms = ", ".join(g["permission"] for g in app["grants"])
-            priv_titles.append(f"{app['app_name']}: {perms}")
-        cap_titles = "\n".join(cap_annotate(f["cap_member"])) if f["cap_member"] else ""
-        owned_titles = "\n".join(cap_annotate(f["owned_cap"])) if f["owned_cap"] else ""
-        account_source = ('<span class="badge badge-hybrid" title="Synced from on-prem Active Directory">AD</span>'
-                          if f["hybrid"] else '<span class="badge badge-disabled" title="Cloud-only account">Cloud</span>')
-        ca_titles = "\n".join(x["name"] for x in f.get("ca_exclusions", []))
-        ca_count = len(f.get("ca_exclusions", []))
-        ca_cell = (f'<span class="tag-chip tag-divergence" title="{esc(ca_titles)}">{ca_count}</span>'
-                   if ca_count else '<span class="muted">0</span>')
-        out.append(f"""
-        <tr data-sp-id="" data-app-id="" data-owner-id="{esc(f["user_id"])}" data-profile-id="{esc(f["user_id"])}" data-detail-key="{key}">
-          <td class="expand-cell">{EXPAND_BUTTON_HTML}</td>
-          <td data-field="severity" data-value="{esc(f["severity"])}">{severity_badge(f["severity"])}</td>
-          <td class="clickable" data-field="user" data-value="{esc(f["user_display"])}">{esc(f["user_display"])}{guest}</td>
-          <td class="clickable" data-field="userUpn" data-value="{esc(f["user_upn"])}">{esc(f["user_upn"])}</td>
-          <td data-field="roles" data-value="{esc(', '.join(r["name"] for r in f["roles"]))}">{role_chips}</td>
-          <td class="clickable" data-field="eligible" data-value="{esc(', '.join(r['name'] for r in elig))}">{elig_cell}</td>
-          <td data-field="privApps" data-value="{esc(str(len(f["priv_apps"])))}"><span class="perm" title="{esc(chr(10).join(priv_titles))}">{len(f["priv_apps"])}</span></td>
-          <td data-field="capGroups" data-value="{esc(str(len(f["cap_member"])))}"><span class="perm" title="{esc(cap_titles)}">{len(f["cap_member"])}</span></td>
-          <td data-field="grpOwned" data-value="{esc(str(f["owned_count"]))}"><span class="perm" title="{esc(owned_titles or '')}">{f["owned_count"]}</span></td>
-          <td data-field="caExcl" data-value="{esc(str(ca_count))}"><span class="perm" title="{esc(ca_titles)}">{ca_cell}</span></td>
-          <td data-field="hybrid" data-value="{esc('AD' if f['hybrid'] else 'Cloud')}">{account_source}</td>
-          <td data-field="userStatus" data-value="{esc('Enabled' if f['user_enabled'] else 'Disabled')}">{bool_badge(f["user_enabled"])}</td>
-        </tr>{drawer_for_html(key, 12)}""")
+        r = {"graph": (ctx or {}).get("graph"), "user_id": f["user_id"], "tid": tid}
+        tr_attrs = (f'data-sp-id="" data-app-id="" '
+                    f'data-owner-id="{esc(f["user_id"])}" '
+                    f'data-profile-id="{esc(f["user_id"])}"')
+        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
     return out, len(items)
 
 
@@ -3820,48 +5290,78 @@ def legacy_search_text(f):
     return " ".join(parts).lower()
 
 
-def legacy_sort_value(f, key):
+def sp_extra_sort_value(sp_id, app_id, key, ctx):
+    graph = (ctx or {}).get("graph")
+    if key == "appId":
+        return sp_app_id(sp_id, app_id, graph).lower()
+    rec = ((graph or {}).get("sp") or {}).get(sp_id)
+    return ((rec or {}).get("servicePrincipalType") or "").lower()
+
+
+def owner_attr_sort_value(rec, key):
+    """Sort key for owner-resolved user attribute columns (rec = graph user)."""
+    rec = rec or {}
+    if key == "ownerSource":
+        return 0 if rec.get("dirSyncEnabled") in (1, True) else 1
+    if key == "ownerAdDn":
+        return (rec.get("onPremisesDistinguishedName") or "").lower()
+    if key == "ownerAdSid":
+        return (rec.get("onPremisesSecurityIdentifier") or "").lower()
+    return (rec.get("immutableId") or "").lower()
+
+
+OWNER_FIELDS = ("owner", "ownerUpn", "ownerStatus") + OWNER_USER_FIELDS
+
+
+def legacy_sort_value(f, key, ctx=None):
     owner = (f.get("owners") or [{}])[0]
-    return {
-        "1": severity_rank(f.get("severity", "Info")),
-        "2": (owner.get("display_name") or "").lower(),
-        "3": (owner.get("upn") or "").lower(),
-        "4": 0 if owner.get("enabled") else 1,
-        "5": (f.get("display_name") or "").lower(),
-        "6": f.get("pw") or 0,
-        "7": f.get("keys") or 0,
-        "8": (f.get("resource_name") or "").lower(),
-        "9": (f.get("permission") or "").lower(),
-        "10": 0 if f.get("sp_enabled") else 1,
-    }.get(key, 0)
+    if key == "severity":
+        return severity_rank(f.get("severity", "Info"))
+    if key == "owner":
+        return (owner.get("display_name") or "").lower()
+    if key == "ownerUpn":
+        return (owner.get("upn") or "").lower()
+    if key == "ownerStatus":
+        return 0 if owner.get("enabled") else 1
+    if key in OWNER_FIELDS:
+        return owner_attr_sort_value(
+            graph_user_record((ctx or {}).get("graph"), owner.get("object_id")), key)
+    if key == "app":
+        return (f.get("display_name") or "").lower()
+    if key == "pw":
+        return f.get("pw") or 0
+    if key == "keys":
+        return f.get("keys") or 0
+    if key == "resource":
+        return (f.get("resource_name") or "").lower()
+    if key == "permission":
+        return (f.get("permission") or "").lower()
+    if key == "spStatus":
+        return 0 if f.get("sp_enabled") else 1
+    if key in ("appId", "spType"):
+        return sp_extra_sort_value(f.get("principal_id"), f.get("app_object_id"),
+                                   key, ctx)
+    return 0
 
 
-LEGACY_SORT_KEYS = {str(i): str(i) for i in range(1, 11)}
-
-
-def legacy_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None):
+def legacy_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
+                     columns=None, ctx=None, collect=None):
+    tid = "owned-table"
+    spec = table_spec(tid)
+    fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                            legacy_search_text, legacy_sort_value)
+                            legacy_search_text,
+                            lambda f, k: legacy_sort_value(f, k, ctx))
     out = []
     for f in selected:
         for owner in f["owners"]:
             key = f"row-{len(out)}"
-            foreign_note = (' <span class="muted">(foreign SP, no local app registration)</span>'
-                            if f["is_foreign"] else "")
-            out.append(f"""
-        <tr data-sp-id="{esc(f["principal_id"])}" data-app-id="{esc(f["app_object_id"] or "")}" data-owner-id="{esc(owner["object_id"])}" data-detail-key="{key}">
-          <td class="expand-cell">{EXPAND_BUTTON_HTML}</td>
-          <td data-field="severity" data-value="{esc(f["severity"])}">{severity_badge(f["severity"])}</td>
-          <td class="clickable" data-field="owner" data-value="{esc(owner["display_name"])}">{esc(owner["display_name"])}</td>
-          <td class="clickable" data-field="ownerUpn" data-value="{esc(owner["upn"])}">{esc(owner["upn"])}</td>
-          <td data-field="ownerStatus" data-value="{esc('Enabled' if owner['enabled'] else 'Disabled')}">{bool_badge(owner["enabled"])}</td>
-          <td class="clickable" data-field="app" data-value="{esc(f["display_name"])}">{esc(f["display_name"])}{foreign_note}</td>
-          <td data-field="pw" data-value="{esc(str(f.get("pw")) if f.get("pw") is not None else '')}">{count_cell(f.get("pw"))}</td>
-          <td data-field="keys" data-value="{esc(str(f.get("keys")) if f.get("keys") is not None else '')}">{count_cell(f.get("keys"))}</td>
-          <td class="clickable" data-field="resource" data-value="{esc(f["resource_name"])}">{esc(f["resource_name"])}</td>
-          <td class="clickable" data-field="permission" data-value="{esc(f["permission"])}"><span class="perm" title="{esc(f["reason"])}">{esc(f["permission"])}</span></td>
-          <td data-field="spStatus" data-value="{esc('Enabled' if f['sp_enabled'] else 'Disabled')}">{bool_badge(f["sp_enabled"])}</td>
-        </tr>{drawer_for_html(key, 11)}""")
+            r = {"graph": (ctx or {}).get("graph"), "owner": owner, "tid": tid,
+                 "sp_id": f.get("principal_id"), "app_id": f.get("app_object_id")}
+            tr_attrs = (f'data-sp-id="{esc(f["principal_id"])}" '
+                        f'data-app-id="{esc(f["app_object_id"] or "")}" '
+                        f'data-owner-id="{esc(owner["object_id"])}"')
+            out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
     return out, total
 
 
@@ -3870,38 +5370,44 @@ def unowned_search_text(f):
                      f.get("permission") or "", f.get("severity") or ""]).lower()
 
 
-def unowned_sort_value(f, key):
-    return {
-        "1": severity_rank(f.get("severity", "Info")),
-        "2": (f.get("display_name") or "").lower(),
-        "3": f.get("pw") or 0,
-        "4": f.get("keys") or 0,
-        "5": (f.get("resource_name") or "").lower(),
-        "6": (f.get("permission") or "").lower(),
-        "7": 0 if f.get("sp_enabled") else 1,
-    }.get(key, 0)
+def unowned_sort_value(f, key, ctx=None):
+    if key == "severity":
+        return severity_rank(f.get("severity", "Info"))
+    if key == "app":
+        return (f.get("display_name") or "").lower()
+    if key == "pw":
+        return f.get("pw") or 0
+    if key == "keys":
+        return f.get("keys") or 0
+    if key == "resource":
+        return (f.get("resource_name") or "").lower()
+    if key == "permission":
+        return (f.get("permission") or "").lower()
+    if key == "spStatus":
+        return 0 if f.get("sp_enabled") else 1
+    if key in ("appId", "spType"):
+        return sp_extra_sort_value(f.get("principal_id"), f.get("app_object_id"),
+                                   key, ctx)
+    return 0
 
 
-UNOWNED_SORT_KEYS = {str(i): str(i) for i in range(1, 8)}
-
-
-def legacy_unowned_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None):
+def legacy_unowned_rows_html(findings, q="", sort_key=None, desc=False, start=0,
+                             stop=None, columns=None, ctx=None, collect=None):
+    tid = "unowned-table"
+    spec = table_spec(tid)
+    fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                            unowned_search_text, unowned_sort_value)
+                            unowned_search_text,
+                            lambda f, k: unowned_sort_value(f, k, ctx))
     out = []
     for f in selected:
         key = f"row-{len(out)}"
-        out.append(f"""
-        <tr data-sp-id="{esc(f["principal_id"])}" data-app-id="{esc(f["app_object_id"] or "")}" data-owner-id="" data-detail-key="{key}">
-          <td class="expand-cell">{EXPAND_BUTTON_HTML}</td>
-          <td data-field="severity" data-value="{esc(f["severity"])}">{severity_badge(f["severity"])}</td>
-          <td class="clickable" data-field="app" data-value="{esc(f["display_name"])}">{esc(f["display_name"])}</td>
-          <td data-field="pw" data-value="{esc(str(f.get("pw")) if f.get("pw") is not None else '')}">{count_cell(f.get("pw"))}</td>
-          <td data-field="keys" data-value="{esc(str(f.get("keys")) if f.get("keys") is not None else '')}">{count_cell(f.get("keys"))}</td>
-          <td class="clickable" data-field="resource" data-value="{esc(f["resource_name"])}">{esc(f["resource_name"])}</td>
-          <td class="clickable" data-field="permission" data-value="{esc(f["permission"])}"><span class="perm" title="{esc(f["reason"])}">{esc(f["permission"])}</span></td>
-          <td data-field="spStatus" data-value="{esc('Enabled' if f['sp_enabled'] else 'Disabled')}">{bool_badge(f["sp_enabled"])}</td>
-        </tr>{drawer_for_html(key, 8)}""")
+        r = {"graph": (ctx or {}).get("graph"), "tid": tid,
+             "sp_id": f.get("principal_id"), "app_id": f.get("app_object_id")}
+        tr_attrs = (f'data-sp-id="{esc(f["principal_id"])}" '
+                    f'data-app-id="{esc(f["app_object_id"] or "")}" '
+                    f'data-owner-id=""')
+        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
     return out, total
 
 
@@ -3913,26 +5419,49 @@ def generic_search_text(f):
                      f.get("severity") or ""]).lower()
 
 
-def generic_sort_value(f, key):
+def generic_sort_value(f, key, ctx=None):
     t = f.get("target") or {}
-    return {
-        "1": severity_rank(f.get("severity", "Info")),
-        "2": (t.get("name") or "").lower(),
-        "3": (t.get("type") or "").lower(),
-        "4": (t.get("id") or "").lower(),
-        "5": f.get("pw") or 0,
-        "6": f.get("keys") or 0,
-        "7": f.get("roles") or 0,
-        "8": ((f.get("status") or {}).get("label") or "").lower(),
-    }.get(key, 0)
+    if key == "severity":
+        return severity_rank(f.get("severity", "Info"))
+    if key == "target":
+        return (t.get("name") or "").lower()
+    if key == "targetType":
+        return (t.get("type") or "").lower()
+    if key == "id":
+        return (t.get("id") or "").lower()
+    if key == "pw":
+        return f.get("pw") or 0
+    if key == "keys":
+        return f.get("keys") or 0
+    if key == "roleCount":
+        return f.get("roles") or 0
+    if key == "status":
+        return ((f.get("status") or {}).get("label") or "").lower()
+    o = f.get("object_ids") or {}
+    if key in OWNER_FIELDS:
+        owner = row_owner_dict(f, ctx) or {}
+        if key == "owner":
+            return (owner.get("display_name") or "").lower()
+        if key == "ownerUpn":
+            return (owner.get("upn") or "").lower()
+        if key == "ownerStatus":
+            return 0 if owner.get("enabled") else 1
+        return owner_attr_sort_value(
+            graph_user_record((ctx or {}).get("graph"), owner.get("object_id")), key)
+    if key in ("appId", "spType"):
+        return sp_extra_sort_value(next(iter(o.get("sp", ()) or ()), ""),
+                                   next(iter(o.get("app", ()) or ()), ""), key, ctx)
+    return 0
 
 
-GENERIC_SORT_KEYS = {str(i): str(i) for i in range(1, 9)}
-
-
-def generic_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None):
+def generic_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
+                      columns=None, ctx=None, collect=None):
+    tid = "table-generic"
+    spec = table_spec(tid)
+    fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                            generic_search_text, generic_sort_value)
+                            generic_search_text,
+                            lambda f, k: generic_sort_value(f, k, ctx))
     out = []
     for f in selected:
         o = f.get("object_ids") or {}
@@ -3943,19 +5472,127 @@ def generic_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=N
         t = f.get("target") or {}
         key = f"row-{len(out)}"
         policy_id = esc(t.get("id", "")) if t.get("type") == "Policy" else ""
-        out.append(f"""
-        <tr data-sp-id="{esc(sp_id)}" data-app-id="{esc(app_id)}" data-owner-id="{esc(owner_id)}" data-device-id="{esc(device_id)}" data-policy-id="{policy_id}" data-check-id="{esc(f["check_id"])}" data-detail-key="{key}">
-          <td class="expand-cell">{EXPAND_BUTTON_HTML}</td>
-          <td data-field="severity" data-value="{esc(f["severity"])}">{severity_badge(f["severity"])}</td>
-          <td class="clickable" data-field="target" data-value="{esc(t.get("name", ""))}">{esc(t.get("name", ""))}</td>
-          <td data-field="targetType" data-value="{esc(t.get("type", ""))}">{esc(t.get("type", ""))}</td>
-          <td class="mono" data-field="id" data-value="{esc(t.get("id", ""))}">{esc(t.get("id", ""))}</td>
-          <td data-field="pw" data-value="{esc(str(f.get("pw")) if f.get("pw") is not None else '')}">{count_cell(f.get("pw"))}</td>
-          <td data-field="keys" data-value="{esc(str(f.get("keys")) if f.get("keys") is not None else '')}">{count_cell(f.get("keys"))}</td>
-          <td data-field="roleCount" data-value="{esc(str(f.get("roles")) if f.get("roles") is not None else '')}">{count_cell(f.get("roles"))}</td>
-          <td data-field="status" data-value="{esc((f.get("status") or {}).get("label", ""))}">{status_cell(f.get("status"))}</td>
-        </tr>{drawer_for_html(key, 9)}""")
+        r = {"graph": (ctx or {}).get("graph"), "tid": tid,
+             "owner": row_owner_dict(f, ctx), "sp_id": sp_id, "app_id": app_id}
+        tr_attrs = (f'data-sp-id="{esc(sp_id)}" data-app-id="{esc(app_id)}" '
+                    f'data-owner-id="{esc(owner_id)}" data-device-id="{esc(device_id)}" '
+                    f'data-policy-id="{policy_id}" data-check-id="{esc(f["check_id"])}"')
+        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
     return out, total
+
+
+# ---- azure arc rows ---------------------------------------------------------
+
+def arc_search_text(f):
+    parts = [f.get("machine_name") or "", f.get("arc_principal") or "",
+             f.get("arc_provider") or "", f.get("arc_sub") or "",
+             f.get("arc_rg") or "", f.get("arc_resource_id") or "",
+             f.get("severity") or ""]
+    parts += [a.get("role", "") for a in f.get("arc_roles", [])]
+    if f.get("arc_tagged"):
+        parts.append("AzureArcSPN")
+    return " ".join(parts).lower()
+
+
+def arc_sort_value(f, key, ctx=None):
+    if key == "severity":
+        return severity_rank(f.get("severity", "Info"))
+    if key in ("arcMachine", "arcPrincipal", "arcProvider"):
+        return (f.get("machine_name") or f.get("arc_principal")
+                or f.get("arc_provider") or "").lower()
+    if key == "arcSub":
+        return (f.get("arc_sub") or "").lower()
+    if key == "arcRg":
+        return (f.get("arc_rg") or "").lower()
+    if key == "arcResourceId":
+        return (f.get("arc_resource_id") or "").lower()
+    if key == "arcPrincipalType":
+        return (f.get("arc_principal_type") or "").lower()
+    if key == "arcTag":
+        return 0 if f.get("arc_tagged") else 1
+    if key == "arcAzRoles":
+        return ", ".join(a.get("role", "") for a in f.get("arc_roles", [])).lower()
+    if key == "pw":
+        return f.get("pw") or 0
+    if key == "pwLastSet":
+        return (f.get("pw_last_set") or "").lower()
+    if key == "arcStatus":
+        st = f.get("arc_status") or {}
+        return (st.get("label") or "").lower()
+    if key == "appId":
+        o = f.get("object_ids") or {}
+        return sp_extra_sort_value(next(iter(o.get("sp", ()) or ()), ""), "", key, ctx)
+    if key == "id":
+        return ((f.get("target") or {}).get("id") or "").lower()
+    return 0
+
+
+def arc_machines_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
+                           columns=None, ctx=None, collect=None):
+    tid = "arc-machines-table"
+    spec = table_spec(tid)
+    fields = list(columns) if columns else list(spec["defaults"])
+    selected, total = page_rows(findings, q, sort_key, desc, start, stop,
+                                arc_search_text, lambda f, k: arc_sort_value(f, k, ctx))
+    out = []
+    for f in selected:
+        sp_id = (f.get("target") or {}).get("id") or ""
+        key = f"row-{len(out)}"
+        r = {"graph": (ctx or {}).get("graph"), "tid": tid, "sp_id": sp_id}
+        tr_attrs = f'data-sp-id="{esc(sp_id)}" data-check-id="{esc(f["check_id"])}"'
+        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
+    return out, total
+
+
+def arc_principals_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
+                             columns=None, ctx=None, collect=None):
+    tid = "arc-principals-table"
+    spec = table_spec(tid)
+    fields = list(columns) if columns else list(spec["defaults"])
+    selected, total = page_rows(findings, q, sort_key, desc, start, stop,
+                                arc_search_text, lambda f, k: arc_sort_value(f, k, ctx))
+    out = []
+    graph = (ctx or {}).get("graph")
+    for f in selected:
+        oid = (f.get("target") or {}).get("id") or ""
+        kind = f.get("arc_principal_type") or ""
+        key = f"row-{len(out)}"
+        r = {"graph": graph, "tid": tid}
+        if kind == "Service Principal":
+            r["sp_id"] = oid
+            r["owner"] = sp_owner_dict(oid, graph)
+            tr_attrs = f'data-sp-id="{esc(oid)}" data-check-id="{esc(f["check_id"])}"'
+        elif kind == "User":
+            tr_attrs = f'data-profile-id="{esc(oid)}" data-check-id="{esc(f["check_id"])}"'
+        else:
+            gid = f.get("arc_group_id") or oid
+            tr_attrs = f'data-group-id="{esc(gid)}" data-check-id="{esc(f["check_id"])}"'
+        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
+    return out, total
+
+
+def arc_providers_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
+                            columns=None, ctx=None, collect=None):
+    tid = "arc-providers-table"
+    spec = table_spec(tid)
+    fields = list(columns) if columns else list(spec["defaults"])
+    selected, total = page_rows(findings, q, sort_key, desc, start, stop,
+                                arc_search_text, lambda f, k: arc_sort_value(f, k, ctx))
+    out = []
+    for f in selected:
+        sp_id = (f.get("target") or {}).get("id") or ""
+        key = f"row-{len(out)}"
+        r = {"graph": (ctx or {}).get("graph"), "tid": tid, "sp_id": sp_id}
+        tr_attrs = f'data-sp-id="{esc(sp_id)}" data-check-id="{esc(f["check_id"])}"'
+        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
+    return out, total
+
+
+ARC_TABLE_ROWS = {
+    "arc-machines-table": arc_machines_rows_html,
+    "arc-principals-table": arc_principals_rows_html,
+    "arc-providers-table": arc_providers_rows_html,
+}
 
 
 # ---- app directory roles rows ------------------------------------------------
@@ -3964,20 +5601,6 @@ def app_dir_search_text(f):
     t = f.get("target") or {}
     roles = ", ".join(r["name"] for r in f.get("dir_role_tags", []))
     return " ".join([t.get("name") or "", f.get("severity") or "", roles]).lower()
-
-
-def app_dir_sort_value(f, key):
-    t = f.get("target") or {}
-    return {
-        "1": severity_rank(f.get("severity", "Info")),
-        "2": (t.get("name") or "").lower(),
-        "3": (t.get("id") or "").lower(),
-        "4": ", ".join(r["name"] for r in f.get("dir_role_tags", [])).lower(),
-        "5": 0 if (f.get("status") or {}).get("enabled") else 1,
-    }.get(key, 0)
-
-
-APP_DIR_SORT_KEYS = {str(i): str(i) for i in range(1, 6)}
 
 
 def app_dir_role_chip(r):
@@ -3997,23 +5620,53 @@ def app_dir_role_chip(r):
             f'title="{esc(title)}">{label}</span> ')
 
 
-def app_dir_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None):
+def app_dir_sort_value(f, key, ctx=None):
+    t = f.get("target") or {}
+    if key == "severity":
+        return severity_rank(f.get("severity", "Info"))
+    if key == "app":
+        return (t.get("name") or "").lower()
+    if key == "id":
+        return (t.get("id") or "").lower()
+    if key == "appDirRoles":
+        return ", ".join(r["name"] for r in f.get("dir_role_tags", [])).lower()
+    if key == "status":
+        return 0 if (f.get("status") or {}).get("enabled") else 1
+    if key in OWNER_FIELDS:
+        owner = sp_owner_dict(f.get("sp_id"), (ctx or {}).get("graph")) or {}
+        if key == "owner":
+            return (owner.get("display_name") or "").lower()
+        if key == "ownerUpn":
+            return (owner.get("upn") or "").lower()
+        if key == "ownerStatus":
+            return 0 if owner.get("enabled") else 1
+        return owner_attr_sort_value(
+            graph_user_record((ctx or {}).get("graph"), owner.get("object_id")), key)
+    if key in ("appId", "spType"):
+        sp_id = f.get("sp_id") or (t.get("id")
+                                   if t.get("type") == "ServicePrincipal" else "")
+        return sp_extra_sort_value(sp_id, "", key, ctx)
+    return 0
+
+
+def app_dir_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
+                      columns=None, ctx=None, collect=None):
+    tid = "app-dir-roles-table"
+    spec = table_spec(tid)
+    fields = list(columns) if columns else list(spec["defaults"])
+    need_owner = collect is not None or any(x in fields for x in OWNER_FIELDS)
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                                app_dir_search_text, app_dir_sort_value)
+                                app_dir_search_text,
+                                lambda f, k: app_dir_sort_value(f, k, ctx))
     out = []
     for f in selected:
         key = f"row-{len(out)}"
-        tags = f.get("dir_role_tags", [])
-        role_chips = "".join(app_dir_role_chip(r) for r in tags)
-        out.append(f"""
-        <tr data-sp-id="{esc(f.get("sp_id") or "")}" data-detail-key="{key}">
-          <td class="expand-cell">{EXPAND_BUTTON_HTML}</td>
-          <td data-field="severity" data-value="{esc(f["severity"])}">{severity_badge(f["severity"])}</td>
-          <td class="clickable" data-field="app" data-value="{esc(f["target"]["name"])}">{esc(f["target"]["name"])}</td>
-          <td class="mono" data-field="id" data-value="{esc(f["target"]["id"])}">{esc(f["target"]["id"])}</td>
-          <td data-field="appDirRoles" data-value="{esc(', '.join(r['name'] for r in tags))}">{role_chips or '<span class="muted">&mdash;</span>'}</td>
-          <td data-field="status" data-value="{esc((f.get("status") or {}).get("label", ""))}">{status_cell(f.get("status"))}</td>
-        </tr>{drawer_for_html(key, 6)}""")
+        sp_id = f.get("sp_id") or ""
+        r = {"graph": (ctx or {}).get("graph"), "tid": tid, "sp_id": sp_id}
+        if need_owner:
+            r["owner"] = sp_owner_dict(sp_id, (ctx or {}).get("graph"))
+        tr_attrs = f'data-sp-id="{esc(sp_id)}"'
+        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
     return out, total
 
 
@@ -4026,68 +5679,43 @@ def group_search_text(f):
                      roles, elig, " ".join(f.get("types", []))]).lower()
 
 
-def group_sort_value(f, key):
-    return {
-        "1": severity_rank(f.get("severity", "Info")),
-        "2": (f.get("group_name") or "").lower(),
-        "3": " ".join(f.get("types", [])).lower(),
-        "4": ", ".join(r["name"] for r in f.get("dir_roles", [])).lower(),
-        "5": len(f.get("eligible_roles", [])),
-        "6": f.get("member_count", 0),
-        "7": f.get("priv_member_count", 0),
-        "8": len(f.get("owners", [])),
-    }.get(key, 0)
+def group_sort_value(f, key, ctx=None):
+    if key == "severity":
+        return severity_rank(f.get("severity", "Info"))
+    if key == "group":
+        return (f.get("group_name") or "").lower()
+    if key == "grpType":
+        return " ".join(f.get("types", [])).lower()
+    if key == "grpRoles":
+        return ", ".join(r["name"] for r in f.get("dir_roles", [])).lower()
+    if key == "eligible":
+        return len(f.get("eligible_roles", []))
+    if key == "grpMembers":
+        return f.get("member_count", 0)
+    if key == "grpPriv":
+        return f.get("priv_member_count", 0)
+    if key == "grpOwners":
+        return len(f.get("owners", []))
+    if key == "dynRule":
+        return (f.get("dyn_rule") or "").lower()
+    return 0
 
 
-GROUP_SORT_KEYS = {str(i): str(i) for i in range(1, 9)}
-
-
-def group_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None):
+def group_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
+                    columns=None, ctx=None, collect=None):
+    tid = "groups-table"
+    spec = table_spec(tid)
+    fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                            group_search_text, group_sort_value)
+                            group_search_text,
+                            lambda f, k: group_sort_value(f, k, ctx))
     out = []
     for f in selected:
         key = f"row-{len(out)}"
-        type_chips = []
-        for t in f["types"]:
-            type_chips.append(f'<span class="tag-chip">{esc(t)}</span>')
-        if f["is_public"]:
-            type_chips.append('<span class="tag-chip">Public</span>')
-        if f["dynamic"]:
-            type_chips.append('<span class="tag-chip tag-spray">Auto-membership</span>')
-        if f["assignable"]:
-            type_chips.append('<span class="tag-chip tag-divergence">Assignable</span>')
-        if f["mail"]:
-            type_chips.append('<span class="tag-chip">Mail</span>')
-        role_chips = "".join(
-            f'<span class="badge {severity_class(r["severity"])} role-badge" data-role="{esc(r["name"])}" data-role-field="grpRoles" title="{esc(r["name"])}">{esc(r["name"])}</span> '
-            for r in f["dir_roles"])
-        member_titles = "\n".join(
-            ((m["upn"] or m["name"])
-             + (" — " + ", ".join(r["name"] for r in m["roles"] if r["severity"] != "Info")
-                if any(r["severity"] != "Info" for r in m["roles"]) else ""))
-            for m in f["members"])
-        if f["sp_members"]:
-            member_titles += ("\n" if member_titles else "") + f"{len(f['sp_members'])} SP member(s): " + ", ".join(m["name"] for m in f["sp_members"])
-        priv_titles = "\n".join(
-            ((m["upn"] or m["name"])
-             + " — " + ", ".join(r["name"] for r in m["roles"]))
-            for m in f["members"] if m["privileged"])
-        owner_titles = "\n".join(f["owners"])
-        elig = f.get("eligible_roles") or []
-        elig_titles = "\n".join(f"{r['name']} (PIM eligible)" for r in elig)
-        out.append(f"""
-        <tr data-group-id="{esc(f["group_id"])}" data-detail-key="{key}">
-          <td class="expand-cell">{EXPAND_BUTTON_HTML}</td>
-          <td data-field="severity" data-value="{esc(f["severity"])}">{severity_badge(f["severity"])}</td>
-          <td class="clickable" data-field="group" data-value="{esc(f["group_name"])}">{esc(f["group_name"])}</td>
-          <td data-field="grpType" data-value="{esc(', '.join(f['types'] + (['Public'] if f['is_public'] else []) + (['assignable'] if f['assignable'] else []) + (['dynamic'] if f['dynamic'] else [])))}">{''.join(type_chips) or '<span class="muted">&mdash;</span>'}</td>
-          <td data-field="grpRoles" data-value="{esc(', '.join(r['name'] for r in f['dir_roles']))}">{role_chips or '<span class="muted">&mdash;</span>'}</td>
-          <td class="clickable" data-field="eligible" data-value="{esc(', '.join(r['name'] for r in elig))}"><span class="perm" title="{esc(elig_titles or '')}">{len(elig) if elig else '<span class="muted">&mdash;</span>'}</span></td>
-          <td data-field="grpMembers" data-value="{esc(str(f['member_count']))}"><span class="perm" title="{esc(member_titles or '')}">{f['member_count']}</span></td>
-          <td data-field="grpPriv" data-value="{esc(str(f['priv_member_count']))}"><span class="perm" title="{esc(priv_titles or '')}">{f['priv_member_count']}</span></td>
-          <td data-field="grpOwners" data-value="{esc(str(len(f['owners'])))}"><span class="perm" title="{esc(owner_titles or '')}">{len(f['owners'])}</span></td>
-        </tr>{drawer_for_html(key, 9)}""")
+        r = {"graph": (ctx or {}).get("graph"), "group_id": f.get("group_id"),
+             "tid": tid}
+        tr_attrs = f'data-group-id="{esc(f["group_id"])}"'
+        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
     return out, total
 
 
@@ -4097,38 +5725,37 @@ def dynamic_search_text(f):
                      " ".join(f.get("dyn_mods", []))]).lower()
 
 
-def dynamic_sort_value(f, key):
-    return {
-        "1": (f.get("group_name") or "").lower(),
-        "2": (f.get("dyn_rule") or "").lower(),
-        "3": " ".join(f.get("dyn_attrs", [])).lower(),
-        "4": " ".join(f.get("dyn_mods", [])).lower(),
-    }.get(key, 0)
+def dynamic_sort_value(f, key, ctx=None):
+    if key == "dynGroup":
+        return (f.get("group_name") or "").lower()
+    if key == "dynRule":
+        return (f.get("dyn_rule") or "").lower()
+    if key == "dynAttrs":
+        return " ".join(f.get("dyn_attrs", [])).lower()
+    if key == "dynMods":
+        return " ".join(f.get("dyn_mods", [])).lower()
+    if key == "grpMembers":
+        return f.get("member_count", 0)
+    if key == "grpOwners":
+        return len(f.get("owners", []))
+    return 0
 
 
-DYNAMIC_SORT_KEYS = {"1": "1", "2": "2", "3": "3", "4": "4"}
-
-
-def dynamic_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None):
+def dynamic_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
+                      columns=None, ctx=None, collect=None):
+    tid = "dynamic-groups-table"
+    spec = table_spec(tid)
+    fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                            dynamic_search_text, dynamic_sort_value)
+                            dynamic_search_text,
+                            lambda f, k: dynamic_sort_value(f, k, ctx))
     out = []
     for f in selected:
         key = f"row-{len(out)}"
-        attr_chips = "".join(
-            f'<span class="tag-chip filter-tag" data-filter-field="dynAttrs" data-filter-value="{esc(a)}">{esc(a)}</span> '
-            for a in f["dyn_attrs"])
-        mod_chips = "".join(
-            f'<span class="tag-chip {"tag-spray" if m == "User modifiable" else "tag-divergence" if m == "User Administrator" else "tag-privileged" if m == "Directory Writer" else ""} filter-tag" data-filter-field="dynMods" data-filter-value="{esc(m)}">{esc(m)}</span> '
-            for m in f["dyn_mods"])
-        out.append(f"""
-        <tr data-group-id="{esc(f["group_id"])}" data-detail-key="{key}">
-          <td class="expand-cell">{EXPAND_BUTTON_HTML}</td>
-          <td class="clickable" data-field="dynGroup" data-value="{esc(f["group_name"])}">{esc(f["group_name"])}</td>
-          <td class="mono" data-field="dynRule" data-value="{esc(f["dyn_rule"])}"><span class="perm" title="{esc(f["dyn_rule"])}">{esc(truncate(f["dyn_rule"], 60))}</span></td>
-          <td data-field="dynAttrs" data-value="{esc(', '.join(f['dyn_attrs']))}">{attr_chips or '<span class="muted">&mdash;</span>'}</td>
-          <td data-field="dynMods" data-value="{esc(', '.join(f['dyn_mods']))}">{mod_chips or '<span class="muted">&mdash;</span>'}</td>
-        </tr>{drawer_for_html(key, 5)}""")
+        r = {"graph": (ctx or {}).get("graph"), "group_id": f.get("group_id"),
+             "tid": tid}
+        tr_attrs = f'data-group-id="{esc(f["group_id"])}"'
+        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
     return out, total
 
 
@@ -4141,50 +5768,48 @@ def ad_search_text(f):
                      " ".join(x.get("name") or "" for x in f.get("ca_exclusions", []))]).lower()
 
 
-def ad_sort_value(f, key):
-    return {
-        "1": (f.get("user_display") or "").lower(),
-        "2": (f.get("user_upn") or "").lower(),
-        "3": (f.get("ad_cn") or "").lower(),
-        "4": (f.get("ad_dn") or "").lower(),
-        "5": (f.get("ad_sid") or "").lower(),
-        "6": (f.get("pw_change") or "").lower(),
-        "7": " ".join(f.get("tags", [])).lower(),
-        "8": len(f.get("ca_exclusions", [])),
-        "9": 0 if (f.get("status") or {}).get("enabled") else 1,
-    }.get(key, 0)
+def ad_sort_value(f, key, ctx=None):
+    if key == "adUser":
+        return (f.get("user_display") or "").lower()
+    if key == "adUpn":
+        return (f.get("user_upn") or "").lower()
+    if key == "adCn":
+        return (f.get("ad_cn") or "").lower()
+    if key == "adDn":
+        return (f.get("ad_dn") or "").lower()
+    if key == "adSid":
+        return (f.get("ad_sid") or "").lower()
+    if key == "adPw":
+        return (f.get("pw_change") or "").lower()
+    if key == "adTags":
+        return " ".join(f.get("tags", [])).lower()
+    if key == "caExcl":
+        return len(f.get("ca_exclusions", []))
+    if key == "adStatus":
+        return 0 if (f.get("status") or {}).get("enabled") else 1
+    if key == "immutableId":
+        rec = graph_user_record((ctx or {}).get("graph"), f.get("user_id")) or {}
+        return (rec.get("immutableId") or "").lower()
+    return 0
 
 
-AD_SORT_KEYS = {str(i): str(i) for i in range(1, 10)}
-
-
-def ad_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None):
+def ad_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
+                 columns=None, ctx=None, collect=None):
+    tid = "ad-sync-users-table"
+    spec = table_spec(tid)
+    fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                            ad_search_text, ad_sort_value)
+                            ad_search_text,
+                            lambda f, k: ad_sort_value(f, k, ctx))
     out = []
     for f in selected:
         key = f"row-{len(out)}"
-        sid_tail = f["sid_rid"]
-        sid_cell = (f'<span class="perm" title="{esc(f["ad_sid"])}">{esc(sid_tail)}</span>'
-                    if sid_tail else '<span class="muted">&mdash;</span>')
-        pw = esc(f["pw_change"]) if f["pw_change"] else '<span class="muted">&mdash;</span>'
-        ca_titles = "\n".join(x["name"] for x in f.get("ca_exclusions", []))
-        ca_count = len(f.get("ca_exclusions", []))
-        ca_cell = (f'<span class="tag-chip tag-divergence" title="{esc(ca_titles)}">{ca_count}</span>'
-                   if ca_count else '<span class="muted">0</span>')
-        out.append(f"""
-        <tr data-sp-id="" data-app-id="" data-owner-id="{esc(f["user_id"])}" data-profile-id="{esc(f["user_id"])}" data-detail-key="{key}">
-          <td class="expand-cell">{EXPAND_BUTTON_HTML}</td>
-          <td class="clickable" data-field="adUser" data-value="{esc(f["user_display"])}">{esc(f["user_display"])}</td>
-          <td class="clickable" data-field="adUpn" data-value="{esc(f["user_upn"])}">{esc(f["user_upn"])}</td>
-          <td data-field="adCn" data-value="{esc(f["ad_cn"])}">{esc(f["ad_cn"]) or '<span class="muted">&mdash;</span>'}</td>
-          <td data-field="adDn" data-value="{esc(f["ad_dn"])}">{esc(f["ad_dn"]) or '<span class="muted">&mdash;</span>'}</td>
-          <td data-field="adSid" data-value="{esc(f["ad_sid"])}">{sid_cell}</td>
-          <td data-field="adPw" data-value="{esc(f["pw_change"])}">{pw}</td>
-          <td data-field="adTags" data-value="{esc(', '.join(f["tags"]))}">{ad_tag_chips(f["tags"])}</td>
-          <td data-field="caExcl" data-value="{esc(str(ca_count))}"><span class="perm" title="{esc(ca_titles)}">{ca_cell}</span></td>
-          <td data-field="adStatus" data-value="{esc('Enabled' if (f.get('status') or {}).get('enabled') else 'Disabled')}">{bool_badge(bool((f.get('status') or {}).get('enabled')))}</td>
-        </tr>{drawer_for_html(key, 10)}""")
+        r = {"graph": (ctx or {}).get("graph"), "user_id": f.get("user_id"),
+             "tid": tid}
+        tr_attrs = (f'data-sp-id="" data-app-id="" '
+                    f'data-owner-id="{esc(f["user_id"])}" '
+                    f'data-profile-id="{esc(f["user_id"])}"')
+        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
     return out, total
 
 
@@ -4245,6 +5870,8 @@ JS_FILTER_MODULE = """<script id="filter-module">
     status: ['userstatus', 'status', 'spstatus', 'ownerstatus', 'adstatus'],
     userstatus: ['userstatus'], spstatus: ['spstatus'],
     ownerstatus: ['ownerstatus'], adstatus: ['adstatus'],
+    ownersource: ['ownersource'], owneraddn: ['owneraddn'],
+    ownersid: ['ownersid'], ownerimmutableid: ['ownerimmutableid'],
     target: ['target'], targettype: ['targettype'],
     objectid: ['id'], id: ['id'],
     passwords: ['pw'], pw: ['pw'], keys: ['keys'],
@@ -4271,6 +5898,10 @@ JS_FILTER_MODULE = """<script id="filter-module">
     sid: ['adsid'], adsid: ['adsid'],
     onprempwchange: ['adpw'], adpw: ['adpw'],
     targetingtags: ['adtags'], adtags: ['adtags'],
+    appid: ['appid'], spty: ['spty'], servicetype: ['spty'],
+    poltype: ['poltype'], polcreated: ['polcreated'], created: ['polcreated'],
+    polmodified: ['polmodified'], lastmodified: ['polmodified'],
+    immutableid: ['immutableid'],
     check: ['check'], category: ['category']
   };
 
@@ -4286,10 +5917,14 @@ JS_FILTER_MODULE = """<script id="filter-module">
     controls: 'Controls', included: 'Included', excluded: 'Excluded',
     application: 'Application', owner: 'Owner', ownerupn: 'Owner UPN',
     ownerstatus: 'Owner Status', resource: 'Resource', permission: 'Permission',
+    ownersource: 'Owner Source', owneraddn: 'Owner AD DN', ownersid: 'Owner SID',
+    ownerimmutableid: 'Owner Immutable ID',
     spstatus: 'SP Status', membershiprule: 'Membership rule',
     referencedattributes: 'Referenced attributes', modifiableby: 'Modifiable by',
     aduser: 'User', adupn: 'UPN', adcn: 'AD CN', addn: 'AD DN', sid: 'SID',
     onprempwchange: 'On-prem pw change', targetingtags: 'Targeting tags',
+    appid: 'App ID', spty: 'SP type', poltype: 'Policy type',
+    polcreated: 'Created', polmodified: 'Last modified', immutableid: 'Immutable ID',
     check: 'Check', category: 'Category'
   };
 
@@ -4305,7 +5940,9 @@ JS_FILTER_MODULE = """<script id="filter-module">
     ['Referenced attributes', 'referencedattributes'],
     ['attribute modifiable by', 'modifiableby'],
     ['AD CN', 'adcn'], ['AD DN', 'addn'],
-    ['On-prem pw change', 'onprempwchange'], ['Targeting tags', 'targetingtags']
+    ['On-prem pw change', 'onprempwchange'], ['Targeting tags', 'targetingtags'],
+    ['App ID', 'appid'], ['SP type', 'spty'], ['Policy type', 'poltype'],
+    ['Immutable ID', 'immutableid']
   ];
 
   var BS = String.fromCharCode(92);  // backslash, avoids escape-layering with Python strings
@@ -4568,46 +6205,49 @@ def ca_search_text(f):
                      " ".join(f.get("excluded") or [])]).lower()
 
 
-def ca_sort_value(f, key):
+def ca_sort_value(f, key, ctx=None):
     ch = f.get("conditions_html") or {}
-    return {
-        "1": severity_rank(f.get("severity", "Info")),
-        "2": (f.get("policy_name") or "").lower(),
-        "3": (f.get("state") or "").lower(),
-        "4": (f.get("scope") or "").lower(),
-        "5": ", ".join(ch.get("apps") or []).lower(),
-        "6": ", ".join(ch.get("controls") or []).lower(),
-        "7": len(f.get("included", [])),
-        "8": len(f.get("excluded", [])),
-    }.get(key, 0)
+    if key == "severity":
+        return severity_rank(f.get("severity", "Info"))
+    if key == "polName":
+        return (f.get("policy_name") or "").lower()
+    if key == "polState":
+        return (f.get("state") or "").lower()
+    if key == "polScope":
+        return (f.get("scope") or "").lower()
+    if key == "polApps":
+        return ", ".join(ch.get("apps") or []).lower()
+    if key == "polControls":
+        return ", ".join(ch.get("controls") or []).lower()
+    if key == "polInc":
+        return len(f.get("included", []))
+    if key == "polExc":
+        return len(f.get("excluded", []))
+    if key == "polType":
+        v = f.get("policy_type")
+        return ("" if v is None else str(v)).lower()
+    if key == "polCreated":
+        return (f.get("created") or "").lower()
+    if key == "polModified":
+        return (f.get("modified") or "").lower()
+    return 0
 
 
-CA_SORT_KEYS = {str(i): str(i) for i in range(1, 9)}
-
-
-def ca_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None):
+def ca_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
+                 columns=None, ctx=None, collect=None):
+    tid = "table-ca_exposure"
+    spec = table_spec(tid)
+    fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                                ca_search_text, ca_sort_value)
+                                ca_search_text,
+                                lambda f, k: ca_sort_value(f, k, ctx))
     out = []
     for f in selected:
         key = f"row-{len(out)}"
-        ch = f.get("conditions_html") or {}
-        inc_titles = "\n".join(f.get("included", []))
-        exc_titles = "\n".join(f.get("excluded", []))
-        apps = ", ".join(ch.get("apps") or []) or "—"
-        controls = ", ".join(ch.get("controls") or []) or "—"
-        out.append(f"""
-        <tr data-policy-id="{esc(f.get("policy_id", ""))}" data-detail-key="{key}">
-          <td class="expand-cell">{EXPAND_BUTTON_HTML}</td>
-          <td data-field="severity" data-value="{esc(f["severity"])}">{severity_badge(f["severity"])}</td>
-          <td class="clickable" data-field="polName" data-value="{esc(f.get("policy_name", ""))}">{esc(f.get("policy_name", ""))}</td>
-          <td data-field="polState" data-value="{esc(f.get("state", ""))}">{status_cell(f.get("status"))}</td>
-          <td data-field="polScope" data-value="{esc(f.get("scope", ""))}">{esc(f.get("scope", ""))}</td>
-          <td data-field="polApps" data-value="{esc(apps)}"><span class="perm" title="{esc(", ".join(ch.get("apps") or []))}">{esc(apps)}</span></td>
-          <td data-field="polControls" data-value="{esc(controls)}"><span class="perm" title="{esc(", ".join(ch.get("controls") or []))}">{esc(controls)}</span></td>
-          <td data-field="polInc" data-value="{esc(str(len(f.get('included', []))))}"><span class="perm" title="{esc(inc_titles)}">{len(f.get('included', []))}</span></td>
-          <td data-field="polExc" data-value="{esc(str(len(f.get('excluded', []))))}"><span class="perm" title="{esc(exc_titles)}">{len(f.get('excluded', []))}</span></td>
-        </tr>{drawer_for_html(key, 9)}""")
+        r = {"graph": (ctx or {}).get("graph"), "tid": tid,
+             "policy_id": f.get("policy_id")}
+        tr_attrs = f'data-policy-id="{esc(f.get("policy_id", ""))}"'
+        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
     return out, total
 
 
@@ -4627,6 +6267,24 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
                 f'<td colspan="{colspan}"><div class="drawer-body"></div></td></tr>')
 
     serve_pager = _serve_pager
+    col_ctx = {"graph": graph}
+    extras_blobs = {}
+    catalog_tids = []
+
+    def register_catalog_table(tid, findings, rows_fn, search_fn):
+        """Register a catalog-driven table for --serve and the column catalog."""
+        if serve_tables is not None:
+            serve_tables[tid] = {"findings": findings, "rows": rows_fn,
+                                 "search": search_fn, "ctx": col_ctx}
+        if tid not in catalog_tids:
+            catalog_tids.append(tid)
+
+    def catalog_rows(tid, findings, rows_fn, sep="\n"):
+        """Render static rows for a catalog table, collecting extras into blobs."""
+        if serve_mode:
+            return ""
+        return sep.join(rows_fn(findings, ctx=col_ctx,
+                                collect=extras_blobs.setdefault(tid, {}))[0])
 
     # ---- Azure Roles tables (one per principal section) -------------------
     def az_sub(a):
@@ -4640,6 +6298,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     def azure_roles_section(title, table_id, category, principal_header, rows, az_field):
         if not rows:
             return ""
+        spec = table_spec(table_id)
+        fields = list(spec["defaults"])
+        blob = {}
         body = []
         for label, rid, kind, a in rows:
             key = f"az-{table_id}-{len(body)}"
@@ -4649,49 +6310,34 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
                 data = f'data-group-id="{esc(rid)}"'
             else:
                 data = f'data-profile-id="{esc(rid)}"'
+            row = {
+                "severity": a.get("severity") or "Info",
+                "principal": label,
+                "role": a["role"],
+                "eligible": bool(a.get("eligible")),
+                "scope_type": a.get("scope_type") or "",
+                "sub": az_sub(a),
+                "scope_rg": a.get("scope_rg") or "",
+                "scope_provider": a.get("scope_provider") or "",
+                "scope_resource": a.get("scope_resource") or "",
+            }
+            r = {"graph": graph, "tid": table_id,
+                 "sp_id": rid if kind == "sp" else "",
+                 "group_id": rid if kind == "group" else "",
+                 "user_id": rid if kind == "user" else ""}
             if kind == "sp":
-                pfield = "azApp"
-            elif kind == "group":
-                pfield = "azGroup"
-            else:
-                pfield = "azUser"
-            pcell = f'<td class="clickable" data-field="{pfield}" data-value="{esc(label)}">{esc(label)}</td>'
-            body.append(f"""
-        <tr {data} data-detail-key="{key}">
-          <td class="expand-cell">{EXPAND_BUTTON}</td>
-          <td data-field="severity" data-value="{esc(a.get('severity') or 'Info')}">{severity_badge(a.get('severity') or 'Info')}</td>
-          {pcell}
-          <td class="clickable" data-field="{az_field}" data-value="{esc(a['role'])}">{esc(a['role'] + (' (eligible)' if a.get('eligible') else ''))}</td>
-          <td data-field="azScopeType" data-value="{esc(a.get('scope_type') or '')}">{esc(a.get('scope_type') or '—')}</td>
-          <td data-field="azSub" data-value="{esc(az_sub(a))}">{esc(az_sub(a))}</td>
-          <td data-field="azRg" data-value="{esc(a.get('scope_rg') or '')}">{esc(a.get('scope_rg') or '—')}</td>
-          <td data-field="azProvider" data-value="{esc(a.get('scope_provider') or '')}">{esc(a.get('scope_provider') or '—')}</td>
-          <td data-field="azResource" data-value="{esc(a.get('scope_resource') or '')}">{esc(a.get('scope_resource') or '—')}</td>
-        </tr>{drawer_for(key, 9)}""")
+                r["owner"] = sp_owner_dict(rid, graph)
+            body.append(row_html(table_id, data, key, fields, row, r, blob))
+        if blob:
+            extras_blobs[table_id] = blob
+        if table_id not in catalog_tids:
+            catalog_tids.append(table_id)
         return f"""
   <section data-category="{esc(category)}">
     <h2>{esc(title)}</h2>
     <div class="table-scroll">
     <table id="{esc(table_id)}" class="findings">
-      <colgroup>
-        <col style="width:44px">
-        <col style="width:90px">
-        <col style="width:170px"><col style="width:210px"><col style="width:110px">
-        <col style="width:230px"><col style="width:120px"><col style="width:150px"><col style="width:170px">
-      </colgroup>
-      <thead>
-        <tr>
-          <th class="no-sort"></th>
-          <th data-type="text">Privileges</th>
-          <th data-type="text">{esc(principal_header)}</th>
-          <th data-type="text">Role</th>
-          <th data-type="text">Scope Type</th>
-          <th data-type="text">Subscription</th>
-          <th data-type="text">Resource Group</th>
-          <th data-type="text">Provider</th>
-          <th data-type="text">Resource</th>
-        </tr>
-      </thead>
+      {table_head_html(table_id)}
       <tbody>{''.join(body)}</tbody>
     </table>
     </div>
@@ -4715,37 +6361,15 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         if not priv:
             return ""
         owned = [f for f in priv["findings"] if f["owners"]]
-        owned_rows = "" if serve_mode else "\n".join(legacy_rows_html(owned)[0])
-        if serve_tables is not None:
-            serve_tables["owned-table"] = {"findings": owned, "rows": legacy_rows_html,
-                                           "search": legacy_search_text,
-                                           "sort_keys": LEGACY_SORT_KEYS, "colspan": 11}
+        owned_rows = catalog_rows("owned-table", owned, legacy_rows_html)
+        register_catalog_table("owned-table", owned, legacy_rows_html, legacy_search_text)
         owned_pager = serve_pager() if serve_mode else ""
         return f"""
   <section data-category="apps">
     <h2>{esc(priv["title"])}</h2>
     <div class="table-scroll">
     <table id="owned-table" class="findings" data-serve="1">
-      <colgroup>
-        <col style="width:44px">
-        <col style="width:90px"><col style="width:150px"><col style="width:190px">
-        <col style="width:90px"><col style="width:170px"><col style="width:60px"><col style="width:50px"><col style="width:140px"><col style="width:190px"><col style="width:90px">
-      </colgroup>
-      <thead>
-        <tr>
-          <th class="no-sort"></th>
-          <th data-type="text">Privileges</th>
-          <th data-type="text">Owner</th>
-          <th data-type="text">Owner UPN</th>
-          <th data-type="text">Owner Status</th>
-          <th data-type="text">Application</th>
-          <th data-type="text">Passwords</th>
-          <th data-type="text">Keys</th>
-          <th data-type="text">Resource</th>
-          <th data-type="text">Permission</th>
-          <th data-type="text">SP Status</th>
-        </tr>
-      </thead>
+      {table_head_html("owned-table")}
       <tbody>{owned_rows}</tbody>
     </table>
     </div>
@@ -4759,33 +6383,16 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         if not priv:
             return ""
         unowned = [f for f in priv["findings"] if not f["owners"]]
-        unowned_rows = "" if serve_mode else "\n".join(legacy_unowned_rows_html(unowned)[0])
-        if serve_tables is not None:
-            serve_tables["unowned-table"] = {"findings": unowned, "rows": legacy_unowned_rows_html,
-                                             "search": unowned_search_text,
-                                             "sort_keys": UNOWNED_SORT_KEYS, "colspan": 8}
+        unowned_rows = catalog_rows("unowned-table", unowned, legacy_unowned_rows_html)
+        register_catalog_table("unowned-table", unowned, legacy_unowned_rows_html,
+                               unowned_search_text)
         unowned_pager = serve_pager() if serve_mode else ""
         return f"""
   <section data-category="apps">
     <h2>Privileged applications / service principals with no recorded owner</h2>
     <div class="table-scroll">
     <table id="unowned-table" class="findings" data-serve="1">
-      <colgroup>
-        <col style="width:44px">
-        <col style="width:110px"><col style="width:220px"><col style="width:70px"><col style="width:60px"><col style="width:160px"><col style="width:260px"><col style="width:110px">
-      </colgroup>
-      <thead>
-        <tr>
-          <th class="no-sort"></th>
-          <th data-type="text">Privileges</th>
-          <th data-type="text">Application</th>
-          <th data-type="text">Passwords</th>
-          <th data-type="text">Keys</th>
-          <th data-type="text">Resource</th>
-          <th data-type="text">Permission</th>
-          <th data-type="text">SP Status</th>
-        </tr>
-      </thead>
+      {table_head_html("unowned-table")}
       <tbody>{unowned_rows}</tbody>
     </table>
     </div>
@@ -4802,35 +6409,35 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     # ---- generic findings sections ---------------------------------------
     def generic_section(res):
         tid = f"table-{res['id']}"
-        rows_html = "" if serve_mode else "\n".join(generic_rows_html(res["findings"])[0])
-        if serve_tables is not None:
-            serve_tables[tid] = {"findings": res["findings"], "rows": generic_rows_html,
-                                 "search": generic_search_text,
-                                 "sort_keys": GENERIC_SORT_KEYS, "colspan": 9}
+        rows_html = catalog_rows(tid, res["findings"], generic_rows_html)
+        register_catalog_table(tid, res["findings"], generic_rows_html, generic_search_text)
         pager = serve_pager() if serve_mode else ""
         return f"""
   <section data-category="{esc(res["category"])}">
     <h2>{esc(res["title"])}</h2>
     <div class="table-scroll">
     <table id="{esc(tid)}" class="findings" data-serve="1">
-      <colgroup>
-        <col style="width:44px">
-        <col style="width:110px"><col style="width:200px"><col style="width:120px">
-        <col style="width:170px"><col style="width:70px"><col style="width:60px"><col style="width:90px"><col style="width:110px">
-      </colgroup>
-      <thead>
-        <tr>
-          <th class="no-sort"></th>
-          <th data-type="text">Privileges</th>
-          <th data-type="text">Target</th>
-          <th data-type="text">Target Type</th>
-          <th data-type="text">Object ID</th>
-          <th data-type="text">Passwords</th>
-          <th data-type="text">Keys</th>
-          <th data-type="text">Role assignment</th>
-          <th data-type="text">Status</th>
-        </tr>
-      </thead>
+      {table_head_html(tid)}
+      <tbody>{rows_html}</tbody>
+    </table>
+    </div>
+    {pager}
+  </section>
+"""
+
+    # ---- azure arc sections ------------------------------------------------
+    def arc_section(res, table_id):
+        rows_fn = ARC_TABLE_ROWS[table_id]
+        rows_html = catalog_rows(table_id, res["findings"], rows_fn)
+        register_catalog_table(table_id, res["findings"], rows_fn, arc_search_text)
+        pager = serve_pager() if serve_mode else ""
+        return f"""
+  <section data-category="arc">
+    <h2>{esc(res["title"])}</h2>
+    <p class="sub">{esc(res["description"])}</p>
+    <div class="table-scroll">
+    <table id="{esc(table_id)}" class="findings" data-serve="1">
+      {table_head_html(table_id)}
       <tbody>{rows_html}</tbody>
     </table>
     </div>
@@ -4840,11 +6447,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 
     # ---- conditional-access policies section ----------------------------------
     def ca_section(res):
-        rows_html = "" if serve_mode else "\n".join(ca_rows_html(res["findings"])[0])
-        if serve_tables is not None:
-            serve_tables["table-ca_exposure"] = {"findings": res["findings"], "rows": ca_rows_html,
-                                                 "search": ca_search_text,
-                                                 "sort_keys": CA_SORT_KEYS, "colspan": 9}
+        rows_html = catalog_rows("table-ca_exposure", res["findings"], ca_rows_html)
+        register_catalog_table("table-ca_exposure", res["findings"], ca_rows_html,
+                               ca_search_text)
         pager = serve_pager() if serve_mode else ""
         caview = ' data-caview="main"' if serve_mode else ""
         return f"""
@@ -4852,24 +6457,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     <h2>{esc(res["title"])}</h2>
     <div class="table-scroll">
     <table id="table-ca_exposure" class="findings" data-serve="1">
-      <colgroup>
-        <col style="width:44px">
-        <col style="width:90px"><col style="width:220px"><col style="width:90px"><col style="width:130px">
-        <col style="width:130px"><col style="width:110px"><col style="width:90px"><col style="width:90px">
-      </colgroup>
-      <thead>
-        <tr>
-          <th class="no-sort"></th>
-          <th data-type="text">Privileges</th>
-          <th data-type="text">Policy</th>
-          <th data-type="text">State</th>
-          <th data-type="text">Scope</th>
-          <th data-type="text">Apps</th>
-          <th data-type="text">Controls</th>
-          <th data-type="text">Included</th>
-          <th data-type="text">Excluded</th>
-        </tr>
-      </thead>
+      {table_head_html("table-ca_exposure")}
       <tbody>{rows_html}</tbody>
     </table>
     </div>
@@ -4879,35 +6467,16 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 
     # ---- groups section ----------------------------------------
     def groups_section(res):
-        rows_html = "" if serve_mode else "\n".join(group_rows_html(res["findings"])[0])
-        if serve_tables is not None:
-            serve_tables["groups-table"] = {"findings": res["findings"], "rows": group_rows_html,
-                                            "search": group_search_text,
-                                            "sort_keys": GROUP_SORT_KEYS, "colspan": 9}
+        rows_html = catalog_rows("groups-table", res["findings"], group_rows_html)
+        register_catalog_table("groups-table", res["findings"], group_rows_html,
+                               group_search_text)
         pager = serve_pager() if serve_mode else ""
         return f"""
   <section data-category="groups">
     <h2>{esc(res["title"])}</h2>
     <div class="table-scroll">
     <table id="groups-table" class="findings" data-serve="1">
-      <colgroup>
-        <col style="width:44px">
-        <col style="width:100px"><col style="width:220px"><col style="width:180px"><col style="width:200px">
-        <col style="width:70px"><col style="width:70px"><col style="width:80px"><col style="width:110px">
-      </colgroup>
-      <thead>
-        <tr>
-          <th class="no-sort"></th>
-          <th data-type="text">Privileges</th>
-          <th data-type="text">Group</th>
-          <th data-type="text">Type</th>
-          <th data-type="text">Directory roles</th>
-          <th data-type="text">Eligible</th>
-          <th data-type="text">Members</th>
-          <th data-type="text">Priv. members</th>
-          <th data-type="text">Owners</th>
-        </tr>
-      </thead>
+      {table_head_html("groups-table")}
       <tbody>{rows_html}</tbody>
     </table>
     </div>
@@ -4924,30 +6493,16 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         dyn = [f for f in res["findings"] if f.get("dyn_rule")]
         if not dyn:
             return ""
-        rows_html = "" if serve_mode else "\n".join(dynamic_rows_html(dyn)[0])
-        if serve_tables is not None:
-            serve_tables["dynamic-groups-table"] = {"findings": dyn, "rows": dynamic_rows_html,
-                                                    "search": dynamic_search_text,
-                                                    "sort_keys": DYNAMIC_SORT_KEYS, "colspan": 5}
+        rows_html = catalog_rows("dynamic-groups-table", dyn, dynamic_rows_html)
+        register_catalog_table("dynamic-groups-table", dyn, dynamic_rows_html,
+                               dynamic_search_text)
         pager = serve_pager() if serve_mode else ""
         return f"""
   <section data-category="groups">
     <h2>Dynamic membership groups ({len(dyn)})</h2>
     <div class="table-scroll">
     <table id="dynamic-groups-table" class="findings" data-serve="1">
-      <colgroup>
-        <col style="width:44px">
-        <col style="width:220px"><col style="width:280px"><col style="width:220px"><col style="width:340px">
-      </colgroup>
-      <thead>
-        <tr>
-          <th class="no-sort"></th>
-          <th data-type="text">Group</th>
-          <th data-type="text">Membership rule</th>
-          <th data-type="text">Referenced attributes</th>
-          <th data-type="text">attribute modifiable by</th>
-        </tr>
-      </thead>
+      {table_head_html("dynamic-groups-table")}
       <tbody>{rows_html}</tbody>
     </table>
     </div>
@@ -4956,38 +6511,16 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 """
 
     def users_section(res):
-        if serve_tables is not None:
-            serve_tables["privileged-users-table"] = {
-                "findings": res["findings"], "rows": user_rows_html,
-                "search": user_search_text, "sort_keys": USER_SORT_KEYS, "colspan": 12}
-        rows = "" if serve_mode else "".join(user_rows_html(res["findings"])[0])
+        register_catalog_table("privileged-users-table", res["findings"], user_rows_html,
+                               user_search_text)
+        rows = catalog_rows("privileged-users-table", res["findings"], user_rows_html, sep="")
         pager = serve_pager() if serve_mode else ""
         return f"""
   <section data-category="users">
     <h2>{esc(res["title"])}</h2>
     <div class="table-scroll">
     <table id="privileged-users-table" class="findings" data-serve="1">
-      <colgroup>
-        <col style="width:44px">
-        <col style="width:90px"><col style="width:170px"><col style="width:190px"><col style="width:200px">
-        <col style="width:70px"><col style="width:70px"><col style="width:70px"><col style="width:70px"><col style="width:70px"><col style="width:90px"><col style="width:80px">
-      </colgroup>
-      <thead>
-        <tr>
-          <th class="no-sort"></th>
-          <th data-type="text">Privileges</th>
-          <th data-type="text">User</th>
-          <th data-type="text">UPN</th>
-          <th data-type="text">Directory roles</th>
-          <th data-type="text">Eligible</th>
-          <th data-type="text">Priv apps</th>
-          <th data-type="text">Capable grp</th>
-          <th data-type="text">Groups owned</th>
-          <th data-type="text">CA excl.</th>
-          <th data-type="text">Account Source</th>
-          <th data-type="text">Status</th>
-        </tr>
-      </thead>
+      {table_head_html("privileged-users-table")}
       <tbody>{rows}</tbody>
     </table>
     </div>
@@ -5003,32 +6536,16 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 
     # ---- app directory roles section --------------------------------------
     def app_dir_roles_section(res):
-        rows_html = "" if serve_mode else "\n".join(app_dir_rows_html(res["findings"])[0])
-        if serve_tables is not None:
-            serve_tables["app-dir-roles-table"] = {"findings": res["findings"], "rows": app_dir_rows_html,
-                                                   "search": app_dir_search_text,
-                                                   "sort_keys": APP_DIR_SORT_KEYS, "colspan": 6}
+        rows_html = catalog_rows("app-dir-roles-table", res["findings"], app_dir_rows_html)
+        register_catalog_table("app-dir-roles-table", res["findings"], app_dir_rows_html,
+                               app_dir_search_text)
         pager = serve_pager() if serve_mode else ""
         return f"""
   <section data-category="apps">
     <h2>{esc(res["title"])}</h2>
     <div class="table-scroll">
     <table id="app-dir-roles-table" class="findings" data-serve="1">
-      <colgroup>
-        <col style="width:44px">
-        <col style="width:90px"><col style="width:200px"><col style="width:220px">
-        <col style="width:260px"><col style="width:90px">
-      </colgroup>
-      <thead>
-        <tr>
-          <th class="no-sort"></th>
-          <th data-type="text">Privileges</th>
-          <th data-type="text">Application</th>
-          <th data-type="text">Object ID</th>
-          <th data-type="text">Directory roles</th>
-          <th data-type="text">Status</th>
-        </tr>
-      </thead>
+      {table_head_html("app-dir-roles-table")}
       <tbody>{rows_html}</tbody>
     </table>
     </div>
@@ -5042,6 +6559,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         verdict = f.get("verdict") or "Undetermined"
         hosts = f.get("connector_host") or []
         wb = f.get("writeback") or {}
+        auth = f.get("auth_mode") or {}
         sso = f.get("desktop_sso") or {}
         indicators = {i["label"]: i for i in (f.get("indicators") or [])}
 
@@ -5051,6 +6569,10 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 
         rows = []
         rows.append(f"<tr><th>Engine</th><td><b>{esc(verdict)}</b></td></tr>")
+        if auth.get("mode"):
+            rows.append(f'<tr><th>Authentication</th><td><b>{esc(auth["mode"])}</b>'
+                        + (f' <span class="muted">({esc(auth["detail"])})</span>'
+                           if auth.get("detail") else "") + "</td></tr>")
         if hosts:
             rows.append(f'<tr><th>Connector host</th><td class="mono">{esc(", ".join(hosts))}</td></tr>')
         if wb.get("count"):
@@ -5101,11 +6623,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     def ad_users_section(res):
         realm_html = realm_card_html(res.get("meta") or {})
 
-        rows_html = "" if serve_mode else "\n".join(ad_rows_html(res["findings"])[0])
-        if serve_tables is not None:
-            serve_tables["ad-sync-users-table"] = {"findings": res["findings"], "rows": ad_rows_html,
-                                                   "search": ad_search_text,
-                                                   "sort_keys": AD_SORT_KEYS, "colspan": 10}
+        rows_html = catalog_rows("ad-sync-users-table", res["findings"], ad_rows_html)
+        register_catalog_table("ad-sync-users-table", res["findings"], ad_rows_html,
+                               ad_search_text)
         pager = serve_pager() if serve_mode else ""
         return f"""
   <section data-category="ad">
@@ -5113,25 +6633,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     {realm_html}
     <div class="table-scroll">
     <table id="ad-sync-users-table" class="findings" data-serve="1">
-      <colgroup>
-        <col style="width:44px">
-        <col style="width:180px"><col style="width:200px"><col style="width:140px"><col style="width:200px">
-        <col style="width:100px"><col style="width:120px"><col style="width:150px"><col style="width:90px"><col style="width:80px">
-      </colgroup>
-      <thead>
-        <tr>
-          <th class="no-sort"></th>
-          <th data-type="text">User</th>
-          <th data-type="text">UPN</th>
-          <th data-type="text">AD CN</th>
-          <th data-type="text">AD DN</th>
-          <th data-type="text">SID</th>
-          <th data-type="text">On-prem pw change</th>
-          <th data-type="text">Targeting tags</th>
-          <th data-type="text">CA excl.</th>
-          <th data-type="text">Status</th>
-        </tr>
-      </thead>
+      {table_head_html("ad-sync-users-table")}
       <tbody>{rows_html}</tbody>
     </table>
     </div>
@@ -5235,6 +6737,12 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
             sections_html.append(ad_summary_card(res))
         elif res["id"] == "ad_sync_users":
             sections_html.append(ad_users_section(res))
+        elif res["id"] == "azure_arc_machines":
+            sections_html.append(arc_section(res, "arc-machines-table"))
+        elif res["id"] == "azure_arc_sps":
+            sections_html.append(arc_section(res, "arc-principals-table"))
+        elif res["id"] == "azure_arc_providers":
+            sections_html.append(arc_section(res, "arc-providers-table"))
         else:
             sections_html.append(generic_section(res))
     user_profile_json = json.dumps(user_profile_data, default=str).replace("</", "<\\/")
@@ -5251,6 +6759,8 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         "dynmods", "dynattrs", "adtags", "targettype", "status", "hybrid",
         "userstatus", "spstatus", "ownerstatus", "adstatus", "polstate",
         "resource", "permission",
+        "arcmachine", "arcprincipal", "arcprincipaltype", "arctag",
+        "arcazroles", "arcprovider", "arcsub", "arcrg", "arcstatus",
     }
     suggest_data = {}
 
@@ -5315,6 +6825,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         bar.append(item("Sync", f'<span class="mono">{esc(ts["engine"])}</span>'))
     if ts.get("writeback") is True:
         bar.append('<span class="sum-item tag"><span class="sum-label">Writeback</span><span class="tag-chip tag-privileged">ON</span></span>')
+    if ts.get("auth_mode"):
+        bar.append(item("Auth", f'<span class="tag-chip tag-divergence">{esc(ts["auth_mode"])}</span>',
+                        "Authentication mode (PHS / PTA / federated), see the sync summary"))
     if "users" in ts:
         synced_note = f'<span class="muted">({ts.get("synced", "?")} synced)</span>' if "synced" in ts else ""
         bar.append(item("Users", f'{ts.get("users", 0)} {synced_note}'))
@@ -5325,10 +6838,33 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
             if b_key and b_key in ts:
                 value += f' / {ts.get(b_key, 0)}'
             bar.append(item(label, value))
+    arc_machines = next((r for r in results if r["id"] == "azure_arc_machines"), None)
+    if arc_machines and arc_machines["findings"]:
+        arc_principals = next((r for r in results if r["id"] == "azure_arc_sps"), None)
+        arc_note = f'{len(arc_machines["findings"])} machines, {len(arc_principals["findings"]) if arc_principals else 0} Arc principals'
+        bar.append(item("Arc", f"<b>{len(arc_machines['findings'])}</b>", arc_note))
     summary_bar_html = "\n    ".join(bar)
 
     entity_details_json = json.dumps(entity_details, default=str).replace("</", "<\\/")
     entity_profiles_json = json.dumps(entity_profiles or {"sp": {}, "app": {}}, default=str).replace("</", "<\\/")
+
+    # ---- column-manager catalog + static extras blobs ---------------------
+    catalog_data = {}
+    for tid in catalog_tids:
+        entry = catalog_entry(tid)
+        if entry:
+            catalog_data[tid] = entry
+    catalog_json = json.dumps(catalog_data, default=str).replace("</", "<\\/")
+    extras_scripts = []
+    for tid, blob in extras_blobs.items():
+        if not blob:
+            continue
+        if serve_mode and not tid.startswith("azure-roles-"):
+            continue  # serve mode renders extras on demand via cols=
+        blob_json = json.dumps(blob, default=str).replace("</", "<\\/")
+        extras_scripts.append(
+            f'<script type="application/json" id="extras-{tid}">{blob_json}</script>')
+    extras_scripts_html = "\n".join(extras_scripts)
 
     return f"""<!doctype html>
 <html lang="en">
@@ -5532,6 +7068,45 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     position: absolute; top: 0; right: 0; width: 8px; height: 100%; cursor: col-resize; z-index: 1;
   }}
   .col-resizer:hover, .col-resizer.resizing {{ background: var(--border); }}
+  .colman {{ position: relative; display: flex; justify-content: flex-end; margin: 6px 0 8px; }}
+  .table-head-row {{
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 12px; flex-wrap: wrap;
+  }}
+  .table-head-row h2 {{ margin: 0 0 4px; }}
+  .table-head-row .colman {{ margin: 0; }}
+  .colman-btn {{
+    display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+    background: var(--surface-1); color: var(--text-secondary); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; font-size: 12px; font-family: inherit;
+  }}
+  .colman-btn:hover {{ color: var(--text-primary); }}
+  .colman-badge {{
+    background: var(--accent); color: #fff; border-radius: 999px; font-size: 10px;
+    line-height: 1; padding: 2px 6px; font-weight: 600;
+  }}
+  .colman-pop {{
+    position: absolute; right: 0; top: calc(100% + 4px); z-index: 30;
+    min-width: 240px; max-height: 340px; overflow-y: auto; text-align: left;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.18); padding: 6px 0;
+  }}
+  .colman-group {{ padding: 2px 0 6px; }}
+  .colman-group-title {{
+    padding: 5px 12px 2px; font-size: 10px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.04em; color: var(--text-muted);
+  }}
+  .colman-item {{
+    display: flex; align-items: center; gap: 8px; padding: 4px 12px;
+    font-size: 12.5px; color: var(--text-secondary); cursor: pointer;
+  }}
+  .colman-item:hover {{ background: var(--row-hover); color: var(--text-primary); }}
+  .colman-item input {{ margin: 0; }}
+  .colman-foot {{ border-top: 1px solid var(--gridline); margin-top: 4px; padding: 8px 12px 2px; }}
+  .colman-reset {{
+    background: none; border: none; padding: 0; cursor: pointer; text-decoration: underline;
+    color: var(--accent); font-size: 12px; font-family: inherit;
+  }}
   tbody td {{ padding: 11px 14px; border-bottom: 1px solid var(--gridline); vertical-align: top; overflow-wrap: anywhere; }}
   tbody tr:hover {{ background: var(--row-hover); }}
   tbody tr.hidden {{ display: none; }}
@@ -5738,6 +7313,10 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 
 <script type="application/json" id="policy-profile-data">{policy_profile_json}</script>
 
+<script type="application/json" id="table-catalog-data">{catalog_json}</script>
+
+{extras_scripts_html}
+
 {JS_FILTER_MODULE}
 <script>
 (function() {{
@@ -5797,7 +7376,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   }}
   var FIELD_LABELS = {{
     severity: 'Privileges', owner: 'Owner', ownerUpn: 'Owner UPN',
-    ownerStatus: 'Owner Status', app: 'Application',
+    ownerStatus: 'Owner Status', ownerSource: 'Owner Source',
+    ownerAdDn: 'Owner AD DN', ownerAdSid: 'Owner SID',
+    ownerImmutableId: 'Owner Immutable ID', app: 'Application',
     resource: 'Resource', permission: 'Permission', spStatus: 'SP Status',
     target: 'Target', targetType: 'Target Type', id: 'Object ID', status: 'Target Status',
     pw: 'Passwords', keys: 'Keys', roleCount: 'Role assignment',
@@ -5815,7 +7396,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     azSpRoles: 'Azure roles',
     azApp: 'Application / SP', azUser: 'User', azGroup: 'Group',
     azScopeType: 'Scope Type', azSub: 'Subscription', azRg: 'Resource Group',
-    azProvider: 'Provider', azResource: 'Resource'
+    azProvider: 'Provider', azResource: 'Resource',
+    appId: 'App ID', spType: 'SP type', polType: 'Policy type',
+    polCreated: 'Created', polModified: 'Last modified', immutableId: 'Immutable ID'
   }};
   var DRILLDOWN_COLUMNS = {{
     owner:      ['app', 'resource', 'permission', 'severity', 'spStatus'],
@@ -7266,7 +8849,10 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   var suppressSortClick = 0;
 
   function stampColumnIds() {{
+    // Legacy column-identity stamping: only for tables without a column
+    // catalog (the dynamic CA-analysis tables), which keep index-based sort.
     allTables().forEach(function(table) {{
+      if (window.__columns && window.__columns.isManaged(table)) return;
       Array.prototype.forEach.call(table.tHead.rows[0].cells, function(th, i) {{
         if (!th.classList.contains('no-sort')) {{
           if (th.dataset.colidx === undefined) th.dataset.colidx = String(i);
@@ -7276,34 +8862,12 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     }});
   }}
 
-  function applyColumnOrder(table) {{
-    // Rebuild every data row so its cells follow the thead's current order
-    // (clone-based: all interactive handlers are document-delegated).
-    var theadCells = table.tHead.rows[0].cells;
-    var order = [];
-    var identity = true;
-    for (var i = 0; i < theadCells.length; i++) {{
-      var cidx = theadCells[i].dataset.colidx;
-      var o = cidx === undefined ? i : parseInt(cidx, 10);
-      if (o !== i) identity = false;
-      order.push(o);
-    }}
-    if (identity) return;
-    Array.prototype.forEach.call(table.tBodies[0].rows, function(row) {{
-      if (row.classList.contains('drawer')) return;
-      var cells = Array.prototype.slice.call(row.cells);
-      var reordered = [];
-      for (var o = 0; o < order.length; o++) reordered.push(cells[order[o]].cloneNode(true));
-      row.innerHTML = '';
-      for (var c = 0; c < reordered.length; c++) row.appendChild(reordered[c]);
-    }});
-  }}
-
   function moveColumn(table, sourceTh, targetTh) {{
     var headerRow = table.tHead.rows[0];
+    var colCount = headerRow.cells.length;
     var srcIdx = Array.prototype.indexOf.call(headerRow.cells, sourceTh);
     var tgtIdx = Array.prototype.indexOf.call(headerRow.cells, targetTh);
-    if (srcIdx < 0 || tgtIdx < 0) return;
+    if (srcIdx < 0 || tgtIdx < 0 || srcIdx === tgtIdx) return;
     headerRow.insertBefore(sourceTh, targetTh);
     // keep colgroup widths aligned with the header order
     var cols = table.querySelectorAll('colgroup col');
@@ -7312,7 +8876,18 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
       var tgtCol = cols[tgtIdx];
       if (srcCol && tgtCol) srcCol.parentNode.insertBefore(srcCol, tgtCol);
     }}
-    applyColumnOrder(table);
+    // Mirror the exact same single-cell move on every data row. A relative
+    // move composes across drags; rebuilding cells from original column
+    // identities would assume they are still in original order and misfile
+    // them after the first drag.
+    Array.prototype.forEach.call(table.tBodies[0].rows, function(row) {{
+      if (row.classList.contains('drawer')) return;
+      if (row.cells.length !== colCount) return;  // malformed row: leave it alone
+      row.insertBefore(row.cells[srcIdx], row.cells[tgtIdx]);
+    }});
+    if (window.__columns && window.__columns.isManaged(table)) {{
+      window.__columns.onReorder(table);
+    }}
   }}
 
   var dragState = null;
@@ -7361,65 +8936,79 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   }});
 
   stampColumnIds();
-  window.__applyColumnOrder = applyColumnOrder;
+  window.__stampColumnIds = stampColumnIds;
 
   function wireTableSort(table) {{
-    var headers = table.tHead.rows[0].cells;
-    Array.prototype.forEach.call(headers, function(th) {{
-      if (th.classList.contains('no-sort')) return;
-      var asc = true;
-      th.addEventListener('click', function() {{
-        if (suppressSortClick && Date.now() - suppressSortClick < 300) return;
-        var idx = Array.prototype.indexOf.call(table.tHead.rows[0].cells, th);
-        var mantissa = Array.prototype.filter.call(table.tBodies[0].rows, function(r) {{
-          return !r.classList.contains('drawer');
-        }});
-        var drawers = Array.prototype.filter.call(table.tBodies[0].rows, function(r) {{
-          return r.classList.contains('drawer');
-        }});
-        drawers.forEach(function(d) {{ d.remove(); }});
-        mantissa.sort(function(a, b) {{
-          var av = a.cells[idx].textContent.trim().toLowerCase();
-          var bv = b.cells[idx].textContent.trim().toLowerCase();
-          if (av < bv) return asc ? -1 : 1;
-          if (av > bv) return asc ? 1 : -1;
-          return 0;
-        }});
-        var order = [];
-        mantissa.forEach(function(r) {{
-          order.push(r);
-          var key = r.getAttribute('data-detail-key');
-          var d = drawers.find(function(x) {{ return x.getAttribute('data-detail-for') === key; }});
-          if (d) order.push(d);
-        }});
-        order.forEach(function(r) {{ table.tBodies[0].appendChild(r); }});
-        Array.prototype.forEach.call(headers, function(h) {{ h.classList.remove('sorted'); }});
-        th.classList.add('sorted');
-        asc = !asc;
+    if (!table || !table.tHead || table.__sortWired) return;
+    table.__sortWired = true;
+    table.tHead.addEventListener('click', function(e) {{
+      if (table.__loaderMade) return;  // serve-mode loader owns sorting
+      var th = e.target.closest('th');
+      if (!th || !table.tHead.contains(th) || th.classList.contains('no-sort')) return;
+      if (suppressSortClick && Date.now() - suppressSortClick < 300) return;
+      var headers = table.tHead.rows[0].cells;
+      var idx = Array.prototype.indexOf.call(headers, th);
+      if (idx < 0) return;
+      var asc = th.__asc === undefined ? true : !!th.__asc;
+      var mantissa = Array.prototype.filter.call(table.tBodies[0].rows, function(r) {{
+        return !r.classList.contains('drawer');
       }});
+      var drawers = Array.prototype.filter.call(table.tBodies[0].rows, function(r) {{
+        return r.classList.contains('drawer');
+      }});
+      drawers.forEach(function(d) {{ d.remove(); }});
+      mantissa.sort(function(a, b) {{
+        var ac = a.cells[idx], bc = b.cells[idx];
+        var av = ac ? ac.textContent.trim().toLowerCase() : '';
+        var bv = bc ? bc.textContent.trim().toLowerCase() : '';
+        if (av < bv) return asc ? -1 : 1;
+        if (av > bv) return asc ? 1 : -1;
+        return 0;
+      }});
+      var order = [];
+      mantissa.forEach(function(r) {{
+        order.push(r);
+        var key = r.getAttribute('data-detail-key');
+        var d = drawers.find(function(x) {{ return x.getAttribute('data-detail-for') === key; }});
+        if (d) order.push(d);
+      }});
+      order.forEach(function(r) {{ table.tBodies[0].appendChild(r); }});
+      Array.prototype.forEach.call(headers, function(h) {{ h.classList.remove('sorted'); }});
+      th.classList.add('sorted');
+      th.__asc = !asc;
     }});
   }}
   allTables().forEach(wireTableSort);
   window.__wireTableSort = wireTableSort;
 
+  function colForTh(table, th) {{
+    var cg = table.querySelector('colgroup');
+    if (!cg || !table.tHead) return null;
+    var idx = Array.prototype.indexOf.call(table.tHead.rows[0].cells, th);
+    return cg.children[idx] || null;
+  }}
+
   function makeColumnsResizable(table) {{
-    if (!table) return;
-    var cols = table.querySelectorAll('colgroup col');
+    if (!table || !table.tHead) return;
     var headers = table.tHead.rows[0].cells;
     Array.prototype.forEach.call(headers, function(th, index) {{
-      if (index === headers.length - 1 || !cols[index] || th.classList.contains('no-sort')) return;
+      if (index === headers.length - 1 || th.classList.contains('no-sort')) return;
+      if (th.querySelector(':scope > .col-resizer')) return;
       var handle = document.createElement('span');
       handle.className = 'col-resizer';
       handle.addEventListener('click', function(e) {{ e.stopPropagation(); }});
       handle.addEventListener('mousedown', function(e) {{
         e.preventDefault();
         e.stopPropagation();
-        var col = cols[Array.prototype.indexOf.call(table.tHead.rows[0].cells, th)];
+        var col = colForTh(table, th);
+        if (!col) return;
         var startX = e.clientX;
         var startWidth = col.getBoundingClientRect().width;
+        var moved = false;
         handle.classList.add('resizing');
         document.body.style.userSelect = 'none';
         function onMouseMove(e2) {{
+          if (!moved && Math.abs(e2.clientX - startX) > 3) moved = true;
           var newWidth = Math.max(50, startWidth + (e2.clientX - startX));
           col.style.width = newWidth + 'px';
         }}
@@ -7428,6 +9017,13 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
           document.removeEventListener('mouseup', onMouseUp);
           handle.classList.remove('resizing');
           document.body.style.userSelect = '';
+          // The browser fires a click after the drag on the mousedown/mouseup
+          // common ancestor; if it lands on the header it would toggle the
+          // sort. Suppress sort clicks for a beat, exactly like column drags.
+          if (moved) {{
+            suppressSortClick = Date.now();
+            window.__suppressSortClickUntil = suppressSortClick;
+          }}
         }}
         document.addEventListener('mousemove', onMouseMove);
         document.addEventListener('mouseup', onMouseUp);
@@ -7437,14 +9033,351 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   }}
   allTables().forEach(makeColumnsResizable);
   window.__makeColumnsResizable = makeColumnsResizable;
+
+  window.__applyCurrentFilter = applyRowFilter;
+
+  // ---- column manager (add/remove columns per table) ---------------------
+  var COLUMN_CATALOG = {{}};
+  try {{ COLUMN_CATALOG = JSON.parse(document.getElementById('table-catalog-data').textContent) || {{}}; }} catch (e) {{}}
+  var COLUMN_EXTRAS = {{}};
+  var COLUMN_STORE = 'entra-surface:cols:v1:';
+  var FAMILY_LABELS = {{ sp: 'SP / application', user: 'User', group: 'Group', policy: 'CA policy', arc: 'Azure Arc' }};
+
+  function columnMeta(tid) {{
+    var meta = {{}};
+    var entry = COLUMN_CATALOG[tid];
+    ((entry && entry.fields) || []).forEach(function(f) {{ meta[f.id] = f; }});
+    return meta;
+  }}
+
+  function columnExtras(tid) {{
+    if (Object.prototype.hasOwnProperty.call(COLUMN_EXTRAS, tid)) return COLUMN_EXTRAS[tid];
+    var el = document.getElementById('extras-' + tid);
+    var blob = null;
+    if (el) {{ try {{ blob = JSON.parse(el.textContent) || {{}}; }} catch (e) {{ blob = null; }} }}
+    COLUMN_EXTRAS[tid] = blob;
+    return blob;
+  }}
+
+  function isManagedColumnTable(table) {{
+    return !!(table && table.id && COLUMN_CATALOG[table.id] && table.tHead);
+  }}
+
+  function columnFields(table) {{
+    var out = [];
+    Array.prototype.forEach.call(table.tHead.rows[0].cells, function(th) {{
+      var f = th.getAttribute('data-field');
+      if (f) out.push(f);
+    }});
+    return out;
+  }}
+
+  function defaultColumnFields(tid) {{
+    var entry = COLUMN_CATALOG[tid] || {{}};
+    return (entry.fields || []).filter(function(f) {{ return f['default']; }})
+        .map(function(f) {{ return f.id; }});
+  }}
+
+  function readColumnState(tid) {{
+    try {{
+      var raw = localStorage.getItem(COLUMN_STORE + tid);
+      if (!raw) return null;
+      var arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) return null;
+      var meta = columnMeta(tid), seen = {{}}, out = [];
+      arr.forEach(function(id) {{
+        if (meta[id] && !seen[id]) {{ seen[id] = 1; out.push(id); }}
+      }});
+      return out.length ? out : null;
+    }} catch (e) {{ return null; }}
+  }}
+
+  function writeColumnState(tid, fields) {{
+    try {{
+      if (fields.join(',') === defaultColumnFields(tid).join(',')) {{
+        localStorage.removeItem(COLUMN_STORE + tid);
+      }} else {{
+        localStorage.setItem(COLUMN_STORE + tid, JSON.stringify(fields));
+      }}
+    }} catch (e) {{}}
+  }}
+
+  function syncCols(table) {{
+    var cg = table.querySelector('colgroup');
+    if (!cg || !table.tHead) return;
+    var headers = table.tHead.rows[0].cells;
+    var widths = {{}};
+    Array.prototype.forEach.call(cg.children, function(col, i) {{
+      var th = headers[i];
+      var f = th && th.getAttribute('data-field');
+      if (f && col.style && col.style.width) widths[f] = col.style.width;
+    }});
+    var meta = columnMeta(table.id);
+    var html = '';
+    Array.prototype.forEach.call(headers, function(th) {{
+      var f = th.getAttribute('data-field');
+      if (!f) {{ html += '<col style="width:44px">'; return; }}
+      var m = meta[f] || {{}};
+      html += '<col style="width:' + (widths[f] || ((m.width || 120) + 'px')) + '">';
+    }});
+    cg.innerHTML = html;
+  }}
+
+  function extraCell(tid, detailKey, field, meta) {{
+    var blob = columnExtras(tid);
+    var pair = blob && blob[detailKey] ? blob[detailKey][field] : null;
+    if (!pair) return null;
+    var td = document.createElement('td');
+    if (meta && meta.cls) td.className = meta.cls;
+    td.setAttribute('data-field', field);
+    td.setAttribute('data-value', pair[1] || '');
+    td.innerHTML = pair[0];
+    return td;
+  }}
+
+  function rebuildTable(table, fields) {{
+    var tid = table.id;
+    var meta = columnMeta(tid);
+    var theadRow = table.tHead.rows[0];
+    var thByField = {{}};
+    Array.prototype.forEach.call(theadRow.cells, function(th) {{
+      var f = th.getAttribute('data-field');
+      if (f) thByField[f] = th;
+    }});
+    var ordered = [];
+    Array.prototype.slice.call(theadRow.cells).forEach(function(th) {{
+      if (th.getAttribute('data-field')) {{
+        if (fields.indexOf(th.getAttribute('data-field')) < 0) th.remove();
+      }} else {{
+        ordered.push(th);
+      }}
+    }});
+    fields.forEach(function(f) {{
+      var th = thByField[f];
+      if (!th) {{
+        th = document.createElement('th');
+        th.setAttribute('data-type', 'text');
+        th.setAttribute('data-field', f);
+        th.title = 'Click to sort \u00b7 drag to reorder';
+        th.textContent = (meta[f] && meta[f].label) || f;
+      }}
+      ordered.push(th);
+    }});
+    ordered.forEach(function(th) {{ theadRow.appendChild(th); }});
+    Array.prototype.forEach.call(table.tBodies[0].rows, function(row) {{
+      if (row.classList.contains('drawer')) {{
+        var dtd = row.querySelector('td');
+        if (dtd) dtd.colSpan = fields.length + 1;
+        return;
+      }}
+      var tdByField = {{}};
+      var expander = null;
+      Array.prototype.slice.call(row.cells).forEach(function(td) {{
+        var f = td.getAttribute('data-field');
+        if (f) {{
+          if (fields.indexOf(f) >= 0) tdByField[f] = td;
+          else td.remove();
+        }} else if (expander === null) {{
+          expander = td;
+        }}
+      }});
+      if (!expander) return;
+      var detailKey = row.getAttribute('data-detail-key') || '';
+      var frag = document.createDocumentFragment();
+      frag.appendChild(expander);
+      fields.forEach(function(f) {{
+        var td = tdByField[f];
+        if (!td) td = extraCell(tid, detailKey, f, meta[f]);
+        if (td) frag.appendChild(td);
+      }});
+      row.appendChild(frag);
+    }});
+    syncCols(table);
+    if (window.__makeColumnsResizable) window.__makeColumnsResizable(table);
+    if (window.__wireTableSort) window.__wireTableSort(table);
+    if (window.__applyCurrentFilter) window.__applyCurrentFilter();
+  }}
+
+  function applyColumnList(table, fields) {{
+    table.__columnFields = fields.slice();
+    table.__pendingCols = null;
+    writeColumnState(table.id, fields);
+    if (table.__loaderMade && table.__reload) {{
+      table.__reload();
+    }} else {{
+      rebuildTable(table, fields);
+    }}
+    updateColumnUI(table);
+  }}
+
+  function updateColumnUI(table) {{
+    var ui = table.__colman;
+    if (!ui) return;
+    var visible = {{}};
+    window.__columns.getFields(table).forEach(function(f) {{ visible[f] = 1; }});
+    var hidden = 0;
+    defaultColumnFields(table.id).forEach(function(f) {{ if (!visible[f]) hidden++; }});
+    ui.badge.textContent = hidden ? String(hidden) : '';
+    ui.badge.classList.toggle('hidden', !hidden);
+  }}
+
+  function escHtml(s) {{
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }}
+
+  function closeColumnPops() {{
+    Array.prototype.forEach.call(document.querySelectorAll('.colman-pop'), function(p) {{
+      p.classList.add('hidden');
+    }});
+    Array.prototype.forEach.call(document.querySelectorAll('.colman-btn'), function(b) {{
+      b.setAttribute('aria-expanded', 'false');
+    }});
+  }}
+  document.addEventListener('click', closeColumnPops);
+
+  function renderColumnPop(table) {{
+    var ui = table.__colman;
+    var entry = COLUMN_CATALOG[table.id];
+    if (!ui || !entry) return;
+    var visible = {{}};
+    window.__columns.getFields(table).forEach(function(f) {{ visible[f] = 1; }});
+    var byFamily = {{}}, order = [];
+    (entry.fields || []).forEach(function(f) {{
+      var fam = f.family || 'sp';
+      if (!byFamily[fam]) {{ byFamily[fam] = []; order.push(fam); }}
+      byFamily[fam].push(f);
+    }});
+    var famOrder = order.filter(function(f) {{ return f === entry.family; }})
+        .concat(order.filter(function(f) {{ return f !== entry.family; }}));
+    var html = '';
+    famOrder.forEach(function(fam) {{
+      html += '<div class="colman-group"><div class="colman-group-title">'
+          + escHtml(FAMILY_LABELS[fam] || fam) + '</div>';
+      byFamily[fam].forEach(function(f) {{
+        html += '<label class="colman-item"><input type="checkbox" data-field="'
+            + escHtml(f.id) + '"' + (visible[f.id] ? ' checked' : '') + '> <span>'
+            + escHtml(f.label || f.id) + '</span></label>';
+      }});
+      html += '</div>';
+    }});
+    html += '<div class="colman-foot"><button type="button" class="colman-reset">'
+        + 'Reset to defaults</button></div>';
+    ui.pop.innerHTML = html;
+    var reset = ui.pop.querySelector('.colman-reset');
+    if (reset) reset.addEventListener('click', function(e) {{
+      e.stopPropagation();
+      applyColumnList(table, defaultColumnFields(table.id));
+      renderColumnPop(table);
+    }});
+  }}
+
+  function buildColumnUI(table) {{
+    if (table.__colman || !COLUMN_CATALOG[table.id]) return;
+    var scroll = table.closest('.table-scroll');
+    if (!scroll) return;
+    var wrap = document.createElement('div');
+    wrap.className = 'colman';
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'colman-btn';
+    btn.setAttribute('aria-expanded', 'false');
+    btn.textContent = 'Columns \u25be';
+    var badge = document.createElement('span');
+    badge.className = 'colman-badge hidden';
+    btn.appendChild(badge);
+    var pop = document.createElement('div');
+    pop.className = 'colman-pop hidden';
+    wrap.appendChild(btn);
+    wrap.appendChild(pop);
+    // lift the picker onto the section's title line (h2 + button share a row)
+    var section = table.closest('section');
+    var h2 = section ? section.querySelector(':scope > h2') : null;
+    if (section && h2) {{
+      var headRow = document.createElement('div');
+      headRow.className = 'table-head-row';
+      section.insertBefore(headRow, h2);
+      headRow.appendChild(h2);
+      headRow.appendChild(wrap);
+    }} else {{
+      scroll.parentNode.insertBefore(wrap, scroll);
+    }}
+    table.__colman = {{ wrap: wrap, btn: btn, badge: badge, pop: pop }};
+    btn.addEventListener('click', function(e) {{
+      e.stopPropagation();
+      var open = !pop.classList.contains('hidden');
+      closeColumnPops();
+      if (!open) {{
+        renderColumnPop(table);
+        pop.classList.remove('hidden');
+        btn.setAttribute('aria-expanded', 'true');
+      }}
+    }});
+    // keep the popover open while the user toggles columns inside it
+    pop.addEventListener('click', function(e) {{ e.stopPropagation(); }});
+    pop.addEventListener('change', function(e) {{
+      var cb = e.target;
+      if (!cb || cb.tagName !== 'INPUT') return;
+      var field = cb.getAttribute('data-field');
+      var current = window.__columns.getFields(table);
+      if (cb.checked) {{
+        if (current.indexOf(field) < 0) current.push(field);
+      }} else {{
+        if (current.length <= 1) {{ cb.checked = true; return; }}
+        current = current.filter(function(x) {{ return x !== field; }});
+      }}
+      applyColumnList(table, current);
+      renderColumnPop(table);
+    }});
+    updateColumnUI(table);
+  }}
+
+  window.__columns = {{
+    catalog: COLUMN_CATALOG,
+    isManaged: isManagedColumnTable,
+    getFields: function(table) {{
+      if (table.__pendingCols) return table.__pendingCols.slice();
+      return table.__columnFields ? table.__columnFields.slice() : columnFields(table);
+    }},
+    setFields: function(table, fields) {{
+      table.__columnFields = fields.slice();
+      updateColumnUI(table);
+    }},
+    colForTh: colForTh,
+    syncCols: syncCols,
+    apply: applyColumnList,
+    reset: function(table) {{ applyColumnList(table, defaultColumnFields(table.id)); }},
+    onReorder: function(table) {{
+      table.__columnFields = columnFields(table);
+      table.__pendingCols = null;
+      writeColumnState(table.id, table.__columnFields);
+      updateColumnUI(table);
+    }}
+  }};
+
+  allTables().forEach(function(table) {{
+    if (!isManagedColumnTable(table)) return;
+    var saved = readColumnState(table.id);
+    if (saved) {{
+      table.__columnFields = saved.slice();
+      if (table.getAttribute('data-serve') === '1') {{
+        table.__pendingCols = saved.slice();
+      }} else {{
+        rebuildTable(table, saved);
+      }}
+    }}
+    buildColumnUI(table);
+  }});
 }})();
 
 (function() {{
   if (!window.REPORT_SERVE) return;
   var filterInput = document.getElementById('filter-input');
   function makeLoader(table) {{
+    if (table.__loaderMade) return;
     var pager = table.closest('.table-scroll') ? table.closest('.table-scroll').nextElementSibling : null;
     if (!pager || !pager.classList.contains('table-pager')) return;
+    table.__loaderMade = true;
     var state = {{ page: 1, size: 25, q: '', sort: '', dir: 'asc' }};
     var tbody = table.tBodies[0];
     var info = pager.querySelector('.tp-info');
@@ -7452,24 +9385,43 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     var next = pager.querySelector('.tp-next');
     var sizeSel = pager.querySelector('.tp-size');
     var timer = null;
+    var fieldsKey = null;
+    if (window.__columns && window.__columns.isManaged(table) && !table.__pendingCols) {{
+      fieldsKey = window.__columns.getFields(table).join(',');
+    }}
     function load() {{
       var params = 'page=' + state.page + '&size=' + state.size;
       if (state.q) params += '&q=' + encodeURIComponent(state.q);
       var adv = document.getElementById('advanced-toggle');
       if (adv && adv.getAttribute('aria-pressed') === 'true') params += '&mode=advanced';
-      if (state.sort) params += '&sort=' + state.sort + '&dir=' + state.dir;
+      if (state.sort) params += '&sort=' + encodeURIComponent(state.sort) + '&dir=' + state.dir;
+      var managed = window.__columns && window.__columns.isManaged(table);
+      if (managed) params += '&cols=' + encodeURIComponent(window.__columns.getFields(table).join(','));
       fetch('/api/table/' + encodeURIComponent(table.id) + '?' + params)
         .then(function(r) {{ return r.json(); }})
         .then(function(d) {{
           if (!d || d.rows_html == null) return;
+          if (managed && d.fields && window.__columns) {{
+            var key = d.fields.join(',');
+            if (key !== fieldsKey) {{
+              fieldsKey = key;
+              if (d.thead_html != null && table.tHead) table.tHead.rows[0].innerHTML = d.thead_html;
+              var cg = table.querySelector('colgroup');
+              if (cg && d.colgroup_html != null) cg.innerHTML = d.colgroup_html;
+              if (window.__makeColumnsResizable) window.__makeColumnsResizable(table);
+              if (window.__wireTableSort) window.__wireTableSort(table);
+            }}
+            window.__columns.setFields(table, d.fields);
+            table.__pendingCols = null;
+          }}
           tbody.innerHTML = d.rows_html;
-          if (window.__applyColumnOrder) window.__applyColumnOrder(table);
           info.textContent = 'Page ' + d.page + ' of ' + d.pages + ' (' + d.total + ' rows)';
           pager.classList.remove('hidden');
           prev.disabled = d.page <= 1;
           next.disabled = d.page >= d.pages;
         }});
     }}
+    table.__reload = function() {{ state.page = 1; load(); }};
     prev.addEventListener('click', function() {{ state.page = Math.max(1, state.page - 1); load(); }});
     next.addEventListener('click', function() {{ state.page += 1; load(); }});
     sizeSel.addEventListener('change', function() {{ state.size = parseInt(sizeSel.value, 10) || 25; state.page = 1; load(); }});
@@ -7483,10 +9435,16 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
       if (!th || th.classList.contains('no-sort')) return;
       e.stopPropagation();
       if (window.__suppressSortClickUntil && Date.now() - window.__suppressSortClickUntil < 300) return;
-      var col = th.dataset.colidx || String(Array.prototype.indexOf.call(table.tHead.rows[0].cells, th));
+      var managed = window.__columns && window.__columns.isManaged(table);
+      var col = managed
+          ? th.getAttribute('data-field')
+          : (th.dataset.colidx || String(Array.prototype.indexOf.call(table.tHead.rows[0].cells, th)));
+      if (!col) return;
       if (state.sort === String(col)) state.dir = state.dir === 'asc' ? 'desc' : 'asc';
       else {{ state.sort = String(col); state.dir = 'asc'; }}
       state.page = 1;
+      Array.prototype.forEach.call(table.tHead.rows[0].cells, function(h) {{ h.classList.remove('sorted'); }});
+      th.classList.add('sorted');
       load();
     }}, true);
     load();
@@ -7554,9 +9512,13 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     function caRenderResults(d, resultsEl) {{
       if (d.status === 'done' && d.result) {{
         resultsEl.innerHTML = (d.result.summary_html || '') + (d.result.sections_html || '');
+        // these tables are created after load: stamp fresh headers with their
+        // column identities so drag-reorder and serve-mode paging stay aligned
+        if (window.__stampColumnIds) window.__stampColumnIds();
         Array.prototype.forEach.call(
             resultsEl.querySelectorAll('table.findings'), function(t) {{
               if (window.__wireTableSort) window.__wireTableSort(t);
+              if (window.__makeColumnsResizable) window.__makeColumnsResizable(t);
               if (window.__makeLoader) window.__makeLoader(t);
             }});
       }}
@@ -7669,12 +9631,14 @@ def build_tenant_summary(graph, results=None):
         engine = "No sync observed"
 
     writeback = None  # None = unknown, True/False when the sync summary check ran
+    auth_mode = None
     if results:
         for res in results:
             if res["id"] != "ad_sync_summary":
                 continue
             wb = (res["findings"][0].get("writeback") or {})
             writeback = bool(wb.get("count"))
+            auth_mode = (res["findings"][0].get("auth_mode") or {}).get("short") or None
 
     domains = []
     for d in json_list(graph["tenant"].get("verified_domains")):
@@ -7690,6 +9654,7 @@ def build_tenant_summary(graph, results=None):
         "sid_prefix": sid_prefix or "",
         "engine": engine,
         "writeback": writeback,
+        "auth_mode": auth_mode,
         "users": users,
         "enabled": enabled,
         "synced": synced,
@@ -7763,6 +9728,9 @@ def _serve_table_id(res_id):
         "ad_sync_users": "ad-sync-users-table",
         "app_dir_roles": "app-dir-roles-table",
         "ca_exposure": "table-ca_exposure",
+        "azure_arc_machines": "arc-machines-table",
+        "azure_arc_sps": "arc-principals-table",
+        "azure_arc_providers": "arc-providers-table",
     }.get(res_id, f"table-{res_id}")
 
 
@@ -7848,6 +9816,29 @@ def serve_field_map(table_id, f, owner=None):
             "status": (f.get("status") or {}).get("label") or "",
             "severity": f.get("severity", "Info"),
         })
+    elif table_id == "arc-machines-table":
+        fields.update({
+            "arcMachine": f.get("machine_name") or "",
+            "arcSub": f.get("arc_sub") or "",
+            "arcRg": f.get("arc_rg") or "",
+            "arcResourceId": f.get("arc_resource_id") or "",
+            "arcStatus": (f.get("arc_status") or {}).get("label") or "",
+        })
+    elif table_id == "arc-principals-table":
+        fields.update({
+            "arcPrincipal": f.get("arc_principal") or "",
+            "arcPrincipalType": f.get("arc_principal_type") or "",
+            "arcTag": "AzureArcSPN" if f.get("arc_tagged") else "",
+            "arcAzRoles": ", ".join(a.get("role", "") for a in f.get("arc_roles", [])),
+            "pw": str(f.get("pw")) if f.get("pw") is not None else "",
+            "pwLastSet": (f.get("pw_last_set") or "")[:10],
+            "arcStatus": (f.get("arc_status") or {}).get("label") or "",
+        })
+    elif table_id == "arc-providers-table":
+        fields.update({
+            "arcProvider": f.get("arc_provider") or "",
+            "arcStatus": (f.get("arc_status") or {}).get("label") or "",
+        })
     else:  # generic table-<check_id>
         t = f.get("target") or {}
         fields.update({
@@ -7911,14 +9902,25 @@ def serve_table_response(table_id, qs):
     entry = SERVE_STATE["tables"].get(table_id)
     if not entry:
         return {"error": f"unknown table: {table_id}"}, 404
+    spec = table_spec(table_id)
     q = (qs.get("q") or [""])[0]
     mode = (qs.get("mode") or [""])[0]
     page = _serve_int(qs, "page", 1, 1, 10 ** 9)
     size = _serve_int(qs, "size", 25, 25, 2000)
     sort = (qs.get("sort") or [""])[0]
     desc = ((qs.get("dir") or ["asc"])[0]).lower() == "desc"
-    skmap = entry.get("sort_keys") or {}
-    sort_key = skmap.get(sort, sort)
+    row_kwargs = {}
+    thead_html = None
+    colgroup_html = None
+    if spec is not None:
+        fields = parse_cols_param((qs.get("cols") or [""])[0], table_id)
+        sort_key = sort if sort in allowed_fields(table_id) else ""
+        row_kwargs = {"columns": fields, "ctx": entry.get("ctx")}
+        thead_html = table_thead_row_html(table_id, fields)
+        colgroup_html = table_colgroup_inner_html(fields)
+    else:
+        skmap = entry.get("sort_keys") or {}
+        sort_key = skmap.get(sort, sort)
     findings = entry["findings"]
     row_q = q
     if mode == "advanced" and q:
@@ -7947,31 +9949,40 @@ def serve_table_response(table_id, qs):
                             if evaluate_advanced(ast, serve_field_map(table_id, f),
                                                  entry["search"](f))]
             row_q = ""
+    payload = {}
+    if thead_html is not None:
+        payload["fields"] = fields
+        payload["thead_html"] = thead_html
+        payload["colgroup_html"] = colgroup_html
     if table_id == "owned-table":
         # one row per owner: paginate by row, not by finding
-        rows_html, _ = entry["rows"](findings, q=row_q, sort_key=sort_key, desc=desc)
+        rows_html, _ = entry["rows"](findings, q=row_q, sort_key=sort_key,
+                                     desc=desc, **row_kwargs)
         total = len(rows_html)
         pages = max(1, -(-total // size))
         page = min(page, pages)
         start = (page - 1) * size
-        return {
+        payload.update({
             "rows_html": "".join(rows_html[start:start + size]),
             "total": total,
             "page": page,
             "pages": pages,
             "size": size,
-        }, 200
-    rows, total = entry["rows"](findings, q=row_q, sort_key=sort_key, desc=desc)
+        })
+        return payload, 200
+    rows, total = entry["rows"](findings, q=row_q, sort_key=sort_key,
+                                desc=desc, **row_kwargs)
     pages = max(1, -(-total // size))
     page = min(page, pages)
     start = (page - 1) * size
-    return {
+    payload.update({
         "rows_html": "".join(rows[start:start + size]),
         "total": total,
         "page": page,
         "pages": pages,
         "size": size,
-    }, 200
+    })
+    return payload, 200
 
 
 def serve_profile_response(kind, oid):
@@ -8059,6 +10070,28 @@ CA_LEGACY_CLIENT_TYPES = {
     "EasSupported", "EasUnsupported", "OtherLegacy", "LegacySmtp", "LegacyPop",
     "LegacyImap", "LegacyMapi", "LegacyOffice",
 }
+
+CA_ALL_PLATFORMS = {"android", "windows", "windows_phone", "macos", "linux", "ios"}
+
+
+def fmt_platforms(inc, exc):
+    """Human label for a policy's device-platform condition, e.g.
+    'All except iOS' or 'Windows, macOS · excl: Linux'."""
+    inc_l = [str(x) for x in inc if x]
+    exc_l = [str(x) for x in exc if x]
+    if "All" in [i.lower() for i in inc_l]:
+        covered = set(CA_ALL_PLATFORMS)
+    else:
+        covered = {i.lower() for i in inc_l}
+    excluded = {e.lower() for e in exc_l}
+    if excluded and covered | excluded >= CA_ALL_PLATFORMS:
+        return "All except " + ", ".join(sorted(excluded))
+    parts = []
+    if inc_l:
+        parts.append("All" if "All" in [i.lower() for i in inc_l] else ", ".join(sorted(inc_l)))
+    if exc_l:
+        parts.append("excl: " + ", ".join(sorted(exc_l)))
+    return " \u00b7 ".join(parts)
 
 
 def _ca_policy_inner(detail):
@@ -8247,10 +10280,10 @@ def run_ca_analysis(db_path, progress, target_upn=None,
         platforms_inc, platforms_exc = [], []
         device_states_inc, device_states_exc = [], []
         for block in _ca_blocks(inner, "DevicePlatforms", "Include"):
-            platforms_inc.extend(block.get("DevicePlatforms") or [])
+            platforms_inc.extend(block.get("DevicePlatforms") or block.get("IncludeDevicePlatforms") or [])
             device_states_inc.extend(block.get("IncludeDeviceStates") or [])
         for block in _ca_blocks(inner, "DevicePlatforms", "Exclude"):
-            platforms_exc.extend(block.get("DevicePlatforms") or [])
+            platforms_exc.extend(block.get("DevicePlatforms") or block.get("ExcludeDevicePlatforms") or [])
             device_states_exc.extend(block.get("ExcludeDeviceStates") or [])
         # named locations + trusted locations
         locations_inc, locations_exc, trusted_locations = [], [], False
@@ -8478,9 +10511,7 @@ def run_ca_analysis(db_path, progress, target_upn=None,
             controls.append("Block")
         if p["auth_strength"]:
             controls.append("Auth strength")
-        platforms = fmt(p["platforms_inc"])
-        if p["platforms_exc"]:
-            platforms += f" (excl. {', '.join(sorted(p['platforms_exc']))})"
+        platforms = fmt_platforms(p["platforms_inc"], p["platforms_exc"]) or "—"
         device_states = fmt(p["device_states_inc"], "Any device state")
         if p["device_states_exc"]:
             device_states += f" (excl. {', '.join(sorted(p['device_states_exc']))})"
@@ -8916,7 +10947,9 @@ def run_ca_analysis(db_path, progress, target_upn=None,
                 if bits:
                     rows.append(f"<tr><th>{esc(label)}</th><td>{esc(' \u00b7 '.join(bits))}</td></tr>")
 
-            axis("Platform", r["platforms_inc"], r["platforms_exc"])
+            plat = fmt_platforms(r["platforms_inc"], r["platforms_exc"])
+            if plat:
+                rows.append(f"<tr><th>Platform</th><td>{esc(plat)}</td></tr>")
             axis("Client types", r["client_inc"], r["client_exc"])
             axis("Device states", r["device_states_inc"], r["device_states_exc"])
             loc_bits = []
