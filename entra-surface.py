@@ -6,7 +6,10 @@ Reads a roadrecon SQLite database (https://github.com/dirkjanm/ROADtools) and
 runs a registry of checks that surface dangerous users, applications, service
 principals, and tenant configuration. Each check emits structured findings
 (check_id, category, severity, evidence, object ids); a single renderer turns
-them into a sortable/filterable HTML report with drilldown and entity details.
+them into a sortable/filterable HTML report with drilldown and entity details,
+served interactively over HTTP (rows, profiles and drilldowns are fetched on
+demand, so it scales to large tenants). The tool always runs every enabled
+check and serves the whole report; check selection lives in the config.
 
 Checks (config: privileged_roles.json -> "checks"):
   priv_app_ownership      - privileged application (app-only) permission grants
@@ -41,6 +44,13 @@ Checks (config: privileged_roles.json -> "checks"):
                             no-SID tags
   ad_sync_infra           - AD sync attack surface: ADSync groups, sync service
                             principals, hybrid/legacy auth policies, Windows devices
+  azure_arc_machines      - Arc-enabled servers (Microsoft.HybridCompute managed
+                            identities), with subscription and resource group
+  azure_arc_sps           - principals holding Azure Arc ARM roles (matched by
+                            built-in role-definition GUIDs) and service principals
+                            created by the Arc deployment wizard (AzureArcSPN tag)
+  azure_arc_providers     - first-party Microsoft Arc service principals present
+                            in the tenant (subscription configured for Arc)
 """
 import argparse
 import datetime
@@ -3565,40 +3575,19 @@ CHECK_SPECS = [
 CHECK_IDS = {spec["id"] for spec in CHECK_SPECS}
 
 
-def run_checks(graph, config_resources, check_cfg, args,
+def run_checks(graph, config_resources, check_cfg,
                group_roles=None, group_eligible_roles=None, sp_dir_resolver=None):
-    """Run the selected checks and return the list of {spec, findings} results."""
-    opts = {"include_disabled": args.include_disabled}
+    """Run every enabled check and return the list of {spec, findings} results."""
+    opts = {"include_disabled": True}
     check_config = dict(check_cfg)
 
-    # ---- selection from CLI + config ------------------------------------
-    wanted = set()
-    for chunk in (args.check or []):
-        for cid in chunk.split(","):
-            cid = cid.strip().lower()
-            for spec in CHECK_SPECS:
-                if spec["id"].lower() == cid:
-                    wanted.add(spec["id"])
-    excluded = set()
-    for chunk in (args.exclude_check or []):
-        for cid in chunk.split(","):
-            cid = cid.strip().lower()
-            for spec in CHECK_SPECS:
-                if spec["id"].lower() == cid:
-                    excluded.add(spec["id"])
-    selected = []
-    for spec in CHECK_SPECS:
-        cid = spec["id"]
-        if wanted and cid not in wanted:
-            continue
-        if cid in excluded:
-            continue
-        if cid in check_config["enabled"] and not check_config["enabled"][cid]:
-            continue
-        selected.append(spec)
+    # ---- selection from the config only (the tool always serves the full
+    # report: every check that the config has not explicitly disabled) ------
+    selected = [spec for spec in CHECK_SPECS
+                if not (spec["id"] in check_config["enabled"]
+                        and not check_config["enabled"][spec["id"]])]
 
-    min_rank = SEVERITY_ORDER.get(args.min_severity
-                                   or check_config.get("min_severity", "Info"), 4)
+    min_rank = SEVERITY_ORDER.get(check_config.get("min_severity", "Info"), 4)
     suppress = set(check_config.get("suppress", []) or [])
 
     # ---- shared analysis context ----------------------------------------
@@ -3774,7 +3763,8 @@ DEVICE_DETAIL_FIELDS = [
 
 USER_DETAIL_FIELDS = [
     "displayName", "userPrincipalName", "mail", "objectId", "accountEnabled", "userType",
-    "jobTitle", "department", "companyName", "createdDateTime", "dirSyncEnabled",
+    "jobTitle", "department", "companyName", "officeLocation", "city", "country",
+    "createdDateTime", "dirSyncEnabled",
     "onPremisesUserPrincipalName", "onPremisesObjectIdentifier", "onPremisesSecurityIdentifier",
     "onPremisesDistinguishedName", "onPremisesPasswordChangeTimestamp", "lastDirSyncTime",
     "immutableId", "hasOnPremisesShadow", "isResourceAccount", "creationType",
@@ -4186,8 +4176,8 @@ def cap_annotate(items):
 # columns ("extras"). Each field maps to a renderer returning (inner_html,
 # data_value); cells are assembled by row_html() so the default output stays
 # byte-identical to the legacy per-table templates. The same catalog drives:
-#   * the static report (default columns + an inert data blob for extras),
-#   * --serve mode (the `cols=` request parameter renders any subset/order),
+#   * serve mode (the `cols=` request parameter renders any subset/order),
+#   * shell-rendered azure-roles tables (extras delivered via data blobs),
 #   * the client-side column manager (window.__TABLE_CATALOG).
 #
 # Extra families: "sp", "user", "group", "policy" (see COLUMN_FAMILIES).
@@ -5156,7 +5146,7 @@ def parse_cols_param(raw, table_id):
 def row_html(table_id, tr_attrs, key, fields, f, r, collect=None):
     """One <tr> plus its drawer row; cells follow `fields` in order. When
     `collect` is a dict, every extra column's (inner, value) pair is recorded
-    under the row key so the static report can render it on demand."""
+    under the row key so shell-rendered (azure-roles) tables can render extras on demand."""
     spec = table_spec(table_id) or GENERIC_SPEC
     extras = {e[0] for e in spec["extras"]}
     cells = [f'<td class="expand-cell">{EXPAND_BUTTON_HTML}</td>']
@@ -5277,9 +5267,9 @@ def user_sort_value(f, key, ctx=None):
 
 
 def user_rows_html(findings, start=0, stop=None, q="", sort_key=None, desc=False,
-                   columns=None, ctx=None, collect=None):
-    """Pre-rendered <tr> html for the privileged-users table (shared by the
-    static report and the --serve mode)."""
+                   columns=None, ctx=None):
+    """Pre-rendered <tr> html for the privileged-users table (served by the
+    table endpoint)."""
     tid = "privileged-users-table"
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
@@ -5302,7 +5292,7 @@ def user_rows_html(findings, start=0, stop=None, q="", sort_key=None, desc=False
         tr_attrs = (f'data-sp-id="" data-app-id="" '
                     f'data-owner-id="{esc(f["user_id"])}" '
                     f'data-profile-id="{esc(f["user_id"])}"')
-        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
+        out.append(row_html(tid, tr_attrs, key, fields, f, r))
     return out, len(items)
 
 
@@ -5397,7 +5387,7 @@ def legacy_sort_value(f, key, ctx=None):
 
 
 def legacy_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
-                     columns=None, ctx=None, collect=None):
+                     columns=None, ctx=None):
     tid = "owned-table"
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
@@ -5413,7 +5403,7 @@ def legacy_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=No
             tr_attrs = (f'data-sp-id="{esc(f["principal_id"])}" '
                         f'data-app-id="{esc(f["app_object_id"] or "")}" '
                         f'data-owner-id="{esc(owner["object_id"])}"')
-            out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
+            out.append(row_html(tid, tr_attrs, key, fields, f, r))
     return out, total
 
 
@@ -5444,7 +5434,7 @@ def unowned_sort_value(f, key, ctx=None):
 
 
 def legacy_unowned_rows_html(findings, q="", sort_key=None, desc=False, start=0,
-                             stop=None, columns=None, ctx=None, collect=None):
+                             stop=None, columns=None, ctx=None):
     tid = "unowned-table"
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
@@ -5459,7 +5449,7 @@ def legacy_unowned_rows_html(findings, q="", sort_key=None, desc=False, start=0,
         tr_attrs = (f'data-sp-id="{esc(f["principal_id"])}" '
                     f'data-app-id="{esc(f["app_object_id"] or "")}" '
                     f'data-owner-id=""')
-        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
+        out.append(row_html(tid, tr_attrs, key, fields, f, r))
     return out, total
 
 
@@ -5507,7 +5497,7 @@ def generic_sort_value(f, key, ctx=None):
 
 
 def generic_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
-                      columns=None, ctx=None, collect=None):
+                      columns=None, ctx=None):
     tid = "table-generic"
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
@@ -5529,7 +5519,7 @@ def generic_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=N
         tr_attrs = (f'data-sp-id="{esc(sp_id)}" data-app-id="{esc(app_id)}" '
                     f'data-owner-id="{esc(owner_id)}" data-device-id="{esc(device_id)}" '
                     f'data-policy-id="{policy_id}" data-check-id="{esc(f["check_id"])}"')
-        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
+        out.append(row_html(tid, tr_attrs, key, fields, f, r))
     return out, total
 
 
@@ -5580,7 +5570,7 @@ def arc_sort_value(f, key, ctx=None):
 
 
 def arc_machines_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
-                           columns=None, ctx=None, collect=None):
+                           columns=None, ctx=None):
     tid = "arc-machines-table"
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
@@ -5592,12 +5582,12 @@ def arc_machines_rows_html(findings, q="", sort_key=None, desc=False, start=0, s
         key = f"row-{len(out)}"
         r = {"graph": (ctx or {}).get("graph"), "tid": tid, "sp_id": sp_id}
         tr_attrs = f'data-sp-id="{esc(sp_id)}" data-check-id="{esc(f["check_id"])}"'
-        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
+        out.append(row_html(tid, tr_attrs, key, fields, f, r))
     return out, total
 
 
 def arc_principals_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
-                             columns=None, ctx=None, collect=None):
+                             columns=None, ctx=None):
     tid = "arc-principals-table"
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
@@ -5619,12 +5609,12 @@ def arc_principals_rows_html(findings, q="", sort_key=None, desc=False, start=0,
         else:
             gid = f.get("arc_group_id") or oid
             tr_attrs = f'data-group-id="{esc(gid)}" data-check-id="{esc(f["check_id"])}"'
-        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
+        out.append(row_html(tid, tr_attrs, key, fields, f, r))
     return out, total
 
 
 def arc_providers_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
-                            columns=None, ctx=None, collect=None):
+                            columns=None, ctx=None):
     tid = "arc-providers-table"
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
@@ -5636,7 +5626,7 @@ def arc_providers_rows_html(findings, q="", sort_key=None, desc=False, start=0, 
         key = f"row-{len(out)}"
         r = {"graph": (ctx or {}).get("graph"), "tid": tid, "sp_id": sp_id}
         tr_attrs = f'data-sp-id="{esc(sp_id)}" data-check-id="{esc(f["check_id"])}"'
-        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
+        out.append(row_html(tid, tr_attrs, key, fields, f, r))
     return out, total
 
 
@@ -5702,11 +5692,11 @@ def app_dir_sort_value(f, key, ctx=None):
 
 
 def app_dir_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
-                      columns=None, ctx=None, collect=None):
+                      columns=None, ctx=None):
     tid = "app-dir-roles-table"
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
-    need_owner = collect is not None or any(x in fields for x in OWNER_FIELDS)
+    need_owner = any(x in fields for x in OWNER_FIELDS)
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
                                 app_dir_search_text,
                                 lambda f, k: app_dir_sort_value(f, k, ctx))
@@ -5718,7 +5708,7 @@ def app_dir_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=N
         if need_owner:
             r["owner"] = sp_owner_dict(sp_id, (ctx or {}).get("graph"))
         tr_attrs = f'data-sp-id="{esc(sp_id)}"'
-        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
+        out.append(row_html(tid, tr_attrs, key, fields, f, r))
     return out, total
 
 
@@ -5754,7 +5744,7 @@ def group_sort_value(f, key, ctx=None):
 
 
 def group_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
-                    columns=None, ctx=None, collect=None):
+                    columns=None, ctx=None):
     tid = "groups-table"
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
@@ -5767,7 +5757,7 @@ def group_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=Non
         r = {"graph": (ctx or {}).get("graph"), "group_id": f.get("group_id"),
              "tid": tid}
         tr_attrs = f'data-group-id="{esc(f["group_id"])}"'
-        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
+        out.append(row_html(tid, tr_attrs, key, fields, f, r))
     return out, total
 
 
@@ -5794,7 +5784,7 @@ def dynamic_sort_value(f, key, ctx=None):
 
 
 def dynamic_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
-                      columns=None, ctx=None, collect=None):
+                      columns=None, ctx=None):
     tid = "dynamic-groups-table"
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
@@ -5807,7 +5797,7 @@ def dynamic_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=N
         r = {"graph": (ctx or {}).get("graph"), "group_id": f.get("group_id"),
              "tid": tid}
         tr_attrs = f'data-group-id="{esc(f["group_id"])}"'
-        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
+        out.append(row_html(tid, tr_attrs, key, fields, f, r))
     return out, total
 
 
@@ -5846,7 +5836,7 @@ def ad_sort_value(f, key, ctx=None):
 
 
 def ad_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
-                 columns=None, ctx=None, collect=None):
+                 columns=None, ctx=None):
     tid = "ad-sync-users-table"
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
@@ -5861,7 +5851,7 @@ def ad_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
         tr_attrs = (f'data-sp-id="" data-app-id="" '
                     f'data-owner-id="{esc(f["user_id"])}" '
                     f'data-profile-id="{esc(f["user_id"])}"')
-        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
+        out.append(row_html(tid, tr_attrs, key, fields, f, r))
     return out, total
 
 
@@ -6334,7 +6324,7 @@ def ca_sort_value(f, key, ctx=None):
 
 
 def ca_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
-                 columns=None, ctx=None, collect=None):
+                 columns=None, ctx=None):
     tid = "table-ca_exposure"
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
@@ -6347,13 +6337,13 @@ def ca_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
         r = {"graph": (ctx or {}).get("graph"), "tid": tid,
              "policy_id": f.get("policy_id")}
         tr_attrs = f'data-policy-id="{esc(f.get("policy_id", ""))}"'
-        out.append(row_html(tid, tr_attrs, key, fields, f, r, collect))
+        out.append(row_html(tid, tr_attrs, key, fields, f, r))
     return out, total
 
 
-def render_report(results, tenant_name, db_path, config_path, include_disabled, entity_details,
-                  min_severity_label, entity_profiles=None, tenant_summary=None, graph=None,
-                  serve_mode=False, serve_tables=None, group_roles=None,
+def render_report(results, tenant_name, db_path, config_path,
+                  tenant_summary=None, graph=None,
+                  serve_tables=None, group_roles=None,
                   group_eligible_roles=None):
     all_findings = [f for res in results for f in res["findings"]]
 
@@ -6372,19 +6362,17 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     catalog_tids = []
 
     def register_catalog_table(tid, findings, rows_fn, search_fn):
-        """Register a catalog-driven table for --serve and the column catalog."""
+        """Register a catalog-driven table for serving and the column catalog."""
         if serve_tables is not None:
             serve_tables[tid] = {"findings": findings, "rows": rows_fn,
                                  "search": search_fn, "ctx": col_ctx}
         if tid not in catalog_tids:
             catalog_tids.append(tid)
 
-    def catalog_rows(tid, findings, rows_fn, sep="\n"):
-        """Render static rows for a catalog table, collecting extras into blobs."""
-        if serve_mode:
-            return ""
-        return sep.join(rows_fn(findings, ctx=col_ctx,
-                                collect=extras_blobs.setdefault(tid, {}))[0])
+    def catalog_rows(tid, findings, rows_fn, search_fn):
+        """Register a catalog table; rows are fetched from the table endpoint."""
+        register_catalog_table(tid, findings, rows_fn, search_fn)
+        return ""
 
     # ---- Azure Roles tables (one per principal section) -------------------
     def az_sub(a):
@@ -6461,9 +6449,8 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         if not priv:
             return ""
         owned = [f for f in priv["findings"] if f["owners"]]
-        owned_rows = catalog_rows("owned-table", owned, legacy_rows_html)
-        register_catalog_table("owned-table", owned, legacy_rows_html, legacy_search_text)
-        owned_pager = serve_pager() if serve_mode else ""
+        owned_rows = catalog_rows("owned-table", owned, legacy_rows_html, legacy_search_text)
+        owned_pager = serve_pager()
         return f"""
   <section data-category="apps">
     <h2>{esc(priv["title"])}</h2>
@@ -6483,10 +6470,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         if not priv:
             return ""
         unowned = [f for f in priv["findings"] if not f["owners"]]
-        unowned_rows = catalog_rows("unowned-table", unowned, legacy_unowned_rows_html)
-        register_catalog_table("unowned-table", unowned, legacy_unowned_rows_html,
-                               unowned_search_text)
-        unowned_pager = serve_pager() if serve_mode else ""
+        unowned_rows = catalog_rows("unowned-table", unowned, legacy_unowned_rows_html,
+                                   unowned_search_text)
+        unowned_pager = serve_pager()
         return f"""
   <section data-category="apps">
     <h2>Privileged applications / service principals with no recorded owner</h2>
@@ -6509,9 +6495,8 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     # ---- generic findings sections ---------------------------------------
     def generic_section(res):
         tid = f"table-{res['id']}"
-        rows_html = catalog_rows(tid, res["findings"], generic_rows_html)
-        register_catalog_table(tid, res["findings"], generic_rows_html, generic_search_text)
-        pager = serve_pager() if serve_mode else ""
+        rows_html = catalog_rows(tid, res["findings"], generic_rows_html, generic_search_text)
+        pager = serve_pager()
         return f"""
   <section data-category="{esc(res["category"])}">
     <h2>{esc(res["title"])}</h2>
@@ -6528,9 +6513,8 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     # ---- azure arc sections ------------------------------------------------
     def arc_section(res, table_id):
         rows_fn = ARC_TABLE_ROWS[table_id]
-        rows_html = catalog_rows(table_id, res["findings"], rows_fn)
-        register_catalog_table(table_id, res["findings"], rows_fn, arc_search_text)
-        pager = serve_pager() if serve_mode else ""
+        rows_html = catalog_rows(table_id, res["findings"], rows_fn, arc_search_text)
+        pager = serve_pager()
         return f"""
   <section data-category="arc">
     <h2>{esc(res["title"])}</h2>
@@ -6547,11 +6531,10 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 
     # ---- conditional-access policies section ----------------------------------
     def ca_section(res):
-        rows_html = catalog_rows("table-ca_exposure", res["findings"], ca_rows_html)
-        register_catalog_table("table-ca_exposure", res["findings"], ca_rows_html,
+        rows_html = catalog_rows("table-ca_exposure", res["findings"], ca_rows_html,
                                ca_search_text)
-        pager = serve_pager() if serve_mode else ""
-        caview = ' data-caview="main"' if serve_mode else ""
+        pager = serve_pager()
+        caview = ' data-caview="main"'
         return f"""
   <section data-category="configs"{caview}>
     <h2>{esc(res["title"])}</h2>
@@ -6567,10 +6550,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 
     # ---- groups section ----------------------------------------
     def groups_section(res):
-        rows_html = catalog_rows("groups-table", res["findings"], group_rows_html)
-        register_catalog_table("groups-table", res["findings"], group_rows_html,
+        rows_html = catalog_rows("groups-table", res["findings"], group_rows_html,
                                group_search_text)
-        pager = serve_pager() if serve_mode else ""
+        pager = serve_pager()
         return f"""
   <section data-category="groups">
     <h2>{esc(res["title"])}</h2>
@@ -6593,10 +6575,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         dyn = [f for f in res["findings"] if f.get("dyn_rule")]
         if not dyn:
             return ""
-        rows_html = catalog_rows("dynamic-groups-table", dyn, dynamic_rows_html)
-        register_catalog_table("dynamic-groups-table", dyn, dynamic_rows_html,
+        rows_html = catalog_rows("dynamic-groups-table", dyn, dynamic_rows_html,
                                dynamic_search_text)
-        pager = serve_pager() if serve_mode else ""
+        pager = serve_pager()
         return f"""
   <section data-category="groups">
     <h2>Dynamic membership groups ({len(dyn)})</h2>
@@ -6611,10 +6592,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 """
 
     def users_section(res):
-        register_catalog_table("privileged-users-table", res["findings"], user_rows_html,
-                               user_search_text)
-        rows = catalog_rows("privileged-users-table", res["findings"], user_rows_html, sep="")
-        pager = serve_pager() if serve_mode else ""
+        rows = catalog_rows("privileged-users-table", res["findings"], user_rows_html,
+                            user_search_text)
+        pager = serve_pager()
         return f"""
   <section data-category="users">
     <h2>{esc(res["title"])}</h2>
@@ -6636,10 +6616,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 
     # ---- app directory roles section --------------------------------------
     def app_dir_roles_section(res):
-        rows_html = catalog_rows("app-dir-roles-table", res["findings"], app_dir_rows_html)
-        register_catalog_table("app-dir-roles-table", res["findings"], app_dir_rows_html,
+        rows_html = catalog_rows("app-dir-roles-table", res["findings"], app_dir_rows_html,
                                app_dir_search_text)
-        pager = serve_pager() if serve_mode else ""
+        pager = serve_pager()
         return f"""
   <section data-category="apps">
     <h2>{esc(res["title"])}</h2>
@@ -6723,10 +6702,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     def ad_users_section(res):
         realm_html = realm_card_html(res.get("meta") or {})
 
-        rows_html = catalog_rows("ad-sync-users-table", res["findings"], ad_rows_html)
-        register_catalog_table("ad-sync-users-table", res["findings"], ad_rows_html,
+        rows_html = catalog_rows("ad-sync-users-table", res["findings"], ad_rows_html,
                                ad_search_text)
-        pager = serve_pager() if serve_mode else ""
+        pager = serve_pager()
         return f"""
   <section data-category="ad">
     <h2>{esc(res["title"])}</h2>
@@ -6751,9 +6729,6 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         "azUsrRoles")
 
     sections_html = []
-    user_profile_data = {}
-    group_profile_data = {}
-    policy_profile_data = {}
     for res in results:
         if res["id"] == "priv_app_ownership":
             owned_html = legacy_owned_section()
@@ -6771,8 +6746,6 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
             pass  # already rendered after the first table above
         elif res["id"] == "privileged_users":
             sections_html.append(users_section(res))
-            if not serve_mode:
-                user_profile_data = {f["user_id"]: f for f in res["findings"]}
         elif res["id"] == "app_dir_roles":
             sections_html.append(app_dir_roles_section(res))
         elif res["id"] == "groups":
@@ -6780,11 +6753,8 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
             dyn_html = dynamic_groups_table(res)
             if dyn_html:
                 sections_html.append(dyn_html)
-            if not serve_mode:
-                group_profile_data = {f["group_id"]: f for f in res["findings"]}
         elif res["id"] == "ca_exposure":
-            if serve_mode:
-                sections_html.append("""
+            sections_html.append("""
   <section data-category="configs" class="ca-view-tabs-section">
     <div class="drawer-tabs" id="ca-view-tabs">
       <button type="button" class="drawer-tab active" data-caview="main">Conditional Access</button>
@@ -6793,10 +6763,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   </section>
 """)
             sections_html.append(ca_section(res))
-            if not serve_mode:
-                policy_profile_data = {f["policy_id"]: f for f in res["findings"] if f.get("policy_id")}
-            if serve_mode:
-                sections_html.append("""
+            sections_html.append("""
   <section data-category="configs" data-caview="main">
     <h2>CA coverage analysis</h2>
     <div class="ca-analysis">
@@ -6845,9 +6812,6 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
             sections_html.append(arc_section(res, "arc-providers-table"))
         else:
             sections_html.append(generic_section(res))
-    user_profile_json = json.dumps(user_profile_data, default=str).replace("</", "<\\/")
-    group_profile_json = json.dumps(group_profile_data, default=str).replace("</", "<\\/")
-    policy_profile_json = json.dumps(policy_profile_data, default=str).replace("</", "<\\/")
     # directory role -> service principals holding it (drilldown 'Applications' tab);
     # small index, embedded in serve mode too
     role_apps_json = json.dumps(
@@ -6945,10 +6909,6 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         bar.append(item("Arc", f"<b>{len(arc_machines['findings'])}</b>", arc_note))
     summary_bar_html = "\n    ".join(bar)
 
-    entity_details_json = json.dumps(entity_details, default=str).replace("</", "<\\/")
-    entity_profiles_json = json.dumps(entity_profiles or {"sp": {}, "app": {}}, default=str).replace("</", "<\\/")
-
-    # ---- column-manager catalog + static extras blobs ---------------------
     catalog_data = {}
     for tid in catalog_tids:
         entry = catalog_entry(tid)
@@ -6959,8 +6919,10 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     for tid, blob in extras_blobs.items():
         if not blob:
             continue
-        if serve_mode and not tid.startswith("azure-roles-"):
-            continue  # serve mode renders extras on demand via cols=
+        # only the shell-rendered azure-roles tables carry extras blobs;
+        # loader-managed tables render extras on demand via cols=
+        if not tid.startswith("azure-roles-"):
+            continue
         blob_json = json.dumps(blob, default=str).replace("</", "<\\/")
         extras_scripts.append(
             f'<script type="application/json" id="extras-{tid}">{blob_json}</script>')
@@ -6969,7 +6931,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     return f"""<!doctype html>
 <html lang="en">
 <head>
-    <script>window.REPORT_SERVE = {str(serve_mode).lower()};</script>
+    <script>window.REPORT_SERVE = true;</script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Entra ID Surface{" - " + esc(tenant_name) if tenant_name else ""}</title>
@@ -7368,7 +7330,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 
   {''.join(sections_html)}
 
-  {'<div class="empty">No findings meet the configured severity threshold. Try lowering --min-severity or enabling more checks.</div>' if not all_findings else ''}
+  {'<div class="empty">No findings were produced. Check the check configuration.</div>' if not all_findings else ''}
 
 </div>
 
@@ -7399,19 +7361,9 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   </div>
 </div>
 
-<script type="application/json" id="entity-details-data">{entity_details_json}</script>
-
-<script type="application/json" id="user-profile-data">{user_profile_json}</script>
-
-<script type="application/json" id="entity-profile-data">{entity_profiles_json}</script>
-
-<script type="application/json" id="group-profile-data">{group_profile_json}</script>
-
 <script type="application/json" id="suggest-data">{suggest_json}</script>
 
 <script type="application/json" id="role-apps-data">{role_apps_json}</script>
-
-<script type="application/json" id="policy-profile-data">{policy_profile_json}</script>
 
 <script type="application/json" id="table-catalog-data">{catalog_json}</script>
 
@@ -7588,7 +7540,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     tabsWrap.classList.add('hidden');
     usersScroll.classList.remove('hidden');
     appsScroll.classList.add('hidden');
-    if (window.REPORT_SERVE && SERVE_DRILLDOWN_FIELDS[field]) {{
+    if (SERVE_DRILLDOWN_FIELDS[field]) {{
       fetch('/api/drilldown?field=' + encodeURIComponent(field) + '&value=' + encodeURIComponent(value))
         .then(function(r) {{ return r.json(); }})
         .then(function(d) {{
@@ -7744,7 +7696,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     usersScroll.classList.remove('hidden');
     appsScroll.classList.add('hidden');
     fillAppsPane(value);
-    if (window.REPORT_SERVE && SERVE_DRILLDOWN_FIELDS[field]) {{
+    if (SERVE_DRILLDOWN_FIELDS[field]) {{
       fetch('/api/drilldown?field=' + encodeURIComponent(field) + '&value=' + encodeURIComponent(value))
         .then(function(r) {{ return r.json(); }})
         .then(function(d) {{
@@ -7802,16 +7754,12 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 
 (function() {{
   var MEMBER_CAP = 500;
+  // runtime caches; populated on demand from the API endpoints
   var DETAILS = {{ sp: {{}}, app: {{}}, user: {{}}, device: {{}} }};
-  try {{ DETAILS = JSON.parse(document.getElementById('entity-details-data').textContent); }} catch (e) {{}}
   var PROFILES = {{}};
-  try {{ PROFILES = JSON.parse(document.getElementById('user-profile-data').textContent); }} catch (e) {{}}
   var PROFILES2 = {{ sp: {{}}, app: {{}} }};
-  try {{ PROFILES2 = JSON.parse(document.getElementById('entity-profile-data').textContent); }} catch (e) {{}}
   var GROUPS = {{}};
-  try {{ GROUPS = JSON.parse(document.getElementById('group-profile-data').textContent); }} catch (e) {{}}
   var POLICIES = {{}};
-  try {{ POLICIES = JSON.parse(document.getElementById('policy-profile-data').textContent); }} catch (e) {{}}
 
   function pEsc(s) {{
     return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -8003,7 +7951,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
       b.addEventListener('click', function() {{
         var spOid = b.getAttribute('data-sp-id');
         var spProf = PROFILES2.sp[spOid];
-        if (!spProf && !window.REPORT_SERVE) return;
+        if (!spProf) return;
         container.innerHTML = '';
         var backRow = document.createElement('div');
         backRow.className = 'drawer-back-row';
@@ -8225,18 +8173,51 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
           renderSpAppTabs(prof2, DETAILS.sp[oid] || null, container);
           return;
         }}
-        if (window.REPORT_SERVE && kind === 'sp') {{
+        if (kind === 'sp') {{
           fetchSpApp(oid, 'sp', container);
           return;
         }}
-        if (kind === 'sp') {{ container.appendChild(section('Service Principal', DETAILS.sp[oid] || null)); return; }}
         container.appendChild(section('Application', DETAILS.app[oid] || null));
       }});
     }});
   }}
 
+  function fillUserDetails(wrap, uid) {{
+    var rec = DETAILS.user[uid] || null;
+    var descEl = wrap.querySelector('.user-desc');
+    if (descEl) {{
+      var pairs = [
+        ['Job title', rec ? rec.jobTitle : null],
+        ['Department', rec ? rec.department : null],
+        ['Company', rec ? rec.companyName : null],
+        ['Office', rec ? rec.officeLocation : null],
+        ['City', rec ? rec.city : null],
+        ['Country', rec ? rec.country : null],
+        ['Mail', rec ? rec.mail : null],
+        ['Employee ID', rec ? rec.employeeId : null],
+        ['Usage location', rec ? rec.usageLocation : null],
+        ['Account type', rec ? rec.userType : null],
+        ['Created', rec ? rec.createdDateTime : null]
+      ];
+      var items = pairs.filter(function(pair) {{ return pair[1]; }})
+          .map(function(pair) {{
+            return '<li><span class="muted">' + pEsc(pair[0]) + ':</span> '
+                + pEsc(String(pair[1])) + '</li>';
+          }});
+      descEl.innerHTML = '<div class="detail-section"><h4>User details</h4>'
+          + (items.length ? '<ul class="profile-list">' + items.join('') + '</ul>'
+                          : '<p class="muted">No additional details captured for this user.</p>')
+          + '</div>';
+    }}
+    var rawEl = wrap.querySelector('.user-raw');
+    if (rawEl) {{
+      rawEl.innerHTML = rec ? renderKVHtml(rec)
+                            : '<p class="muted">Not available in the collected data.</p>';
+    }}
+  }}
+
   function renderProfileTabs(p, container) {{
-    var overview = openProfileHtml(p);
+    var overview = openProfileHtml(p) + '<div class="user-desc"></div>';
     var ownedLinks = (p.owned_objects || []).map(function(o) {{
       var isGroup = o.type === 'Group';
       var grants = (o.grants && o.grants.length)
@@ -8278,11 +8259,14 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
                 + '<td>' + pEsc(r.ad) + '</td><td>' + pEsc(r.last_logon) + '</td><td>' + pEsc(r.status) + '</td></tr>';
             }}).join('') + '</tbody></table>'
         : '<p class="muted">No devices recorded for this user.</p>';
+    var uid = p.user_id || '';
+    var rawPane = '<div class="user-raw" data-user-raw="' + pEsc(uid) + '"><p class="muted">Loading\u2026</p></div>';
     var panes = [
       ['overview', 'Overview', overview],
       ['azure', 'Azure roles (' + (p.az_roles ? p.az_roles.length : 0) + ')', azTableHtml(p.az_roles || [], false)],
       ['owned', 'Owned objects (' + (p.owned_objects ? p.owned_objects.length : 0) + ')', ownedHtml],
-      ['devices', 'Devices (' + (p.devices ? p.devices.length : 0) + ')', devicesHtml]
+      ['devices', 'Devices (' + (p.devices ? p.devices.length : 0) + ')', devicesHtml],
+      ['raw', 'Raw', rawPane]
     ];
     var tabsHtml = '<div class="drawer-tabs">' + panes.map(function(pt) {{
       return '<button type="button" class="drawer-tab' + (pt[0] === 'overview' ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pEsc(pt[1]) + '</button>';
@@ -8295,6 +8279,24 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     wrap.innerHTML = tabsHtml + panesHtml;
     container.appendChild(wrap);
     attachDrawerTabs(wrap);
+    // user descriptions (overview) and the Raw pane are backed by the raw
+    // user record, fetched on demand
+    if (uid) {{
+      if (DETAILS.user[uid]) {{
+        fillUserDetails(wrap, uid);
+      }} else {{
+        fetch('/api/details/user/' + encodeURIComponent(uid))
+          .then(function(r) {{ return r.json(); }})
+          .then(function(rec) {{
+            DETAILS.user[uid] = (rec && !rec.error) ? rec : null;
+            fillUserDetails(wrap, uid);
+          }})
+          .catch(function() {{
+            DETAILS.user[uid] = null;
+            fillUserDetails(wrap, uid);
+          }});
+      }}
+    }}
     Array.prototype.forEach.call(wrap.querySelectorAll('.ca-link'), function(b) {{
       b.addEventListener('click', function() {{
         var name = b.getAttribute('data-ca-name');
@@ -8349,29 +8351,21 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
         if (kind === 'group') {{
           var grp = GROUPS[oid];
           if (grp) {{ renderGroupTabs(grp, container); return; }}
-          if (window.REPORT_SERVE) {{
-            fetchProfile('group', oid, function(g) {{ renderGroupTabs(g, container); }}, container);
-            return;
-          }}
-          container.appendChild(section('Group', null));
+          fetchProfile('group', oid, function(g) {{ renderGroupTabs(g, container); }}, container);
           return;
         }}
         if (prof2) {{
           renderSpAppTabs(prof2, kind === 'app' ? (DETAILS.app[oid] || null) : (DETAILS.sp[oid] || null), container);
           return;
         }}
-        if (window.REPORT_SERVE && (kind === 'app' || kind === 'sp')) {{
+        if (kind === 'app' || kind === 'sp') {{
           fetchSpApp(oid, kind, container);
           return;
         }}
-        if (kind === 'app') {{ container.appendChild(section('Application', DETAILS.app[oid] || null)); return; }}
-        if (kind === 'sp') {{ container.appendChild(section('Service Principal', DETAILS.sp[oid] || null)); return; }}
-        if (window.REPORT_SERVE && kind === 'device') {{
+        if (kind === 'device') {{
           fetchDetailsAll([['device', oid]], container);
           return;
         }}
-        container.appendChild(section('Device', DETAILS.device[oid] || null));
-        container.appendChild(section('Owner', DETAILS.user[p.user_id] || null));
       }});
     }});
   }}
@@ -8496,7 +8490,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
       renderProfileTabs(p, body);
       return;
     }}
-    if (profileId && window.REPORT_SERVE) {{
+    if (profileId) {{
       fetch('/api/user/' + encodeURIComponent(profileId)).then(function(r) {{ return r.json(); }}).then(function(prof) {{
         if (prof && prof.user_id) {{
           PROFILES[profileId] = prof;
@@ -8520,7 +8514,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
       renderGroupTabs(GROUPS[gid2], body);
       return;
     }}
-    if (gid2 && window.REPORT_SERVE) {{
+    if (gid2) {{
       fetchProfile('group', gid2, function(g) {{ renderGroupTabs(g, body); }}, body);
       return;
     }}
@@ -8529,15 +8523,15 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
       renderPolicyTabs(POLICIES[pid2], body);
       return;
     }}
-    if (pid2 && window.REPORT_SERVE) {{
+    if (pid2) {{
       fetchProfile('policy', pid2, function(pol) {{ renderPolicyTabs(pol, body); }}, body);
       return;
     }}
     var spId2 = row.getAttribute('data-sp-id') || '';
     var appId2 = row.getAttribute('data-app-id') || '';
-    if (window.REPORT_SERVE && spId2 && !PROFILES2.sp[spId2]) {{
-      // in serve mode the SP profile may not be cached yet even when the app
-      // profile is (e.g. after navigating app -> back); prefer the SP drawer
+    if (spId2 && !PROFILES2.sp[spId2]) {{
+      // the SP profile may not be cached yet even when the app profile is
+      // (e.g. after navigating app -> back); prefer the SP drawer
       fetchSpApp(spId2, 'sp', body);
       return;
     }}
@@ -8548,7 +8542,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
       renderSpAppTabs(prof2, rec2, body);
       return;
     }}
-    if (window.REPORT_SERVE && (spId2 || appId2)) {{
+    if (spId2 || appId2) {{
       fetchSpApp(spId2 || appId2, spId2 ? 'sp' : 'app', body);
       return;
     }}
@@ -8556,14 +8550,10 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     if (row.getAttribute('data-device-id')) wants.push(['device', row.getAttribute('data-device-id')]);
     if (row.getAttribute('data-app-id')) wants.push(['app', row.getAttribute('data-app-id')]);
     if (row.getAttribute('data-sp-id')) wants.push(['sp', row.getAttribute('data-sp-id')]);
-    if (wants.length && window.REPORT_SERVE) {{
+    if (wants.length) {{
       fetchDetailsAll(wants, body);
       return;
     }}
-    if (row.getAttribute('data-device-id')) body.appendChild(section('Device', DETAILS.device[row.getAttribute('data-device-id') || '']));
-    if (row.getAttribute('data-app-id')) body.appendChild(section('Application', DETAILS.app[row.getAttribute('data-app-id') || '']));
-    if (row.getAttribute('data-sp-id')) body.appendChild(section('Service Principal', DETAILS.sp[row.getAttribute('data-sp-id') || '']));
-    if (row.getAttribute('data-owner-id')) body.appendChild(section('Owner', DETAILS.user[row.getAttribute('data-owner-id') || '']));
     if (!body.children.length) {{
       body.appendChild(mutedP('No additional details captured for this object.'));
     }}
@@ -8651,7 +8641,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
     if (!row) return;
     var pid = row.getAttribute('data-profile-id') || '';
     if (!pid) return;
-    if (!PROFILES[pid] && !window.REPORT_SERVE) return;
+    if (!PROFILES[pid]) return;
     e.stopImmediatePropagation();
     toggleDrawer(row);
   }}, true);
@@ -8720,16 +8710,7 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
   }}
 
   function renderApp(oid, body) {{
-    if (window.REPORT_SERVE) {{
-      fetchSpApp(oid, 'app', body);
-      return;
-    }}
-    var prof = PROFILES2.app[oid];
-    if (prof) {{
-      renderSpAppTabs(prof, DETAILS.app[oid] || null, body);
-    }} else {{
-      body.appendChild(section('Application', DETAILS.app[oid] || null));
-    }}
+    fetchSpApp(oid, 'app', body);
   }}
 }})();
 
@@ -9504,7 +9485,6 @@ def render_report(results, tenant_name, db_path, config_path, include_disabled, 
 }})();
 
 (function() {{
-  if (!window.REPORT_SERVE) return;
   var filterInput = document.getElementById('filter-input');
   function makeLoader(table) {{
     if (table.__loaderMade) return;
@@ -9799,7 +9779,7 @@ def build_tenant_summary(graph, results=None):
 
 
 # ---------------------------------------------------------------------------
-# Live serve mode (--serve): same report shell; the users table, user profiles
+# Live serving: the report shell; the users table, user profiles
 # and user-field drilldowns are served on demand from the in-memory results so
 # the page stays small at 50k+ users. Bound to 127.0.0.1, read-only.
 # ---------------------------------------------------------------------------
@@ -10071,7 +10051,7 @@ def serve_table_response(table_id, qs):
             if table_id == "owned-table":
                 # the owned table renders one row per owner: filter at the
                 # (finding, owner) row level so owner predicates keep only the
-                # matching owner rows (same semantics as the static report)
+                # matching owner rows (same semantics as the client)
                 filtered = []
                 seen = set()
                 for f in findings:
@@ -10210,7 +10190,7 @@ def serve_drilldown_response(qs):
 
 
 # ---------------------------------------------------------------------------
-# On-demand CA coverage analysis (--serve mode, runs on button click)
+# On-demand CA coverage analysis (runs on button click)
 # ---------------------------------------------------------------------------
 
 CA_ANALYSIS_STEPS = [
@@ -11426,9 +11406,10 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                        "application/json; charset=utf-8", 500)
 
 
-def start_serve(port):
+def start_serve(port, total=None):
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), AuditServeHandler)
-    print(f"Serving audit report on http://127.0.0.1:{port} (Ctrl+C to stop)")
+    count = f" ({total} findings)" if total else ""
+    print(f"Serving audit report{count} on http://127.0.0.1:{port} (Ctrl+C to stop)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -11442,26 +11423,14 @@ def main():
     parser.add_argument("--db", default="roadrecon.db", help="Path to the roadrecon SQLite database (default: roadrecon.db)")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to the privileged-roles config JSON (default: privileged_roles.json)")
     parser.add_argument("--azure-config", default=str(DEFAULT_AZURE_CONFIG), help="Path to the azure-roles config JSON (default: azure_roles.json)")
-    parser.add_argument("--output", default="entra-surface-report.html", help="Path to write the HTML report (default: entra-surface-report.html)")
-    parser.add_argument("--include-disabled", action="store_true", help="Include disabled/soft-deleted service principals in the report")
-    parser.add_argument("--check", action="append", metavar="CHECK[,CHECK...]",
-                        help="Only run the given checks (comma-separated). See the module docstring for check ids.")
-    parser.add_argument("--exclude-check", action="append", metavar="CHECK[,CHECK...]",
-                        help="Skip the given checks (comma-separated).")
-    parser.add_argument("--min-severity", choices=list(SEVERITY_ORDER), default=None,
-                        help="Drop findings below this severity (default: from config, usually Info)")
-    parser.add_argument("--serve", action="store_true",
-                        help="Serve the report over HTTP on 127.0.0.1 instead of writing a static file "
-                             "(users table, profiles and drilldowns are fetched on demand - scales to large tenants)")
     parser.add_argument("--port", type=int, default=8787,
-                        help="Port for --serve (default: 8787)")
+                        help="Port to serve the report on (default: 8787)")
     parser.add_argument("--timing", action="store_true",
                         help="Print per-phase timings and peak memory at the end of the run")
     args = parser.parse_args()
 
     db_path = Path(args.db)
     config_path = Path(args.config)
-    output_path = Path(args.output)
 
     if not db_path.exists():
         print(f"error: database not found: {db_path}", file=sys.stderr)
@@ -11504,7 +11473,7 @@ def main():
                                            check_cfg["directory_roles"],
                                            group_eligible_roles)
     results = timed("run_checks",
-                    lambda: run_checks(graph, config_resources, check_cfg, args,
+                    lambda: run_checks(graph, config_resources, check_cfg,
                                        group_roles=group_roles,
                                        group_eligible_roles=group_eligible_roles,
                                        sp_dir_resolver=sp_dir_resolver))
@@ -11535,12 +11504,7 @@ def main():
                 device_ids.add(dev.get("object_id"))
     entity_details = timed(
         "fetch_full_details",
-        lambda: fetch_full_details(cur, sp_ids, app_ids,
-                                   set() if args.serve else user_ids, device_ids))
-    if args.serve:
-        # serve mode never uses raw user details (profiles come from the
-        # in-memory findings on demand) - keep the shell lean
-        entity_details["user"] = {}
+        lambda: fetch_full_details(cur, sp_ids, app_ids, user_ids, device_ids))
     entity_profiles = timed("build_entity_profiles",
                             lambda: build_entity_profiles(
                                 graph, check_cfg, sp_ids, app_ids,
@@ -11551,58 +11515,40 @@ def main():
                            lambda: build_tenant_summary(graph, results))
     conn.close()
 
-    min_severity_label = args.min_severity or check_cfg.get("min_severity", "Info")
-    serve_tables = {} if args.serve else None
-    if args.serve:
-        # nothing heavy gets embedded into the shell in serve mode; profiles
-        # and raw details are fetched on demand from the endpoints below
-        entity_details_render = {"sp": {}, "app": {}, "user": {}, "device": {}}
-        entity_profiles_render = {"sp": {}, "app": {}}
-    else:
-        entity_details_render, entity_profiles_render = entity_details, entity_profiles
+    serve_tables = {}
     report_html = timed("render_report",
                         lambda: render_report(results, tenant_name, db_path, config_path,
-                                              args.include_disabled, entity_details_render,
-                                              min_severity_label, entity_profiles_render,
                                               tenant_summary, graph=graph,
-                                              serve_mode=args.serve, serve_tables=serve_tables,
+                                              serve_tables=serve_tables,
                                               group_roles=group_roles,
                                               group_eligible_roles=group_eligible_roles))
 
     total = sum(len(res["findings"]) for res in results)
 
-    if args.serve:
-        SERVE_STATE["shell"] = report_html
-        SERVE_STATE["db_path"] = str(db_path)
-        SERVE_STATE["ca_analysis"] = None
-        SERVE_STATE["tables"] = serve_tables or {}
-        SERVE_STATE["user_findings"] = next(
-            (res["findings"] for res in results if res["id"] == "privileged_users"), [])
-        SERVE_STATE["profiles2"] = entity_profiles
-        SERVE_STATE["group_profiles"] = {
-            f["group_id"]: f for res in results if res["id"] == "groups"
-            for f in res["findings"]}
-        SERVE_STATE["policy_profiles"] = {
-            f["policy_id"]: f for res in results if res["id"] == "ca_exposure"
-            for f in res["findings"] if f.get("policy_id")}
-        SERVE_STATE["details"] = {k: v for k, v in entity_details.items()
-                                  if k in ("sp", "app", "device")}
-        SERVE_STATE["records"] = build_serve_records(results)
-        # Release the analysis working set before serving: everything the page
-        # needs is embedded in the shell or held in SERVE_STATE above.
-        del graph, results
-        gc.collect()
-        if args.timing:
-            import resource
-            print(f"[timing] peak RSS: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.0f} MB")
-        start_serve(args.port)
-        return 0
-
-    output_path.write_text(report_html, encoding="utf-8")
-    print(f"Wrote {total} finding(s) to {output_path}")
+    SERVE_STATE["shell"] = report_html
+    SERVE_STATE["db_path"] = str(db_path)
+    SERVE_STATE["ca_analysis"] = None
+    SERVE_STATE["tables"] = serve_tables or {}
+    SERVE_STATE["user_findings"] = next(
+        (res["findings"] for res in results if res["id"] == "privileged_users"), [])
+    SERVE_STATE["profiles2"] = entity_profiles
+    SERVE_STATE["group_profiles"] = {
+        f["group_id"]: f for res in results if res["id"] == "groups"
+        for f in res["findings"]}
+    SERVE_STATE["policy_profiles"] = {
+        f["policy_id"]: f for res in results if res["id"] == "ca_exposure"
+        for f in res["findings"] if f.get("policy_id")}
+    SERVE_STATE["details"] = {k: v for k, v in entity_details.items()
+                              if k in ("sp", "app", "device", "user")}
+    SERVE_STATE["records"] = build_serve_records(results)
+    # Release the analysis working set before serving: everything the page
+    # needs is embedded in the shell or held in SERVE_STATE above.
+    del graph, results
+    gc.collect()
     if args.timing:
         import resource
         print(f"[timing] peak RSS: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.0f} MB")
+    start_serve(args.port, total)
     return 0
 
 
