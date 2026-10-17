@@ -15,6 +15,8 @@ python3 entra-surface.py --db roadrecon.db
 
 Opens `http://127.0.0.1:8787`. Startup takes a few minutes on large tenants.
 
+Analysis is cached in `cache.json`: unchanged re-runs skip analysis entirely, and changed databases are diffed against the previous run. `--refresh` forces a full reanalysis.
+
 ### Options
 
 | Option | Description |
@@ -23,6 +25,7 @@ Opens `http://127.0.0.1:8787`. Startup takes a few minutes on large tenants.
 | `--config` | Privileged-roles config (default: `privileged_roles.json`) |
 | `--azure-config` | Azure RBAC role config (default: `azure_roles.json`) |
 | `--port` | Port to serve on (default: `8787`) |
+| `--refresh` | Ignore the cache and re-run the full analysis |
 | `--timing` | Print per-phase timings and peak memory |
 
 ## Report

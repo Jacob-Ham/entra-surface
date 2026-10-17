@@ -6344,7 +6344,7 @@ def ca_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
 def render_report(results, tenant_name, db_path, config_path,
                   tenant_summary=None, graph=None,
                   serve_tables=None, group_roles=None,
-                  group_eligible_roles=None):
+                  group_eligible_roles=None, cache_meta=None, diff=None):
     all_findings = [f for res in results for f in res["findings"]]
 
     category_counts = Counter(res["category"] for res in results for _ in res["findings"])
@@ -6729,6 +6729,19 @@ def render_report(results, tenant_name, db_path, config_path,
         "azUsrRoles")
 
     sections_html = []
+    diff_entries = []
+    if diff:
+        for f in diff.get("added") or []:
+            diff_entries.append({"kind": "added", "f": f})
+        for f in diff.get("removed") or []:
+            diff_entries.append({"kind": "removed", "f": f})
+        for old, new in diff.get("changed") or []:
+            diff_entries.append({"kind": "changed", "f": new, "old": old})
+        diff_entries.sort(key=lambda e: ({"added": 0, "removed": 1,
+                                          "changed": 2}[e["kind"]],
+                                         e["f"].get("check_id", ""),
+                                         ((e["f"].get("target") or {}).get("name")
+                                          or "").lower()))
     for res in results:
         if res["id"] == "priv_app_ownership":
             owned_html = legacy_owned_section()
@@ -6812,6 +6825,54 @@ def render_report(results, tenant_name, db_path, config_path,
             sections_html.append(arc_section(res, "arc-providers-table"))
         else:
             sections_html.append(generic_section(res))
+
+    # ---- changes since the last analysis (diff against the cache) ---------
+    if diff_entries:
+        check_titles = {spec["id"]: spec["title"] for spec in CHECK_SPECS}
+        change_rows = []
+        for e in diff_entries:
+            f = e["f"]
+            t = f.get("target") or {}
+            sev = f.get("severity") or "Info"
+            if e["kind"] == "changed":
+                old_sev = e["old"].get("severity") or "Info"
+                sev_html = f"{severity_badge(old_sev)} \u2192 {severity_badge(sev)}"
+            else:
+                sev_html = severity_badge(sev)
+            kind_html = {
+                "added": '<span class="badge badge-enabled">Added</span>',
+                "removed": '<span class="badge sev-critical">Removed</span>',
+                "changed": '<span class="badge sev-medium">Changed</span>',
+            }[e["kind"]]
+            target = ((t.get("name") or f.get("user_display") or f.get("display_name")
+                       or f.get("group_name") or f.get("policy_name")
+                       or f.get("machine_name") or f.get("arc_principal")
+                       or f.get("arc_provider") or f.get("title")
+                       or f.get("primary_id") or ""))
+            check_label = check_titles.get(f.get("check_id"), f.get("check_id") or "")
+            change_rows.append(
+                f'<tr><td>{kind_html}</td>'
+                f'<td>{esc(check_label)}</td>'
+                f'<td title="{esc(f.get("evidence") or "")}">{esc(target)}</td>'
+                f'<td>{sev_html}</td></tr>')
+        changes_html = f"""
+  <section data-category="changes">
+    <h2>Changes since last analysis ({len(diff_entries)})</h2>
+    <p class="sub">Compared against the cached analysis from {esc(cache_meta.get("previous_at") or "")}.</p>
+    <div class="table-scroll">
+    <table class="findings" id="changes-table">
+      <thead><tr>
+        <th data-type="text">Change</th>
+        <th data-type="text">Check</th>
+        <th data-type="text">Target</th>
+        <th data-type="text">Severity</th>
+      </tr></thead>
+      <tbody>{''.join(change_rows)}</tbody>
+    </table>
+    </div>
+  </section>
+"""
+        sections_html.insert(0, changes_html)
     # directory role -> service principals holding it (drilldown 'Applications' tab);
     # small index, embedded in serve mode too
     role_apps_json = json.dumps(
@@ -6907,6 +6968,18 @@ def render_report(results, tenant_name, db_path, config_path,
         arc_principals = next((r for r in results if r["id"] == "azure_arc_sps"), None)
         arc_note = f'{len(arc_machines["findings"])} machines, {len(arc_principals["findings"]) if arc_principals else 0} Arc principals'
         bar.append(item("Arc", f"<b>{len(arc_machines['findings'])}</b>", arc_note))
+    # ---- cache / diff chips ------------------------------------------------
+    if cache_meta:
+        at = cache_meta.get("generated_at") or ""
+        if cache_meta.get("hit"):
+            bar.append(item("Cache", "<b>hit</b>", f"last analyzed {at}"))
+        else:
+            label = "created" if cache_meta.get("fresh") else "updated"
+            html = f"<b>{label}</b>"
+            title = f"analyzed {at}"
+            if diff_entries:
+                html += f" \u00b7 <b>{len(diff_entries)}</b> changes"
+            bar.append(item("Cache", html, title))
     summary_bar_html = "\n    ".join(bar)
 
     catalog_data = {}
@@ -11418,6 +11491,92 @@ def start_serve(port, total=None):
         server.server_close()
 
 
+# ---------------------------------------------------------------------------
+# Analysis cache + run-to-run diff
+# ---------------------------------------------------------------------------
+# The first run analyzes the tenant and stores the outcomes (findings, derived
+# drawer data, group-role resolution) in ./cache.json. Later launches reuse it
+# when the database fingerprint is unchanged; when the database changed, the
+# new analysis is diffed against the cached one and surfaced in the report.
+
+CACHE_VERSION = 1
+CACHE_FILENAME = "cache.json"
+
+CACHE_FINGERPRINT_TABLES = (
+    "Users", "ServicePrincipals", "Applications", "Groups", "Devices",
+    "RoleAssignments", "AppRoleAssignments", "AZroleAssignments", "Policys",
+)
+
+
+def compute_db_fingerprint(db_path, cur):
+    """Cheap fingerprint of the audited database: file metadata plus row
+    counts of the core tables. Any change triggers a reanalysis."""
+    parts = [db_path.stat().st_mtime_ns, db_path.stat().st_size]
+    for table in CACHE_FINGERPRINT_TABLES:
+        try:
+            cur.execute(f'SELECT COUNT(*) FROM "{table}"')
+            parts.append(cur.fetchone()[0])
+        except sqlite3.OperationalError:
+            parts.append(-1)
+    return parts
+
+
+def _cacheable(v):
+    if isinstance(v, set):
+        return {"__set__": sorted(v, key=str)}
+    if isinstance(v, dict):
+        return {str(k): _cacheable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_cacheable(x) for x in v]
+    return v
+
+
+def _uncache(v):
+    if isinstance(v, dict):
+        if set(v) == {"__set__"}:
+            return set(v["__set__"])
+        return {k: _uncache(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_uncache(x) for x in v]
+    return v
+
+
+def save_cache(path, payload):
+    try:
+        path.write_text(json.dumps(_cacheable(payload), separators=(",", ":")))
+    except OSError as exc:
+        print(f"warning: could not write cache: {exc}", file=sys.stderr)
+
+
+def load_cache(path):
+    try:
+        return _uncache(json.loads(path.read_text()))
+    except (OSError, ValueError):
+        return None
+
+
+def compute_diff(old_results, new_results):
+    """Compare two analysis runs keyed on (check_id, primary_id): added and
+    removed findings, plus changed severity/title/evidence for survivors."""
+    def index(results):
+        return {(f["check_id"], str(f["primary_id"])): f
+                for res in results for f in res["findings"]}
+    old_map = index(old_results)
+    new_map = index(new_results)
+    added = [new_map[k] for k in sorted(new_map) if k not in old_map]
+    removed = [old_map[k] for k in sorted(old_map) if k not in new_map]
+    changed = []
+    for k in sorted(new_map):
+        if k not in old_map:
+            continue
+        old, new = old_map[k], new_map[k]
+        if (old.get("severity") != new.get("severity")
+                or old.get("title") != new.get("title")
+                or old.get("evidence") != new.get("evidence")):
+            changed.append((old, new))
+    return {"added": added, "removed": removed, "changed": changed}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default="roadrecon.db", help="Path to the roadrecon SQLite database (default: roadrecon.db)")
@@ -11425,6 +11584,8 @@ def main():
     parser.add_argument("--azure-config", default=str(DEFAULT_AZURE_CONFIG), help="Path to the azure-roles config JSON (default: azure_roles.json)")
     parser.add_argument("--port", type=int, default=8787,
                         help="Port to serve the report on (default: 8787)")
+    parser.add_argument("--refresh", action="store_true",
+                        help="Ignore the cache and re-run the full analysis")
     parser.add_argument("--timing", action="store_true",
                         help="Print per-phase timings and peak memory at the end of the run")
     args = parser.parse_args()
@@ -11459,61 +11620,107 @@ def main():
             print(f"[timing] {label:<36s} {time.perf_counter() - t0:7.1f}s")
         return r
 
+    def now_iso():
+        return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+    cache_path = Path(CACHE_FILENAME)
+    fingerprint = compute_db_fingerprint(db_path, cur)
+    cached = None if args.refresh else load_cache(cache_path)
+    cache_hit = bool(
+        cached and cached.get("version") == CACHE_VERSION
+        and cached.get("fingerprint") == fingerprint)
+
     graph = timed("build_graph", lambda: build_graph(cur))
     azure_role_sev = load_azure_roles(args.azure_config)
     check_cfg["azure_roles"] = azure_role_sev
     timed("apply_azure_severity", lambda: apply_azure_severity(graph, azure_role_sev))
-    # shared role resolution: computed once, reused by the checks, the
-    # severity bump, the entity profiles and the report embed
-    group_roles = timed("compute_group_roles",
-                        lambda: compute_group_roles(graph, check_cfg))
-    group_eligible_roles = timed("compute_group_eligible_roles",
-                                 lambda: compute_group_eligible_roles(graph, check_cfg))
-    sp_dir_resolver = make_sp_dir_resolver(graph, group_roles,
-                                           check_cfg["directory_roles"],
-                                           group_eligible_roles)
-    results = timed("run_checks",
-                    lambda: run_checks(graph, config_resources, check_cfg,
-                                       group_roles=group_roles,
-                                       group_eligible_roles=group_eligible_roles,
-                                       sp_dir_resolver=sp_dir_resolver))
 
-    sp_ids = set()
-    app_ids = set()
-    user_ids = set()
-    device_ids = set()
-    for res in results:
-        for f in res["findings"]:
-            o = f.get("object_ids") or {}
-            sp_ids |= o.get("sp", set())
-            app_ids |= o.get("app", set())
-            user_ids |= o.get("user", set())
-            device_ids |= o.get("device", set())
-    # owned objects / devices inside user profiles need cards too when clicked
-    for res in results:
-        if res["id"] != "privileged_users":
-            continue
-        for f in res["findings"]:
-            for obj in f.get("owned_objects", []):
-                t = obj.get("type")
-                if t == "Application":
-                    app_ids.add(obj.get("object_id"))
-                elif t == "Service Principal":
-                    sp_ids.add(obj.get("object_id"))
-            for dev in f.get("devices", []):
-                device_ids.add(dev.get("object_id"))
-    entity_details = timed(
-        "fetch_full_details",
-        lambda: fetch_full_details(cur, sp_ids, app_ids, user_ids, device_ids))
-    entity_profiles = timed("build_entity_profiles",
-                            lambda: build_entity_profiles(
-                                graph, check_cfg, sp_ids, app_ids,
-                                group_roles=group_roles,
-                                group_eligible_roles=group_eligible_roles,
-                                sp_dir_resolver=sp_dir_resolver))
-    tenant_summary = timed("build_tenant_summary",
-                           lambda: build_tenant_summary(graph, results))
-    conn.close()
+    if cache_hit:
+        print(f"cache hit: skipping analysis (last analyzed {cached.get('generated_at')})")
+        results = cached["results"]
+        group_roles = cached.get("group_roles") or {}
+        group_eligible_roles = cached.get("group_eligible_roles") or {}
+        entity_details = cached.get("details") or {"sp": {}, "app": {}, "user": {}, "device": {}}
+        entity_profiles = cached.get("profiles2") or {"sp": {}, "app": {}}
+        records = cached.get("records") or []
+        tenant_summary = timed("build_tenant_summary",
+                               lambda: build_tenant_summary(graph, results))
+        conn.close()
+        diff = None
+        cache_meta = {"hit": True, "generated_at": cached.get("generated_at") or ""}
+    else:
+        print("cache miss: running full analysis")
+        # shared role resolution: computed once, reused by the checks, the
+        # severity bump, the entity profiles and the report embed
+        group_roles = timed("compute_group_roles",
+                            lambda: compute_group_roles(graph, check_cfg))
+        group_eligible_roles = timed("compute_group_eligible_roles",
+                                     lambda: compute_group_eligible_roles(graph, check_cfg))
+        sp_dir_resolver = make_sp_dir_resolver(graph, group_roles,
+                                               check_cfg["directory_roles"],
+                                               group_eligible_roles)
+        results = timed("run_checks",
+                        lambda: run_checks(graph, config_resources, check_cfg,
+                                           group_roles=group_roles,
+                                           group_eligible_roles=group_eligible_roles,
+                                           sp_dir_resolver=sp_dir_resolver))
+
+        sp_ids = set()
+        app_ids = set()
+        user_ids = set()
+        device_ids = set()
+        for res in results:
+            for f in res["findings"]:
+                o = f.get("object_ids") or {}
+                sp_ids |= o.get("sp", set())
+                app_ids |= o.get("app", set())
+                user_ids |= o.get("user", set())
+                device_ids |= o.get("device", set())
+        # owned objects / devices inside user profiles need cards too when clicked
+        for res in results:
+            if res["id"] != "privileged_users":
+                continue
+            for f in res["findings"]:
+                for obj in f.get("owned_objects", []):
+                    t = obj.get("type")
+                    if t == "Application":
+                        app_ids.add(obj.get("object_id"))
+                    elif t == "Service Principal":
+                        sp_ids.add(obj.get("object_id"))
+                for dev in f.get("devices", []):
+                    device_ids.add(dev.get("object_id"))
+        entity_details = timed(
+            "fetch_full_details",
+            lambda: fetch_full_details(cur, sp_ids, app_ids, user_ids, device_ids))
+        entity_profiles = timed("build_entity_profiles",
+                                lambda: build_entity_profiles(
+                                    graph, check_cfg, sp_ids, app_ids,
+                                    group_roles=group_roles,
+                                    group_eligible_roles=group_eligible_roles,
+                                    sp_dir_resolver=sp_dir_resolver))
+        tenant_summary = timed("build_tenant_summary",
+                               lambda: build_tenant_summary(graph, results))
+        records = build_serve_records(results)
+        diff = compute_diff(cached.get("results", []), results) if cached else None
+        conn.close()
+        cache_meta = {
+            "hit": False,
+            "fresh": cached is None,
+            "generated_at": now_iso(),
+            "previous_at": cached.get("generated_at") if cached else None,
+        }
+        save_cache(cache_path, {
+            "version": CACHE_VERSION,
+            "fingerprint": fingerprint,
+            "generated_at": cache_meta["generated_at"],
+            "results": results,
+            "tenant_summary": tenant_summary,
+            "group_roles": group_roles,
+            "group_eligible_roles": group_eligible_roles,
+            "profiles2": entity_profiles,
+            "details": entity_details,
+            "records": records,
+        })
 
     serve_tables = {}
     report_html = timed("render_report",
@@ -11521,7 +11728,8 @@ def main():
                                               tenant_summary, graph=graph,
                                               serve_tables=serve_tables,
                                               group_roles=group_roles,
-                                              group_eligible_roles=group_eligible_roles))
+                                              group_eligible_roles=group_eligible_roles,
+                                              cache_meta=cache_meta, diff=diff))
 
     total = sum(len(res["findings"]) for res in results)
 
@@ -11540,7 +11748,7 @@ def main():
         for f in res["findings"] if f.get("policy_id")}
     SERVE_STATE["details"] = {k: v for k, v in entity_details.items()
                               if k in ("sp", "app", "device", "user")}
-    SERVE_STATE["records"] = build_serve_records(results)
+    SERVE_STATE["records"] = records
     # Release the analysis working set before serving: everything the page
     # needs is embedded in the shell or held in SERVE_STATE above.
     del graph, results
