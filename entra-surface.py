@@ -1724,14 +1724,53 @@ def check_privileged_users(ctx):
         p = ensure(uid)
         p["roles"].extend(roles)
 
-    for ra in graph["directory_role_assigns"]:
-        pid = ra["principal_id"]
-        if pid in graph["sp"]:
-            sp = graph["sp"][pid]
-            name = def_name(ra["role_definition_id"])
-            for owner in graph["sp_owners"].get(pid, set()):
-                ensure(owner)["dir_sp_roles"].append(
-                    {"sp_name": sp_name(sp), "role": name, "severity": sev_of(name)})
+    # ---- directory roles on owned SPs (direct, legacy role membership, and
+    # group-inherited incl. nesting) ----------------------------------------
+    def sp_dir_roles(sp_oid):
+        """Active directory roles of an SP: direct assignments, classic role
+        memberships, and roles inherited through group memberships (nested)."""
+        merged = {}
+
+        def add(name):
+            if name not in merged:
+                merged[name] = name
+
+        for ra in graph["directory_role_assigns"]:
+            if ra["principal_id"] == sp_oid:
+                add(def_name(ra["role_definition_id"]))
+        for role_oid, sid in graph["role_member_sp"]:
+            if sid == sp_oid:
+                rec = graph["directory_role"].get(role_oid) or {}
+                add(rec.get("displayName") or role_oid)
+        stack = [gid for gid, sps in graph["group_member_sp"].items()
+                 if sp_oid in sps]
+        seen = set()
+        while stack:
+            gid = stack.pop()
+            if gid in seen:
+                continue
+            seen.add(gid)
+            for r in group_roles.get(gid) or []:
+                add(r["name"])
+            for parent, kids in graph["group_member_group"].items():
+                if gid in kids:
+                    stack.append(parent)
+        return list(merged.values())
+
+    for sp_oid, sp in graph["sp"].items():
+        names = sp_dir_roles(sp_oid)
+        if not names:
+            continue
+        entries = [{"sp_name": sp_name(sp), "role": name, "severity": sev_of(name)}
+                   for name in names]
+        owners = set(graph["sp_owners"].get(sp_oid, set()))
+        # owners of the app registration behind the SP inherit the same
+        # takeover (they can add credentials to the SP)
+        for a_oid in graph["app_by_appid"].get(sp.get("appId"), []):
+            owners |= graph["app_owners"].get(a_oid, set())
+        for owner in owners:
+            for entry in entries:
+                ensure(owner)["dir_sp_roles"].append(dict(entry))
 
     for ea in graph["eligible_role_assigns"]:
         pid = ea["principal_id"]
@@ -5002,14 +5041,16 @@ TABLE_SPECS = {
     "owned-table": {
         "family": "sp",
         "defaults": ["severity", "owner", "ownerUpn", "ownerStatus", "app",
-                     "pw", "keys", "resource", "permission", "spStatus"],
-        "extras": [("appId", "sp"), ("spType", "sp")] + USER_OWNER_EXTRAS,
+                     "resource", "permission", "spStatus"],
+        "extras": [("pw", "sp"), ("keys", "sp"),
+                   ("appId", "sp"), ("spType", "sp")] + USER_OWNER_EXTRAS,
     },
     "unowned-table": {
         "family": "sp",
-        "defaults": ["severity", "app", "pw", "keys", "resource",
+        "defaults": ["severity", "app", "resource",
                      "permission", "spStatus"],
-        "extras": [("appId", "sp"), ("spType", "sp")],
+        "extras": [("pw", "sp"), ("keys", "sp"),
+                   ("appId", "sp"), ("spType", "sp")],
     },
     "table-ca_exposure": {
         "family": "policy",
@@ -8470,6 +8511,17 @@ def render_report(results, tenant_name, db_path, config_path,
     html += pSection('Service principals with directory roles (owned)', pList(p.dir_sp_roles, function(s) {{
       return '<li>' + pEsc(s.sp_name) + ' — ' + pEsc(s.role) + ' ' + pSev(s.severity) + '</li>';
     }}));
+    var ownedCap = p.owned_cap || [];
+    html += pSection('Owned role-capable groups (' + ownedCap.length + ')',
+        ownedCap.length
+            ? '<ul class="profile-list">' + ownedCap.map(function(g) {{
+                var roles = (g.roles || []).map(function(r) {{
+                  return pSev(r.severity) + ' ' + pEsc(r.name);
+                }}).join(' &nbsp;&middot;&nbsp; ');
+                return '<li><b>' + pEsc(g.name) + '</b>'
+                    + (roles ? ' &mdash; ' + roles : '') + '</li>';
+              }}).join('') + '</ul>'
+            : '<p class="muted">None.</p>');
     var gl = (p.groups || []);
     var groupsHtml = '';
     if (gl.length) {{
@@ -8785,6 +8837,7 @@ def render_report(results, tenant_name, db_path, config_path,
   function renderApp(oid, body) {{
     fetchSpApp(oid, 'app', body);
   }}
+
 }})();
 
 (function() {{
