@@ -28,6 +28,7 @@ Analysis is cached in `.entra-surface.cache`: unchanged re-runs skip analysis en
 | `--azure-config` | Azure RBAC role config (default: `azure_roles.json`) |
 | `--port` | Port to serve on (default: `8787`) |
 | `--refresh` | Ignore the cache and re-run the full analysis |
+| `--no-cache` | Disable the analysis cache entirely |
 | `--timing` | Print per-phase timings and peak memory |
 
 ## Report

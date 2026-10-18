@@ -7049,7 +7049,9 @@ def render_report(results, tenant_name, db_path, config_path,
     # ---- cache / diff chips ------------------------------------------------
     if cache_meta:
         at = cache_meta.get("generated_at") or ""
-        if cache_meta.get("hit"):
+        if cache_meta.get("off"):
+            bar.append(item("Cache", "<b>off</b>", "caching disabled (--no-cache)"))
+        elif cache_meta.get("hit"):
             bar.append(item("Cache", "<b>hit</b>", f"last analyzed {at}"))
         else:
             label = "created" if cache_meta.get("fresh") else "updated"
@@ -11634,15 +11636,25 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                        "application/json; charset=utf-8", 500)
 
 
-def start_serve(port, total=None):
+def start_serve(port, total=None, after_start=None):
+    """Start the HTTP server (in a daemon thread), optionally run a callback
+    (e.g. the cache write) once it is accepting connections, then idle until
+    Ctrl+C. Serving first keeps the report usable while the cache is written."""
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), AuditServeHandler)
     count = f" ({total} findings)" if total else ""
-    print(f"Serving audit report{count} on http://127.0.0.1:{port} (Ctrl+C to stop)")
+    print(f"Serving audit report{count} on http://127.0.0.1:{port} (Ctrl+C to stop)",
+          flush=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    if after_start:
+        after_start()
     try:
-        server.serve_forever()
+        while True:
+            time.sleep(3600)
     except KeyboardInterrupt:
         print("\nstopped")
     finally:
+        server.shutdown()
         server.server_close()
 
 
@@ -11750,6 +11762,8 @@ def main():
                         help="Port to serve the report on (default: 8787)")
     parser.add_argument("--refresh", action="store_true",
                         help="Ignore the cache and re-run the full analysis")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Disable the analysis cache entirely: never read or write it")
     parser.add_argument("--timing", action="store_true",
                         help="Print per-phase timings and peak memory at the end of the run")
     args = parser.parse_args()
@@ -11789,7 +11803,7 @@ def main():
 
     cache_path = Path(CACHE_FILENAME)
     fingerprint = compute_db_fingerprint(db_path, cur)
-    cached = None if args.refresh else load_cache(cache_path)
+    cached = None if (args.refresh or args.no_cache) else load_cache(cache_path)
     cache_hit = bool(
         cached and cached.get("version") == CACHE_VERSION
         and cached.get("fingerprint") == fingerprint)
@@ -11834,19 +11848,13 @@ def main():
         conn.close()
         cache_meta = {
             "hit": False,
-            "fresh": cached is None,
+            "off": args.no_cache,
+            "fresh": cached is None and not args.no_cache,
             "generated_at": now_iso(),
             "previous_at": cached.get("generated_at") if cached else None,
         }
-        save_cache(cache_path, {
-            "version": CACHE_VERSION,
-            "fingerprint": fingerprint,
-            "generated_at": cache_meta["generated_at"],
-            "results": results,
-            "tenant_summary": tenant_summary,
-            "group_roles": group_roles,
-            "group_eligible_roles": group_eligible_roles,
-        })
+        # the cache is written after the server starts accepting connections
+        # (see start_serve(after_start=...) below)
 
     serve_tables = {}
     report_html = timed("render_report",
@@ -11879,12 +11887,30 @@ def main():
     SERVE_STATE["group_roles"] = group_roles
     SERVE_STATE["group_eligible_roles"] = group_eligible_roles
     SERVE_STATE["profile_builder"] = None
-    del results
     gc.collect()
     if args.timing:
         import resource
         print(f"[timing] peak RSS: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.0f} MB")
-    start_serve(args.port, total)
+    if args.no_cache or cache_hit:
+        start_serve(args.port, total)
+    else:
+        def write_cache_now():
+            print(f"Writing analysis cache to {cache_path}...", flush=True)
+            save_cache(cache_path, {
+                "version": CACHE_VERSION,
+                "fingerprint": fingerprint,
+                "generated_at": cache_meta["generated_at"],
+                "results": results,
+                "tenant_summary": tenant_summary,
+                "group_roles": group_roles,
+                "group_eligible_roles": group_eligible_roles,
+            })
+            try:
+                size = cache_path.stat().st_size
+                print(f"Analysis cache written ({size:,} bytes)", flush=True)
+            except OSError:
+                print("Analysis cache written", flush=True)
+        start_serve(args.port, total, after_start=write_cache_now)
     return 0
 
 
