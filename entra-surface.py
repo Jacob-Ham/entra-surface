@@ -11675,38 +11675,41 @@ def compute_db_fingerprint(db_path, cur):
     return parts
 
 
-def _cacheable(v):
-    if isinstance(v, set):
-        return {"__set__": sorted(v, key=str)}
-    if isinstance(v, dict):
-        return {str(k): _cacheable(x) for k, x in v.items()}
-    if isinstance(v, (list, tuple)):
-        return [_cacheable(x) for x in v]
-    return v
+def _json_default(obj):
+    if isinstance(obj, set):
+        return sorted(obj, key=str)
+    return str(obj)
 
 
-def _uncache(v):
-    if isinstance(v, dict):
-        if set(v) == {"__set__"}:
-            return set(v["__set__"])
-        return {k: _uncache(x) for k, x in v.items()}
-    if isinstance(v, list):
-        return [_uncache(x) for x in v]
-    return v
+def _restore_object_ids(results):
+    """JSON has no sets: turn object_ids list values back into sets in place
+    (the only set-bearing field in findings)."""
+    for res in results or []:
+        for f in res.get("findings") or []:
+            o = f.get("object_ids")
+            if isinstance(o, dict):
+                f["object_ids"] = {k: set(v) for k, v in o.items()}
 
 
 def save_cache(path, payload):
+    """Stream the payload to the cache file in small chunks (no full deep
+    copy or monolithic string), keeping the save-time memory spike flat."""
     try:
-        path.write_text(json.dumps(_cacheable(payload), separators=(",", ":")))
+        with open(path, "w", encoding="utf-8") as fh:
+            for chunk in json.JSONEncoder(default=_json_default,
+                                          separators=(",", ":")).iterencode(payload):
+                fh.write(chunk)
     except OSError as exc:
         print(f"warning: could not write cache: {exc}", file=sys.stderr)
 
 
 def load_cache(path):
     try:
-        return _uncache(json.loads(path.read_text()))
+        payload = json.loads(path.read_text())
     except (OSError, ValueError):
         return None
+    _restore_object_ids(payload.get("results"))
+    return payload
 
 
 def compute_diff(old_results, new_results):
