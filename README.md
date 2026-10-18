@@ -17,7 +17,7 @@ python3 entra-surface.py --db roadrecon.db
 
 Opens `http://127.0.0.1:8787`. Startup takes a few minutes on large tenants.
 
-Analysis is cached in `cache.json`: unchanged re-runs skip analysis entirely, and changed databases are diffed against the previous run. `--refresh` forces a full reanalysis.
+Analysis is cached in `.entra-surface.cache`: unchanged re-runs skip analysis entirely, and changed databases are diffed against the previous run. `--refresh` forces a full reanalysis.
 
 ### Options
 

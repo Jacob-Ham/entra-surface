@@ -55,6 +55,7 @@ Checks (config: privileged_roles.json -> "checks"):
 import argparse
 import datetime
 import gc
+import gzip
 import html
 import http.server
 import json
@@ -11649,12 +11650,12 @@ def start_serve(port, total=None):
 # Analysis cache + run-to-run diff
 # ---------------------------------------------------------------------------
 # The first run analyzes the tenant and stores the outcomes (findings, derived
-# drawer data, group-role resolution) in ./cache.json. Later launches reuse it
+# drawer data, group-role resolution) in ./.entra-surface.cache. Later launches reuse it
 # when the database fingerprint is unchanged; when the database changed, the
 # new analysis is diffed against the cached one and surfaced in the report.
 
 CACHE_VERSION = 2
-CACHE_FILENAME = "cache.json"
+CACHE_FILENAME = ".entra-surface.cache"
 
 CACHE_FINGERPRINT_TABLES = (
     "Users", "ServicePrincipals", "Applications", "Groups", "Devices",
@@ -11693,9 +11694,10 @@ def _restore_object_ids(results):
 
 def save_cache(path, payload):
     """Stream the payload to the cache file in small chunks (no full deep
-    copy or monolithic string), keeping the save-time memory spike flat."""
+    copy or monolithic string) and gzip it — findings JSON compresses very
+    well, keeping the save-time memory spike flat and the file small."""
     try:
-        with open(path, "w", encoding="utf-8") as fh:
+        with gzip.open(path, "wt", encoding="utf-8") as fh:
             for chunk in json.JSONEncoder(default=_json_default,
                                           separators=(",", ":")).iterencode(payload):
                 fh.write(chunk)
@@ -11705,7 +11707,12 @@ def save_cache(path, payload):
 
 def load_cache(path):
     try:
-        payload = json.loads(path.read_text())
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as fh:
+                payload = json.loads(fh.read())
+        except (OSError, ValueError):
+            # older caches were written uncompressed
+            payload = json.loads(path.read_text())
     except (OSError, ValueError):
         return None
     _restore_object_ids(payload.get("results"))
