@@ -7443,6 +7443,11 @@ def render_report(results, tenant_name, db_path, config_path,
     font-family: inherit; font-size: 12px; text-align: left;
   }}
   .drawer-back-row {{ margin: 0 0 6px; }}
+  .list-more-btn {{
+    font-size: 11.5px; font-family: inherit; background: none; border: none;
+    color: var(--accent); cursor: pointer; padding: 2px 0;
+  }}
+  .list-more-btn:hover {{ text-decoration: underline; }}
   tr.drawer {{ display: none; }}
   tr.drawer.open {{ display: table-row; }}
   tr.drawer td {{ padding: 8px 12px 12px; background: var(--page-plane); }}
@@ -8370,7 +8375,7 @@ def render_report(results, tenant_name, db_path, config_path,
   }}
 
   function renderProfileTabs(p, container) {{
-    var overview = openProfileHtml(p) + '<div class="user-desc"></div>';
+    var overview = '<div class="user-desc"></div>' + openProfileHtml(p);
     var ownedLinks = (p.owned_objects || []).map(function(o) {{
       var isGroup = o.type === 'Group';
       var grants = (o.grants && o.grants.length)
@@ -8388,12 +8393,18 @@ def render_report(results, tenant_name, db_path, config_path,
       }};
     }});
     var ownedHtml = ownedLinks.length
-        ? '<table class="minor-table"><thead><tr><th>Type</th><th>Name</th><th>ObjectId</th><th>AppId</th><th>Privileged grants</th><th>Credentials</th><th>Status</th></tr></thead><tbody>'
-          + ownedLinks.map(function(r) {{
-              return '<tr><td>' + pEsc(r.type) + '</td><td>' + r.name + '</td>'
-                + '<td class="mono">' + pEsc(r.object_id) + '</td><td class="mono">' + pEsc(r.app_id) + '</td>'
-                + '<td>' + pEsc(r.grants) + '</td><td>' + pEsc(r.creds) + '</td><td>' + pEsc(r.status) + '</td></tr>';
-            }}).join('') + '</tbody></table>'
+        ? cappedTableHtml(
+            [['Type', 'type'], ['Name', 'name'], ['ObjectId', 'object_id'],
+             ['AppId', 'app_id'], ['Privileged grants', 'grants'],
+             ['Credentials', 'creds'], ['Status', 'status']],
+            ownedLinks.map(function(r) {{
+              return ['<td>' + pEsc(r.type) + '</td>', '<td>' + r.name + '</td>',
+                      '<td class="mono">' + pEsc(r.object_id) + '</td>',
+                      '<td class="mono">' + pEsc(r.app_id) + '</td>',
+                      '<td>' + pEsc(r.grants) + '</td>',
+                      '<td>' + pEsc(r.creds) + '</td>',
+                      '<td>' + pEsc(r.status) + '</td>'];
+            }}))
         : '<p class="muted">No owned objects recorded.</p>';
     var deviceLinks = (p.devices || []).map(function(d) {{
       return {{
@@ -8406,11 +8417,16 @@ def render_report(results, tenant_name, db_path, config_path,
       }};
     }});
     var devicesHtml = deviceLinks.length
-        ? '<table class="minor-table"><thead><tr><th>Device</th><th>ObjectId</th><th>OS</th><th>AD-bound</th><th>Last logon</th><th>Status</th></tr></thead><tbody>'
-          + deviceLinks.map(function(r) {{
-              return '<tr><td>' + r.name + '</td><td class="mono">' + pEsc(r.object_id) + '</td><td>' + pEsc(r.os) + '</td>'
-                + '<td>' + pEsc(r.ad) + '</td><td>' + pEsc(r.last_logon) + '</td><td>' + pEsc(r.status) + '</td></tr>';
-            }}).join('') + '</tbody></table>'
+        ? cappedTableHtml(
+            [['Device', 'name'], ['ObjectId', 'object_id'], ['OS', 'os'],
+             ['AD-bound', 'ad'], ['Last logon', 'last_logon'], ['Status', 'status']],
+            deviceLinks.map(function(r) {{
+              return ['<td>' + r.name + '</td>',
+                      '<td class="mono">' + pEsc(r.object_id) + '</td>',
+                      '<td>' + pEsc(r.os) + '</td>', '<td>' + pEsc(r.ad) + '</td>',
+                      '<td>' + pEsc(r.last_logon) + '</td>',
+                      '<td>' + pEsc(r.status) + '</td>'];
+            }}))
         : '<p class="muted">No devices recorded for this user.</p>';
     var uid = p.user_id || '';
     var rawPane = '<div class="user-raw" data-user-raw="' + pEsc(uid) + '"><p class="muted">Loading\u2026</p></div>';
@@ -8533,44 +8549,96 @@ def render_report(results, tenant_name, db_path, config_path,
     }});
   }}
 
+  var LIST_CAP = 10;
+
+  function cappedListHtml(items, renderFn) {{
+    if (!items || !items.length) return '<p class="muted">None.</p>';
+    var lis = items.map(renderFn);
+    if (lis.length <= LIST_CAP) {{
+      return '<ul class="profile-list">' + lis.join('') + '</ul>';
+    }}
+    return '<ul class="profile-list">' + lis.slice(0, LIST_CAP).join('') + '</ul>'
+        + '<ul class="profile-list hidden" data-list-more="1">'
+        + lis.slice(LIST_CAP).join('') + '</ul>'
+        + '<button type="button" class="list-more-btn" data-list-more-btn="1">'
+        + 'Show all (' + lis.length + ')</button>';
+  }}
+
+  function cappedTableHtml(headers, rows) {{
+    function tableHtml(r) {{
+      return '<table class="minor-table"><thead><tr>'
+          + headers.map(function(c) {{ return '<th>' + pEsc(c[0]) + '</th>'; }}).join('')
+          + '</tr></thead><tbody>'
+          + r.map(function(row) {{
+              return '<tr>' + row.map(function(c) {{ return '<td>' + c + '</td>'; }}).join('') + '</tr>';
+            }}).join('')
+          + '</tbody></table>';
+    }}
+    if (rows.length <= LIST_CAP) return tableHtml(rows);
+    return '<div>' + tableHtml(rows.slice(0, LIST_CAP))
+        + '<div class="hidden" data-table-more="1">' + tableHtml(rows.slice(LIST_CAP)) + '</div>'
+        + '<button type="button" class="list-more-btn" data-table-more-btn="1">'
+        + 'Show all (' + rows.length + ')</button></div>';
+  }}
+
+  // "Show all" buttons expand the hidden remainder of a capped list/table
+  document.addEventListener('click', function(e) {{
+    var btn = e.target.closest('.list-more-btn');
+    if (!btn) return;
+    var sec = btn.parentElement;
+    var more = sec && sec.querySelector('ul[data-list-more="1"], div[data-table-more="1"]');
+    if (more) {{
+      more.classList.remove('hidden');
+      btn.remove();
+    }}
+  }});
+
   function openProfileHtml(p) {{
+    function groupRank(g) {{
+      return (g.roles && g.roles.length) ? 2 : (g.capable ? 1 : 0);
+    }}
     var html = '';
-    html += pSection('Directory roles', pList(p.roles, function(r) {{
+    html += pSection('Directory roles', cappedListHtml(p.roles, function(r) {{
       return '<li>' + pSev(r.severity) + ' ' + pEsc(r.name) + ' <span class="muted">(' + pEsc(r.source) + ')</span></li>';
     }}));
-    html += pSection('Eligible (PIM) roles', pList(p.eligible_roles, function(r) {{
+    html += pSection('Eligible (PIM) roles', cappedListHtml(p.eligible_roles, function(r) {{
       return '<li>' + pSev(r.severity) + ' ' + pEsc(r.name) + '</li>';
     }}));
-    html += pSection('Privileged objects owned', pList(p.priv_apps, function(a) {{
+    html += pSection('Privileged objects owned', cappedListHtml(p.priv_apps, function(a) {{
       var grants = a.grants.map(function(g) {{
         return '<li>' + pEsc(g.permission) + ' <span class="muted">→ ' + pEsc(g.resource) + '</span> ' + pSev(g.severity) + '</li>';
       }}).join('');
       return '<li><b>' + pEsc(a.app_name) + '</b><ul>' + grants + '</ul></li>';
     }}));
-    html += pSection('Service principals with directory roles (owned)', pList(p.dir_sp_roles, function(s) {{
+    html += pSection('Service principals with directory roles (owned)', cappedListHtml(p.dir_sp_roles, function(s) {{
       return '<li>' + pEsc(s.sp_name) + ' — ' + pEsc(s.role) + ' ' + pSev(s.severity) + '</li>';
     }}));
-    var ownedCap = p.owned_cap || [];
+    var ownedCap = (p.owned_cap || []).slice().sort(function(a, b) {{
+      var ra = groupRank(a), rb = groupRank(b);
+      if (ra !== rb) return rb - ra;
+      return (a.name || '').toLowerCase() < (b.name || '').toLowerCase() ? -1 : 1;
+    }});
     html += pSection('Owned role-capable groups (' + ownedCap.length + ')',
-        ownedCap.length
-            ? '<ul class="profile-list">' + ownedCap.map(function(g) {{
-                var roles = (g.roles || []).map(function(r) {{
-                  return pSev(r.severity) + ' ' + pEsc(r.name);
-                }}).join(' &nbsp;&middot;&nbsp; ');
-                return '<li><b>' + pEsc(g.name) + '</b>'
-                    + (roles ? ' &mdash; ' + roles : '') + '</li>';
-              }}).join('') + '</ul>'
-            : '<p class="muted">None.</p>');
-    var gl = (p.groups || []);
-    var groupsHtml = '';
-    if (gl.length) {{
-      groupsHtml = '<ul class="profile-list">' + gl.map(function(g) {{
-        var extra = '';
-        if (g.capable) extra += ' <span class="tag-chip tag-privileged" title="Role-capable group (assignable to directory roles / role-bearing)">role-capable</span>';
-        if (g.roles && g.roles.length) extra += ' <span class="muted">— ' + g.roles.map(function(r) {{ return r.name; }}).join(', ') + '</span>';
-        return '<li><button type="button" class="dtab-sp-link obj-link" data-obj-id="' + pEsc(g.group_id) + '" data-obj-kind="group">' + pEsc(g.name) + '</button>' + extra + '</li>';
-      }}).join('') + '</ul>';
-    }} else {{
+        cappedListHtml(ownedCap, function(g) {{
+          var roles = (g.roles || []).map(function(r) {{
+            return pSev(r.severity) + ' ' + pEsc(r.name);
+          }}).join(' &nbsp;&middot;&nbsp; ');
+          return '<li><b>' + pEsc(g.name) + '</b>'
+              + (roles ? ' &mdash; ' + roles : '') + '</li>';
+        }}));
+    // role-bearing groups first, then role-capable, then alphabetical
+    var gl = (p.groups || []).slice().sort(function(a, b) {{
+      var ra = groupRank(a), rb = groupRank(b);
+      if (ra !== rb) return rb - ra;
+      return (a.name || '').toLowerCase() < (b.name || '').toLowerCase() ? -1 : 1;
+    }});
+    var groupsHtml = cappedListHtml(gl, function(g) {{
+      var extra = '';
+      if (g.capable) extra += ' <span class="tag-chip tag-privileged" title="Role-capable group (assignable to directory roles / role-bearing)">role-capable</span>';
+      if (g.roles && g.roles.length) extra += ' <span class="muted">— ' + g.roles.map(function(r) {{ return r.name; }}).join(', ') + '</span>';
+      return '<li><button type="button" class="dtab-sp-link obj-link" data-obj-id="' + pEsc(g.group_id) + '" data-obj-kind="group">' + pEsc(g.name) + '</button>' + extra + '</li>';
+    }});
+    if (!gl.length) {{
       groupsHtml = '<p class="muted">Not a member of any captured group.</p>';
     }}
     if (p.owned_count) {{
@@ -8579,12 +8647,10 @@ def render_report(results, tenant_name, db_path, config_path,
       groupsHtml += '</p>';
     }}
     html += pSection('Groups (' + gl.length + ')', groupsHtml);
-    var caHtml = (p.ca_exclusions && p.ca_exclusions.length)
-        ? '<ul class="profile-list">' + p.ca_exclusions.map(function(x) {{
-            return '<li><button type="button" class="dtab-sp-link ca-link" data-ca-name="' + pEsc(x.name) + '">' + pEsc(x.name) + '</button> <span class="muted">(' + pEsc(x.state || '?') + ')</span></li>';
-          }}).join('') + '</ul>'
-        : '';
-    html += pSection('CA exclusions (' + (p.ca_exclusions ? p.ca_exclusions.length : 0) + ')', caHtml);
+    html += pSection('CA exclusions (' + (p.ca_exclusions ? p.ca_exclusions.length : 0) + ')',
+        cappedListHtml(p.ca_exclusions, function(x) {{
+          return '<li><button type="button" class="dtab-sp-link ca-link" data-ca-name="' + pEsc(x.name) + '">' + pEsc(x.name) + '</button> <span class="muted">(' + pEsc(x.state || '?') + ')</span></li>';
+        }}));
     var bits = [];
     if (p.hybrid) bits.push('On-prem synced');
     if (p.user_type === 'Guest') bits.push('Guest user');
@@ -8876,6 +8942,8 @@ def render_report(results, tenant_name, db_path, config_path,
   function renderApp(oid, body) {{
     fetchSpApp(oid, 'app', body);
   }}
+
+  window.__renderProfileTabs = renderProfileTabs;
 
 }})();
 
