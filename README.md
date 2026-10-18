@@ -2,6 +2,8 @@
 
 Entra ID attack-surface report from a [ROADrecon](https://github.com/dirkjanm/ROADtools) database. Runs a registry of checks over the tenant data and serves a sortable, filterable HTML report with drilldowns.
 
+<img width="1384" height="808" alt="image" src="https://github.com/user-attachments/assets/18f39b77-cd95-468b-9bcb-989b336af9c9" />
+
 ## Requirements
 
 - Python 3 (stdlib only)
