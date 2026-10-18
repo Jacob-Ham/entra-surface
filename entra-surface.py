@@ -3940,12 +3940,14 @@ def fetch_full_details(cur, sp_ids, app_ids, user_ids, device_ids=None):
     }
 
 
-def build_entity_profiles(graph, check_cfg, sp_ids, app_ids,
-                          group_roles=None, group_eligible_roles=None,
-                          sp_dir_resolver=None):
-    """Relationship data for the tabbed SP/app 'more info' drawer:
-    owners, directory roles, group memberships, and the two app-role views
-    (roles this principal grants to others / roles granted to it)."""
+def make_profile_builder(graph, check_cfg, group_roles=None, group_eligible_roles=None,
+                         sp_dir_resolver=None):
+    """On-demand builder for the tabbed SP/app 'more info' drawer profiles.
+
+    Indexes the app-role assignment list (by resource and by principal) and
+    the group memberships (SP -> groups) once, so building a single profile
+    costs O(roles of that principal) instead of full-table scans. Profiles are
+    memoized; the batch wrapper build_entity_profiles() uses this builder."""
     role_sev = check_cfg["directory_roles"]
     role_labels = check_cfg.get("role_labels") or {}
     if group_roles is None:
@@ -3955,7 +3957,19 @@ def build_entity_profiles(graph, check_cfg, sp_ids, app_ids,
     if sp_dir_resolver is None:
         sp_dir_resolver = make_sp_dir_resolver(graph, group_roles, role_sev,
                                                group_eligible_roles)
-    app_roles_cache = {}  # sp_oid -> {role_id: {value, description}}
+    app_roles_cache = {}   # sp_oid -> {role_id: {value, description}}
+    profile_cache = {}     # sp_oid / app_oid -> profile
+
+    ra_by_resource = defaultdict(list)
+    ra_by_principal = defaultdict(list)
+    for ra in graph["role_assigns"]:
+        ra_by_resource[ra["resource_id"]].append(ra)
+        if ra["principal_type"] == "ServicePrincipal":
+            ra_by_principal[ra["principal_id"]].append(ra)
+    sp_groups = defaultdict(list)
+    for gid, members in graph["group_member_sp"].items():
+        for sid in members:
+            sp_groups[sid].append(gid)
 
     def catalog_entry(value, description):
         return {"value": value,
@@ -4002,7 +4016,7 @@ def build_entity_profiles(graph, check_cfg, sp_ids, app_ids,
 
     def groups_for(sp_oid):
         return [{"name": graph["group"][g].get("displayName") or g}
-                for g, members in graph["group_member_sp"].items() if sp_oid in members]
+                for g in sp_groups.get(sp_oid, ())]
 
     def owners_for(sp_oid, app_oids):
         owner_ids = set()
@@ -4029,34 +4043,37 @@ def build_entity_profiles(graph, check_cfg, sp_ids, app_ids,
             return role["value"]
         return role_id
 
-    def profile_for(sp_oid):
+    def sp_profile(sp_oid):
+        if sp_oid in profile_cache:
+            return profile_cache[sp_oid]
+        if sp_oid not in graph["sp"]:
+            return None
         granted = []   # roles this SP exposes, held by other principals
+        for ra in ra_by_resource.get(sp_oid, ()):
+            role = resource_roles(sp_oid).get(ra["app_role_id"])
+            granted.append({
+                "principal_name": principal_label(ra["principal_id"], ra["principal_type"]),
+                "principal_type": ra["principal_type"] or "ServicePrincipal",
+                "role": role_label(sp_oid, ra["app_role_id"]),
+                "description": role["description"] if role else "",
+            })
         assigned = []  # roles other SPs expose, held by this SP
-        for ra in graph["role_assigns"]:
-            if ra["resource_id"] == sp_oid:
-                role = resource_roles(sp_oid).get(ra["app_role_id"])
-                granted.append({
-                    "principal_name": principal_label(ra["principal_id"], ra["principal_type"]),
-                    "principal_type": ra["principal_type"] or "ServicePrincipal",
-                    "role": role_label(sp_oid, ra["app_role_id"]),
-                    "description": role["description"] if role else "",
-                })
-            elif ra["principal_id"] == sp_oid and ra["principal_type"] == "ServicePrincipal":
-                resource_rec = graph["sp"].get(ra["resource_id"])
-                role = resource_roles(ra["resource_id"]).get(ra["app_role_id"])
-                resource_app = app_label(resource_rec.get("appId")) if resource_rec else ""
-                assigned.append({
-                    "principal_name": sp_label(sp_oid),
-                    "principal_type": "ServicePrincipal",
-                    "role": role_label(ra["resource_id"], ra["app_role_id"]),
-                    "application": resource_app or sp_label(ra["resource_id"]),
-                    "description": role["description"] if role else "",
-                })
+        for ra in ra_by_principal.get(sp_oid, ()):
+            resource_rec = graph["sp"].get(ra["resource_id"])
+            role = resource_roles(ra["resource_id"]).get(ra["app_role_id"])
+            resource_app = app_label(resource_rec.get("appId")) if resource_rec else ""
+            assigned.append({
+                "principal_name": sp_label(sp_oid),
+                "principal_type": "ServicePrincipal",
+                "role": role_label(ra["resource_id"], ra["app_role_id"]),
+                "application": resource_app or sp_label(ra["resource_id"]),
+                "description": role["description"] if role else "",
+            })
         granted.sort(key=lambda r: (r["principal_name"] or "").lower())
         assigned.sort(key=lambda r: (r["role"] or "").lower())
         app_oids = graph["app_by_appid"].get(graph["sp"][sp_oid].get("appId"), []) if sp_oid in graph["sp"] else []
         application = (graph["app"][app_oids[0]].get("displayName") or "") if app_oids else ""
-        return {
+        prof = {
             "kind": "sp",
             "application": application,
             "app_oid": app_oids[0] if app_oids else "",
@@ -4068,21 +4085,20 @@ def build_entity_profiles(graph, check_cfg, sp_ids, app_ids,
             "az_roles": sorted(graph["az_sp_roles"].get(sp_oid, []),
                                key=lambda a: (a.get("eligible", False), a["role"].lower())),
         }
+        profile_cache[sp_oid] = prof
+        return prof
 
-    profiles = {"sp": {}, "app": {}}
-    for sp_oid in sorted(sp_ids):
-        if sp_oid in graph["sp"]:
-            profiles["sp"][sp_oid] = profile_for(sp_oid)
-
-    for app_oid in sorted(app_ids):
+    def app_profile(app_oid):
+        if app_oid in profile_cache:
+            return profile_cache[app_oid]
         app = graph["app"].get(app_oid)
         if not app:
-            continue
+            return None
         sp_oids = graph["sp_by_appid"].get(app.get("appId"), [])
         granted, assigned, dir_roles, groups = [], [], [], []
         owner_ids = set(graph["app_owners"].get(app_oid, set()))
         for sp_oid in sp_oids:
-            prof = profile_for(sp_oid)
+            prof = sp_profile(sp_oid)
             granted += prof["granted_roles"]
             assigned += prof["assigned_roles"]
             dir_roles += prof["dir_roles"]
@@ -4132,7 +4148,7 @@ def build_entity_profiles(graph, check_cfg, sp_ids, app_ids,
                                  or sp_oid) if sp_rec else sp_oid,
                 "app_id": (sp_rec.get("appId") or "") if sp_rec else "",
             })
-        profiles["app"][app_oid] = {
+        entry = {
             "kind": "app",
             "application": app.get("displayName") or app_oid,
             "owners": owner_list,
@@ -4144,6 +4160,26 @@ def build_entity_profiles(graph, check_cfg, sp_ids, app_ids,
             "sp_oids": sp_oids,
             "sp_list": sp_list,
         }
+        profile_cache[app_oid] = entry
+        return entry
+
+    return {"sp": sp_profile, "app": app_profile}
+
+
+def build_entity_profiles(graph, check_cfg, sp_ids, app_ids,
+                          group_roles=None, group_eligible_roles=None,
+                          sp_dir_resolver=None):
+    """Relationship data for every referenced SP/app drawer profile (batch
+    wrapper around make_profile_builder)."""
+    builder = make_profile_builder(graph, check_cfg, group_roles,
+                                   group_eligible_roles, sp_dir_resolver)
+    profiles = {"sp": {}, "app": {}}
+    for sp_oid in sorted(sp_ids):
+        if sp_oid in graph["sp"]:
+            profiles["sp"][sp_oid] = builder["sp"](sp_oid)
+    for app_oid in sorted(app_ids):
+        if app_oid in graph["app"]:
+            profiles["app"][app_oid] = builder["app"](app_oid)
     return profiles
 
 
@@ -9913,7 +9949,13 @@ def build_tenant_summary(graph, results=None):
 SERVE_STATE = {"shell": "", "user_findings": [], "tables": {},
                "profiles2": {"sp": {}, "app": {}}, "group_profiles": {},
                "policy_profiles": {}, "details": {"sp": {}, "app": {}, "device": {}},
-               "records": [], "db_path": None, "ca_analysis": None}
+               "records": [], "db_path": None, "ca_analysis": None,
+               "graph": {}, "check_cfg": {}, "group_roles": {},
+               "group_eligible_roles": {}, "profile_builder": None,
+               "profiles_lru": {}, "details_lru": {}}
+
+PROFILE_LRU_MAX = 4000
+DETAIL_LRU_MAX = 4000
 
 # ---- server-side drilldown (mirrors the DOM record model + DRILLDOWN_COLUMNS) --
 
@@ -10253,11 +10295,63 @@ def serve_table_response(table_id, qs):
     return payload, 200
 
 
+def _lru_get(cache, key):
+    if key in cache:
+        value = cache[key]
+        del cache[key]
+        cache[key] = value  # move to most-recently-used end
+        return value
+    return None
+
+
+def _lru_put(cache, key, value, max_size):
+    cache[key] = value
+    while len(cache) > max_size:
+        cache.pop(next(iter(cache)))
+
+
+def _profile_builder():
+    if SERVE_STATE.get("profile_builder") is None:
+        graph = SERVE_STATE.get("graph") or {}
+        check_cfg = SERVE_STATE.get("check_cfg") or {}
+        builder = make_profile_builder(graph, check_cfg,
+                                       SERVE_STATE.get("group_roles") or {},
+                                       SERVE_STATE.get("group_eligible_roles") or {})
+        SERVE_STATE["profile_builder"] = builder
+    return SERVE_STATE["profile_builder"]
+
+
+def _fetch_one_detail(kind, oid):
+    """One raw record (with Arc enrichment) read from the collected database.
+    The DB is opened read-only per request; results are LRU-cached."""
+    db_path = SERVE_STATE.get("db_path")
+    if not db_path:
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cur = con.cursor()
+        recs = fetch_full_details(cur,
+                                  {oid} if kind == "sp" else set(),
+                                  {oid} if kind == "app" else set(),
+                                  {oid} if kind == "user" else set(),
+                                  {oid} if kind == "device" else set())
+        con.close()
+        return (recs.get(kind) or {}).get(oid)
+    except sqlite3.Error:
+        return None
+
+
 def serve_profile_response(kind, oid):
     if kind == "user":
         prof = next((f for f in SERVE_STATE["user_findings"] if f.get("user_id") == oid), None)
     elif kind in ("sp", "app"):
-        prof = SERVE_STATE["profiles2"].get(kind, {}).get(oid)
+        cache = SERVE_STATE["profiles_lru"]
+        prof = _lru_get(cache, (kind, oid))
+        if prof is None:
+            builder = _profile_builder()
+            prof = builder[kind](oid)
+            if prof is not None:
+                _lru_put(cache, (kind, oid), prof, PROFILE_LRU_MAX)
     elif kind == "group":
         prof = SERVE_STATE["group_profiles"].get(oid)
     elif kind == "policy":
@@ -10270,7 +10364,14 @@ def serve_profile_response(kind, oid):
 
 
 def serve_details_response(kind, oid):
-    rec = SERVE_STATE["details"].get(kind, {}).get(oid)
+    if kind not in ("sp", "app", "user", "device"):
+        return {"error": f"unknown detail kind: {kind}"}, 400
+    cache = SERVE_STATE["details_lru"]
+    rec = _lru_get(cache, (kind, oid))
+    if rec is None:
+        rec = _fetch_one_detail(kind, oid)
+        if rec is not None:
+            _lru_put(cache, (kind, oid), rec, DETAIL_LRU_MAX)
     if rec is None:
         return {"error": "not found"}, 404
     return rec, 200
@@ -11552,7 +11653,7 @@ def start_serve(port, total=None):
 # when the database fingerprint is unchanged; when the database changed, the
 # new analysis is diffed against the cached one and surfaced in the report.
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 CACHE_FILENAME = "cache.json"
 
 CACHE_FINGERPRINT_TABLES = (
@@ -11693,9 +11794,6 @@ def main():
         results = cached["results"]
         group_roles = cached.get("group_roles") or {}
         group_eligible_roles = cached.get("group_eligible_roles") or {}
-        entity_details = cached.get("details") or {"sp": {}, "app": {}, "user": {}, "device": {}}
-        entity_profiles = cached.get("profiles2") or {"sp": {}, "app": {}}
-        records = cached.get("records") or []
         tenant_summary = timed("build_tenant_summary",
                                lambda: build_tenant_summary(graph, results))
         conn.close()
@@ -11718,42 +11816,10 @@ def main():
                                            group_eligible_roles=group_eligible_roles,
                                            sp_dir_resolver=sp_dir_resolver))
 
-        sp_ids = set()
-        app_ids = set()
-        user_ids = set()
-        device_ids = set()
-        for res in results:
-            for f in res["findings"]:
-                o = f.get("object_ids") or {}
-                sp_ids |= o.get("sp", set())
-                app_ids |= o.get("app", set())
-                user_ids |= o.get("user", set())
-                device_ids |= o.get("device", set())
-        # owned objects / devices inside user profiles need cards too when clicked
-        for res in results:
-            if res["id"] != "privileged_users":
-                continue
-            for f in res["findings"]:
-                for obj in f.get("owned_objects", []):
-                    t = obj.get("type")
-                    if t == "Application":
-                        app_ids.add(obj.get("object_id"))
-                    elif t == "Service Principal":
-                        sp_ids.add(obj.get("object_id"))
-                for dev in f.get("devices", []):
-                    device_ids.add(dev.get("object_id"))
-        entity_details = timed(
-            "fetch_full_details",
-            lambda: fetch_full_details(cur, sp_ids, app_ids, user_ids, device_ids))
-        entity_profiles = timed("build_entity_profiles",
-                                lambda: build_entity_profiles(
-                                    graph, check_cfg, sp_ids, app_ids,
-                                    group_roles=group_roles,
-                                    group_eligible_roles=group_eligible_roles,
-                                    sp_dir_resolver=sp_dir_resolver))
+        # raw details and drawer profiles are served lazily from the database
+        # and the in-memory graph (tier-2 memory saving)
         tenant_summary = timed("build_tenant_summary",
                                lambda: build_tenant_summary(graph, results))
-        records = build_serve_records(results)
         diff = compute_diff(cached.get("results", []), results) if cached else None
         conn.close()
         cache_meta = {
@@ -11770,9 +11836,6 @@ def main():
             "tenant_summary": tenant_summary,
             "group_roles": group_roles,
             "group_eligible_roles": group_eligible_roles,
-            "profiles2": entity_profiles,
-            "details": entity_details,
-            "records": records,
         })
 
     serve_tables = {}
@@ -11792,19 +11855,21 @@ def main():
     SERVE_STATE["tables"] = serve_tables or {}
     SERVE_STATE["user_findings"] = next(
         (res["findings"] for res in results if res["id"] == "privileged_users"), [])
-    SERVE_STATE["profiles2"] = entity_profiles
     SERVE_STATE["group_profiles"] = {
         f["group_id"]: f for res in results if res["id"] == "groups"
         for f in res["findings"]}
     SERVE_STATE["policy_profiles"] = {
         f["policy_id"]: f for res in results if res["id"] == "ca_exposure"
         for f in res["findings"] if f.get("policy_id")}
-    SERVE_STATE["details"] = {k: v for k, v in entity_details.items()
-                              if k in ("sp", "app", "device", "user")}
-    SERVE_STATE["records"] = records
-    # Release the analysis working set before serving: everything the page
-    # needs is embedded in the shell or held in SERVE_STATE above.
-    del graph, results
+    SERVE_STATE["records"] = build_serve_records(results)
+    # lazy drawer inputs: the graph, role resolution and config stay resident;
+    # raw details are read from the database on demand
+    SERVE_STATE["graph"] = graph
+    SERVE_STATE["check_cfg"] = check_cfg
+    SERVE_STATE["group_roles"] = group_roles
+    SERVE_STATE["group_eligible_roles"] = group_eligible_roles
+    SERVE_STATE["profile_builder"] = None
+    del results
     gc.collect()
     if args.timing:
         import resource
