@@ -1851,7 +1851,8 @@ def check_privileged_users(ctx):
             for sp_oid in sp_oids:
                 seen_owner_sp.add((uid, sp_oid))
             ensure(uid)["priv_apps"].append(
-                {"app_name": app.get("displayName") or app_oid, "grants": app_grants})
+                {"app_name": app.get("displayName") or app_oid, "grants": app_grants,
+                 "kind": "application"})
 
     for sp_oid, uids in graph["sp_owners"].items():
         if sp_oid not in grants_by_sp:
@@ -1863,7 +1864,8 @@ def check_privileged_users(ctx):
             if (uid, sp_oid) in seen_owner_sp:
                 continue
             seen_owner_sp.add((uid, sp_oid))
-            ensure(uid)["priv_apps"].append({"app_name": label, "grants": grants})
+            ensure(uid)["priv_apps"].append(
+                {"app_name": label, "grants": grants, "kind": "service principal"})
 
     # ---- owned objects (full inventory, not only privileged) --------------
     def creds_of(record):
@@ -1992,8 +1994,14 @@ def check_privileged_users(ctx):
         sevs += [s["severity"] for s in p["dir_sp_roles"]]
         if p["cap_member"]:
             sevs.append("Medium")
-        if p["owned_cap"]:
-            sevs.append("High")
+        # owning a role-capable group is a takeover path: rate by the roles
+        # the group actually carries; capable-but-unassigned groups stay High
+        for g in p["owned_cap"]:
+            role_sevs = [r["severity"] for r in (g.get("roles") or [])]
+            if role_sevs:
+                sevs += role_sevs
+            else:
+                sevs.append("High")
         display = user.get("displayName") or user.get("userPrincipalName") or uid
         upn = user.get("userPrincipalName") or ""
 
@@ -8375,7 +8383,7 @@ def render_report(results, tenant_name, db_path, config_path,
   }}
 
   function renderProfileTabs(p, container) {{
-    var overview = '<div class="user-desc"></div>' + openProfileHtml(p);
+    var overview = privilegeAnalysisHtml(p) + '<div class="user-desc"></div>' + openProfileHtml(p);
     var ownedLinks = (p.owned_objects || []).map(function(o) {{
       var isGroup = o.type === 'Group';
       var grants = (o.grants && o.grants.length)
@@ -8592,6 +8600,67 @@ def render_report(results, tenant_name, db_path, config_path,
       btn.remove();
     }}
   }});
+
+  function privilegeAnalysisHtml(p) {{
+    // every factor that contributed to the user's severity rating, with the
+    // reason it was attributed ("via" path, naming the object type)
+    function viaSource(s) {{
+      s = s || 'assigned';
+      if (s.indexOf('PIM eligible via ') === 0) {{
+        return 'PIM eligibility in ' + s.slice('PIM eligible via '.length);
+      }}
+      if (s === 'PIM eligible') return 'PIM eligibility';
+      if (s.indexOf('via ') === 0) return 'membership in ' + s.slice(4);
+      return s;
+    }}
+    var factors = [];
+    (p.roles || []).forEach(function(r) {{
+      factors.push(pSev(r.severity) + ' ' + pEsc(r.name)
+          + ' <span class="muted">\u2014 via ' + pEsc(viaSource(r.source)) + '</span>');
+    }});
+    (p.eligible_roles || []).forEach(function(r) {{
+      factors.push(pSev(r.severity) + ' ' + pEsc(r.name)
+          + ' <span class="muted">\u2014 via ' + pEsc(viaSource(r.source)) + '</span>');
+    }});
+    (p.priv_apps || []).forEach(function(a) {{
+      var kind = a.kind === 'service principal' ? ' service principal' : ' application';
+      (a.grants || []).forEach(function(g) {{
+        factors.push(pSev(g.severity) + ' ' + pEsc(g.permission)
+            + ' <span class="muted">on ' + pEsc(g.resource)
+            + ' \u2014 via ownership of ' + pEsc(a.app_name) + kind + '</span>');
+      }});
+    }});
+    (p.dir_sp_roles || []).forEach(function(s) {{
+      factors.push(pSev(s.severity) + ' ' + pEsc(s.role)
+          + ' <span class="muted">\u2014 via ownership of ' + pEsc(s.sp_name)
+          + ' service principal</span>');
+    }});
+    if (p.cap_member && p.cap_member.length) {{
+      factors.push(pSev('Medium') + ' member of role-capable group(s)'
+          + ' <span class="muted">\u2014 via membership in '
+          + pEsc(p.cap_member.map(function(g) {{ return g.name; }}).join(', ')) + ' group(s)</span>');
+    }}
+    (p.owned_cap || []).forEach(function(g) {{
+      var roles = g.roles || [];
+      if (roles.length) {{
+        roles.forEach(function(r) {{
+          factors.push(pSev(r.severity) + ' ' + pEsc(r.name)
+              + ' <span class="muted">\u2014 via ownership of ' + pEsc(g.name) + ' group</span>');
+        }});
+      }} else {{
+        factors.push(pSev('High') + ' ' + pEsc(g.name)
+            + ' <span class="muted">\u2014 via ownership of role-capable group</span>');
+      }}
+    }});
+    var head = 'Privilege Analysis ' + pSev(p.severity || 'Info');
+    if (!factors.length) {{
+      return '<div class="detail-section"><h4>' + head
+          + '</h4><p class="muted">No privilege signals captured.</p></div>';
+    }}
+    return '<div class="detail-section"><h4>' + head + '</h4>'
+        + cappedListHtml(factors, function(f) {{ return '<li>' + f + '</li>'; }})
+        + '</div>';
+  }}
 
   function openProfileHtml(p) {{
     function groupRank(g) {{
