@@ -8783,6 +8783,25 @@ def render_report(results, tenant_name, db_path, config_path,
     drawer.dataset.filled = '1';
     var body = drawer.querySelector('.drawer-body');
     if (!body) return;
+    var spId2 = row.getAttribute('data-sp-id') || '';
+    var appId2 = row.getAttribute('data-app-id') || '';
+    if (spId2 && !PROFILES2.sp[spId2]) {{
+      // the SP profile may not be cached yet even when the app profile is
+      // (e.g. after navigating app -> back); prefer the SP drawer
+      fetchSpApp(spId2, 'sp', body);
+      return;
+    }}
+    var prof2 = (spId2 && PROFILES2.sp[spId2]) ? PROFILES2.sp[spId2]
+              : (appId2 && PROFILES2.app[appId2]) ? PROFILES2.app[appId2] : null;
+    if (prof2) {{
+      var rec2 = (spId2 && PROFILES2.sp[spId2]) ? (DETAILS.sp[spId2] || null) : (DETAILS.app[appId2] || null);
+      renderSpAppTabs(prof2, rec2, body);
+      return;
+    }}
+    if (spId2 || appId2) {{
+      fetchSpApp(spId2 || appId2, spId2 ? 'sp' : 'app', body);
+      return;
+    }}
     var profileId = row.getAttribute('data-profile-id') || '';
     var p = PROFILES[profileId];
     if (profileId && p) {{
@@ -8824,25 +8843,6 @@ def render_report(results, tenant_name, db_path, config_path,
     }}
     if (pid2) {{
       fetchProfile('policy', pid2, function(pol) {{ renderPolicyTabs(pol, body); }}, body);
-      return;
-    }}
-    var spId2 = row.getAttribute('data-sp-id') || '';
-    var appId2 = row.getAttribute('data-app-id') || '';
-    if (spId2 && !PROFILES2.sp[spId2]) {{
-      // the SP profile may not be cached yet even when the app profile is
-      // (e.g. after navigating app -> back); prefer the SP drawer
-      fetchSpApp(spId2, 'sp', body);
-      return;
-    }}
-    var prof2 = (spId2 && PROFILES2.sp[spId2]) ? PROFILES2.sp[spId2]
-              : (appId2 && PROFILES2.app[appId2]) ? PROFILES2.app[appId2] : null;
-    if (prof2) {{
-      var rec2 = (spId2 && PROFILES2.sp[spId2]) ? (DETAILS.sp[spId2] || null) : (DETAILS.app[appId2] || null);
-      renderSpAppTabs(prof2, rec2, body);
-      return;
-    }}
-    if (spId2 || appId2) {{
-      fetchSpApp(spId2 || appId2, spId2 ? 'sp' : 'app', body);
       return;
     }}
     var wants = [];
