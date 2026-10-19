@@ -9,6 +9,12 @@ Entra ID attack-surface report from a [ROADrecon](https://github.com/dirkjanm/RO
 - Python 3 (stdlib only)
 - A roadrecon database (`roadrecon.db`) for the tenant you want to audit
 
+## Collection
+
+```sh
+roadrecon gatherall --evade
+```
+
 ## Usage
 
 ```sh
