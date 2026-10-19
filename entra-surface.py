@@ -271,6 +271,22 @@ def is_privileged(severity):
     return severity_rank(severity) <= PRIVILEGED_MAX_RANK
 
 
+ELIGIBLE_SEVERITY_STEP = {
+    "Critical": "High",
+    "High": "Medium",
+    "Medium": "Low",
+    "Low": "Info",
+    "Info": "Info",
+}
+
+
+def eligible_severity(severity):
+    """PIM-eligible roles are rated one notch below the same role held
+    actively: an eligible Global Administrator is High, not Critical, until
+    the role is activated."""
+    return ELIGIBLE_SEVERITY_STEP.get(severity, "Info")
+
+
 # ---------------------------------------------------------------------------
 # Advanced filter query language (shared semantics with the report JS — the
 # JS side implements the same grammar in the filter module; both are pinned
@@ -1059,6 +1075,122 @@ def build_graph(cur):
     except sqlite3.OperationalError:
         pass
 
+    # ---- PIM (privileged identity management) -------------------------------
+    # The legacy v1 tables (RoleAssignments / EligibleRoleAssignments, AAD
+    # Graph) are always loaded above. The richer PIM v2 governance data comes
+    # from `roadrecon pimgather` (api.azrbac.mspim.azure.com) and is frequently
+    # absent: every table here loads defensively so empty databases render the
+    # same as before. Populated tables upgrade the PIM checks below.
+    graph["pim_providers"] = []
+    try:
+        cur.execute("SELECT id FROM PIMprivilegedAccesss")
+        graph["pim_providers"] = [r[0] for r in cur.fetchall() if r[0]]
+    except sqlite3.OperationalError:
+        pass
+
+    graph["pim_resources"] = {}
+    try:
+        cur.execute('SELECT id, "displayName", type, status FROM PIMgovernanceResources')
+        graph["pim_resources"] = {
+            r[0]: {"display_name": r[1], "type": r[2], "status": r[3]}
+            for r in cur.fetchall() if r[0]}
+    except sqlite3.OperationalError:
+        pass
+
+    graph["pim_role_defs"] = {}
+    try:
+        cur.execute('SELECT id, "resourceId", "displayName", "templateId" '
+                    "FROM PIMgovernanceRoleDefinitions")
+        graph["pim_role_defs"] = {
+            r[0]: {"resource_id": r[1], "display_name": r[2], "template_id": r[3]}
+            for r in cur.fetchall() if r[0]}
+    except sqlite3.OperationalError:
+        pass
+
+    def _load_pim_settings_table(table, columns):
+        out = {}
+        try:
+            cur.execute(f"PRAGMA table_info({table})")
+            available = {r[1] for r in cur.fetchall()}
+            cols = [c for c in columns if c in available]
+            if cols:
+                cur.execute(f"SELECT {', '.join(cols)} FROM {table}")
+                for row in cur.fetchall():
+                    rec = dict(zip(cols, row))
+                    if rec.get("id"):
+                        out[rec["id"]] = rec
+        except sqlite3.OperationalError:
+            pass
+        return out
+
+    graph["pim_role_settings"] = _load_pim_settings_table(
+        "PIMgovernanceRoleSettings",
+        ["id", "resourceId", "roleDefinitionId", "isDefault", "lastUpdatedDateTime",
+         "adminEligibleSettings", "adminMemberSettings",
+         "userEligibleSettings", "userMemberSettings"])
+    graph["pim_role_settings_v2"] = _load_pim_settings_table(
+        "PIMgovernanceRoleSettingV2s",
+        ["id", "resourceId", "roleDefinitionId", "isDefault", "lastUpdatedDateTime",
+         "lifeCycleManagement"])
+
+    graph["pim_role_assignments"] = []
+    try:
+        cur.execute("SELECT id, resourceId, roleDefinitionId, subjectId, "
+                    "linkedEligibleRoleAssignmentId, isPermanent, startDateTime, "
+                    "endDateTime, memberType, assignmentState, status "
+                    "FROM PIMgovernanceRoleAssignments")
+        for row in cur.fetchall():
+            if not row[0]:
+                continue
+            graph["pim_role_assignments"].append({
+                "id": row[0], "resource_id": row[1], "role_definition_id": row[2],
+                "subject_id": row[3], "linked_eligible_id": row[4],
+                "is_permanent": bool(row[5]), "start": row[6], "end": row[7],
+                "member_type": row[8], "assignment_state": row[9], "status": row[10],
+            })
+    except sqlite3.OperationalError:
+        pass
+
+    graph["pim_alerts"] = []
+    try:
+        cur.execute("SELECT id, resourceId, alertName, alertDescription, "
+                    "numberOfAffectedItems, severityLevel, isActive, status, "
+                    "mitigationSteps, howToPrevent, lastScannedDateTime "
+                    "FROM PIMgovernanceAlerts")
+        for row in cur.fetchall():
+            if not row[0]:
+                continue
+            graph["pim_alerts"].append({
+                "id": row[0], "resource_id": row[1], "name": row[2],
+                "description": row[3], "affected": row[4], "severity_level": row[5],
+                "is_active": bool(row[6]), "status": row[7],
+                "mitigation": row[8], "prevention": row[9], "scanned": row[10],
+            })
+    except sqlite3.OperationalError:
+        pass
+
+    # PIM-governance role assignment subjects -> users/groups/SPs (v2 links)
+    def _load_pim_subjects(table, column):
+        out = {}
+        try:
+            cur.execute(f'SELECT "{column}", PIMgovernanceRoleAssignment '
+                        f"FROM {table}")
+            for subject_id, assign_id in cur.fetchall():
+                if subject_id and assign_id:
+                    out[assign_id] = subject_id
+        except sqlite3.OperationalError:
+            pass
+        return out
+
+    graph["pim_assign_subject"] = {}
+    graph["pim_assign_subject"].update(
+        _load_pim_subjects("lnk_pim_roleassignment_subjectuser", "User"))
+    graph["pim_assign_subject"].update(
+        _load_pim_subjects("lnk_pim_roleassignment_subjectgroup", "Group"))
+    graph["pim_assign_subject"].update(
+        _load_pim_subjects("lnk_pim_roleassignment_subjectserviceprincipal",
+                           "ServicePrincipal"))
+
     return graph
 
 
@@ -1626,8 +1758,9 @@ def check_privileged_users(ctx):
     """Aggregate every privilege signal we can attribute per user into one finding.
 
     Signals: directory roles (lnk_role_member_user + RoleAssignments), PIM-eligible
-    roles, ownership of apps/SPs that hold privileged grants (from the app-permission
-    config) or directory roles, and membership/ownership of role-capable groups.
+    roles (rated one notch below the same role held actively), ownership of
+    apps/SPs that hold privileged grants (from the app-permission config) or
+    directory roles, and membership/ownership of role-capable groups.
     On-prem sync is recorded as context, never rated.
     """
     graph = ctx["graph"]
@@ -1778,8 +1911,28 @@ def check_privileged_users(ctx):
         if pid in graph["user"]:
             p = ensure(pid)
             name = def_name(ea["role_definition_id"])
-            p["eligible_roles"].append({"name": name, "severity": sev_of(name),
-                                        "source": "PIM eligible"})
+            p["eligible_roles"].append({
+                "name": name, "severity": eligible_severity(sev_of(name)),
+                "source": "PIM eligible",
+                "scope": pim_scope_label(ea.get("resource_scopes")),
+            })
+
+    # v2-only eligible assignments (roadrecon pimgather) when the legacy v1
+    # tables don't carry them
+    for a in graph.get("pim_role_assignments") or []:
+        if (a.get("assignment_state") or "").lower() != "eligible":
+            continue
+        subject = graph.get("pim_assign_subject", {}).get(a["id"]) or a.get("subject_id")
+        if not subject or subject not in graph["user"]:
+            continue
+        name = _pim_role_def_name(graph, a.get("role_definition_id"))
+        p = ensure(subject)
+        if any(r["name"] == name for r in p["eligible_roles"]):
+            continue
+        p["eligible_roles"].append({
+            "name": name, "severity": eligible_severity(sev_of(name)),
+            "source": "PIM eligible",
+        })
 
     # ---- group memberships / ownership -------------------------------------
     group_path_cache = {}
@@ -1823,9 +1976,11 @@ def check_privileged_users(ctx):
                                    "source": "via " + " \u2192 ".join(r["path"])})
             # PIM-eligible roles inherited through this group (incl. nesting)
             for r in inherited_eligible:
-                p["eligible_roles"].append({"name": r["name"], "severity": r["severity"],
-                                            "source": "PIM eligible via "
-                                                      + " \u2192 ".join(r["path"])})
+                p["eligible_roles"].append({
+                    "name": r["name"], "severity": r["severity"],
+                    "source": "PIM eligible via " + " \u2192 ".join(r["path"]),
+                    "path": list(r["path"]),
+                })
     for gid, uids in graph["group_owner_user"].items():
         for uid in uids:
             p = ensure(uid)
@@ -1939,12 +2094,19 @@ def check_privileged_users(ctx):
             key = r["name"]
             src = r.get("source") or "assigned"
             if key not in merged:
-                merged[key] = {"name": key, "severity": r["severity"], "source": src}
+                entry = {"name": key, "severity": r["severity"], "source": src}
+                for extra in ("scope", "path"):
+                    if r.get(extra):
+                        entry[extra] = r[extra]
+                merged[key] = entry
             else:
                 srcs = [s.strip() for s in merged[key]["source"].split("\u00b7")]
                 if src not in srcs:
                     srcs.append(src)
                 merged[key]["source"] = " \u00b7 ".join(srcs)
+                for extra in ("scope", "path"):
+                    if not merged[key].get(extra) and r.get(extra):
+                        merged[key][extra] = r[extra]
         return sorted(merged.values(), key=lambda r: severity_rank(r["severity"]))
 
     for p in profiles.values():
@@ -1957,6 +2119,29 @@ def check_privileged_users(ctx):
         p["enabled"] = bool(user.get("accountEnabled"))
         p["user_type"] = user.get("userType") or "Member"
         p["ca_exclusions"] = sorted(ca_exclusions.get(uid, ()), key=lambda x: x["name"])
+        # PIM v2 schedule details (permanence / member type / activation
+        # window) when `roadrecon pimgather` governance data is present.
+        # Group-inherited eligibility matches the eligibility on the group.
+        if graph.get("pim_role_assignments"):
+            for r in p["eligible_roles"]:
+                subjects = {uid} | set(r.get("path") or [])
+                for a in graph["pim_role_assignments"]:
+                    if (a.get("assignment_state") or "").lower() != "eligible":
+                        continue
+                    subject = graph["pim_assign_subject"].get(a["id"]) or a.get("subject_id")
+                    if subject not in subjects:
+                        continue
+                    if _pim_role_def_name(graph, a.get("role_definition_id")) != r["name"]:
+                        continue
+                    r["schedule"] = {
+                        "permanent": bool(a.get("is_permanent")),
+                        "member_type": a.get("member_type") or "",
+                        "start": str(a.get("start") or "")[:10],
+                        "end": str(a.get("end") or "")[:10],
+                        "assignment_state": a.get("assignment_state") or "",
+                        "status": a.get("status") or "",
+                    }
+                    break
         p["owned_objects"] = sorted(p.get("owned_objects", []),
                                     key=lambda o: (o["type"], (o["name"] or "").lower()))
         seen_oids = set()
@@ -2745,15 +2930,27 @@ def sp_directory_roles(graph, group_roles, sp_oid, role_sev, group_eligible_role
                 roles.append({"name": r["name"], "severity": r["severity"],
                               "path": list(r["path"]), "eligible": False})
     # PIM-eligible directory roles (direct assignments + via groups): marker
-    # only — shown with an '(eligible)' marker, never rated.
+    # only — shown with an '(eligible)' marker, rated one notch below active.
     if group_eligible_roles is not None:
         for ea in graph["eligible_role_assigns"]:
             if ea["principal_id"] == sp_oid:
                 name = _def_name(ea["role_definition_id"])
                 if name not in seen:
                     seen.add(name)
-                    roles.append({"name": name, "severity": role_sev.get(name, "Info"),
+                    roles.append({"name": name, "severity": eligible_severity(role_sev.get(name, "Info")),
                                   "path": None, "eligible": True})
+        # v2-only direct eligibility (pimgather)
+        for a in graph.get("pim_role_assignments") or []:
+            if (a.get("assignment_state") or "").lower() != "eligible":
+                continue
+            subject = graph.get("pim_assign_subject", {}).get(a["id"]) or a.get("subject_id")
+            if subject != sp_oid:
+                continue
+            name = _pim_role_def_name(graph, a.get("role_definition_id"))
+            if name not in seen:
+                seen.add(name)
+                roles.append({"name": name, "severity": eligible_severity(role_sev.get(name, "Info")),
+                              "path": None, "eligible": True})
         for gid, members in graph["group_member_sp"].items():
             if sp_oid not in members:
                 continue
@@ -2851,7 +3048,7 @@ def build_role_applications(graph, group_roles, group_eligible_roles=None):
 def compute_group_eligible_roles(graph, check_cfg):
     """{group_id: [{"name", "severity"}]} - PIM-eligible directory roles carried
     by each group (EligibleRoleAssignments whose principal is a group). Marker
-    data: eligible roles never affect severity ratings on groups/SPs."""
+    data rated one notch below the active severity of the same role."""
     role_sev = check_cfg["directory_roles"]
 
     def _gdef_name(oid):
@@ -2859,13 +3056,23 @@ def compute_group_eligible_roles(graph, check_cfg):
         return rec.get("displayName") if rec else oid
 
     def _gsev(name):
-        return role_sev.get(name, "Info")
+        return eligible_severity(role_sev.get(name, "Info"))
 
     out = defaultdict(list)
     for ea in graph["eligible_role_assigns"]:
         if ea["principal_id"] in graph["group"]:
             name = _gdef_name(ea["role_definition_id"])
             out[ea["principal_id"]].append({"name": name, "severity": _gsev(name)})
+    # v2-only group eligibility (pimgather) when the v1 tables don't carry it
+    for a in graph.get("pim_role_assignments") or []:
+        if (a.get("assignment_state") or "").lower() != "eligible":
+            continue
+        subject = graph.get("pim_assign_subject", {}).get(a["id"]) or a.get("subject_id")
+        if not subject or subject not in graph["group"]:
+            continue
+        name = _pim_role_def_name(graph, a.get("role_definition_id"))
+        if not any(r["name"] == name for r in out.get(subject, [])):
+            out[subject].append({"name": name, "severity": _gsev(name)})
     for gid in list(out):
         seen = set()
         out[gid] = [r for r in out[gid] if not (r["name"] in seen or seen.add(r["name"]))]
@@ -2946,7 +3153,26 @@ def check_groups(ctx):
                           key=lambda a: (a.get("eligible", False), a["role"].lower()))
 
         dir_roles = group_roles.get(gid, [])
-        eligible_roles = group_eligible_roles.get(gid, [])
+        eligible_roles = [dict(r) for r in group_eligible_roles.get(gid, [])]
+        # enrich group eligibility with scope + PIM v2 schedule details
+        for r in eligible_roles:
+            for a in (graph.get("pim_role_assignments") or []):
+                if (a.get("assignment_state") or "").lower() != "eligible":
+                    continue
+                subject = graph["pim_assign_subject"].get(a["id"]) or a.get("subject_id")
+                if subject != gid:
+                    continue
+                if _pim_role_def_name(graph, a.get("role_definition_id")) != r["name"]:
+                    continue
+                r["schedule"] = {
+                    "permanent": bool(a.get("is_permanent")),
+                    "member_type": a.get("member_type") or "",
+                    "start": str(a.get("start") or "")[:10],
+                    "end": str(a.get("end") or "")[:10],
+                    "assignment_state": a.get("assignment_state") or "",
+                    "status": a.get("status") or "",
+                }
+                break
         group_role_tags = role_paths_for(gid)
         parents = sorted((graph["group"][p].get("displayName") or p)
                          for p, children in graph["group_member_group"].items() if gid in children)
@@ -3068,6 +3294,28 @@ def check_groups(ctx):
 
     findings.sort(key=lambda f: (severity_rank(f["severity"]), (f["group_name"] or "").lower()))
     return findings
+
+
+# ---------------------------------------------------------------------------
+# PIM helpers (eligible-role drawer enrichment: scope + schedule details)
+# ---------------------------------------------------------------------------
+
+def _pim_role_def_name(graph, role_def_id):
+    """Display name of a PIM role definition (v2 governance id or v1 object id)."""
+    rec = graph["pim_role_defs"].get(role_def_id)
+    if rec and rec.get("display_name"):
+        return rec["display_name"]
+    rec = graph["role_definition"].get(role_def_id)
+    if rec:
+        return rec.get("displayName") or role_def_id
+    return role_def_id
+
+
+def pim_scope_label(raw):
+    parts = [p for p in json_list(raw) if isinstance(p, str)]
+    if not parts:
+        return "Tenant-wide"
+    return "Tenant-wide" if parts == ["/"] else ", ".join(parts)
 
 
 def check_ca_exposure(ctx):
@@ -3535,7 +3783,8 @@ CHECK_SPECS = [
         "category": "users",
         "title": "Users",
         "description": ("One row per user. Privileged users are rated by their aggregate "
-                        "signal: directory roles (assigned or eligible), ownership of "
+                        "signal: directory roles (assigned or eligible — eligible is "
+                        "rated one notch below the same role held actively), ownership of "
                         "apps/service principals that hold privileged grants or directory "
                         "roles, and membership or ownership of role-capable groups. Users "
                         "with no observed signals are listed at Info for completeness. "
@@ -7039,6 +7288,21 @@ def render_report(results, tenant_name, db_path, config_path,
     if ts.get("auth_mode"):
         bar.append(item("Auth", f'<span class="tag-chip tag-divergence">{esc(ts["auth_mode"])}</span>',
                         "Authentication mode (PHS / PTA / federated), see the sync summary"))
+    if ts.get("pim"):
+        pim = ts["pim"]
+        pim_labels = {"aadroles": "AAD roles", "aadgroups": "groups",
+                      "azureResources": "Azure resources"}
+        providers = [p for p in ("aadroles", "aadgroups", "azureResources")
+                     if p in (pim.get("providers") or [])]
+        if providers:
+            pim_title = "PIM registered for " + ", ".join(pim_labels[p] for p in providers)
+            if not pim.get("governance"):
+                pim_title += " — assignment schedules not collected (run roadrecon pimgather)"
+            bar.append(item("PIM", f'<span class="mono">{esc(" \u00b7 ".join(pim_labels[p] for p in providers))}</span>',
+                            pim_title))
+        elif not pim.get("governance"):
+            bar.append(item("PIM", "<b>not observed</b>",
+                            "No privileged-access providers registered (PIM may not be licensed/enabled)"))
     if "users" in ts:
         synced_note = f'<span class="muted">({ts.get("synced", "?")} synced)</span>' if "synced" in ts else ""
         bar.append(item("Users", f'{ts.get("users", 0)} {synced_note}'))
@@ -8217,7 +8481,7 @@ def render_report(results, tenant_name, db_path, config_path,
         ? '<p>' + g.dir_roles.map(function(r) {{ return pSev(r.severity) + ' ' + pEsc(r.name); }}).join(' &nbsp;&middot;&nbsp; ') + '</p>'
         : '<p class="muted">No directory roles assigned to this group.</p>';
     var eligRolesHtml = (g.eligible_roles && g.eligible_roles.length)
-        ? '<p>' + g.eligible_roles.map(function(r) {{ return pSev(r.severity) + ' ' + pEsc(r.name) + ' <span class="muted">(PIM eligible)</span>'; }}).join(' &nbsp;&middot;&nbsp; ') + '</p>'
+        ? '<p>' + g.eligible_roles.map(function(r) {{ return '<button type="button" class="elig-link dtab-sp-link" data-elig-role="' + pEsc(r.name) + '">' + pSev(r.severity) + ' ' + pEsc(r.name) + '</button> <span class="muted">(PIM eligible)</span>'; }}).join(' &nbsp;&middot;&nbsp; ') + '</p>'
         : '';
     var ownersHtml = (g.owners && g.owners.length)
         ? '<p>' + g.owners.map(function(o) {{ return pEsc(o); }}).join(', ') + '</p>'
@@ -8345,6 +8609,9 @@ def render_report(results, tenant_name, db_path, config_path,
         }}
         container.appendChild(section('Application', DETAILS.app[oid] || null));
       }});
+    }});
+    attachEligLinks(wrap, g, container, g.group_name || 'group', function() {{
+      renderGroupTabs(g, container);
     }});
   }}
 
@@ -8545,6 +8812,9 @@ def render_report(results, tenant_name, db_path, config_path,
         }}
       }});
     }});
+    attachEligLinks(wrap, p, container, p.user_display || 'user', function() {{
+      renderProfileTabs(p, container);
+    }});
   }}
 
   function capAnnotate(items) {{
@@ -8601,6 +8871,55 @@ def render_report(results, tenant_name, db_path, config_path,
     }}
   }});
 
+  function eligDetailHtml(entry) {{
+    var rows = [
+      ['Role', entry.name || '\u2014'],
+      ['Severity', entry.severity || 'Info'],
+      ['Source', entry.source || '\u2014'],
+      ['Scope', entry.scope || 'Tenant-wide']
+    ];
+    if (entry.path && entry.path.length) {{
+      rows.push(['Group path', entry.path.join(' \u2192 ')]);
+    }}
+    var s = entry.schedule;
+    if (s) {{
+      rows.push(['Assignment state', s.assignment_state || '\u2014']);
+      rows.push(['Member type', s.member_type || '\u2014']);
+      rows.push(['Permanent', s.permanent ? 'Yes' : 'No']);
+      rows.push(['Starts', s.start || '\u2014']);
+      rows.push(['Ends', s.end || (s.permanent ? 'Never' : '\u2014')]);
+      rows.push(['Status', s.status || '\u2014']);
+    }}
+    return '<table class="kv-table">' + rows.map(function(r) {{
+      return '<tr><th>' + pEsc(r[0]) + '</th><td>' + pEsc(String(r[1])) + '</td></tr>';
+    }}).join('') + '</table>';
+  }}
+
+  function openEligDetail(p, name, container, backLabel, backFn) {{
+    var entry = (p.eligible_roles || []).find(function(r) {{ return r.name === name; }});
+    if (!entry) return;
+    container.innerHTML = '';
+    container.innerHTML = '<div class="detail-section"><h4>PIM eligibility \u2014 '
+        + pEsc(entry.name) + ' ' + pSev(entry.severity) + '</h4>'
+        + eligDetailHtml(entry) + '</div>'
+        + '<div class="drawer-back-row"><button type="button" class="drawer-tab drawer-back">&larr; Back to '
+        + pEsc(backLabel) + '</button></div>';
+    Array.prototype.forEach.call(container.querySelectorAll('.drawer-back'), function(x) {{
+      x.addEventListener('click', function() {{
+        container.innerHTML = '';
+        backFn();
+      }});
+    }});
+  }}
+
+  function attachEligLinks(scope, p, container, backLabel, backFn) {{
+    Array.prototype.forEach.call(scope.querySelectorAll('.elig-link'), function(b) {{
+      b.addEventListener('click', function() {{
+        openEligDetail(p, b.getAttribute('data-elig-role'), container, backLabel, backFn);
+      }});
+    }});
+  }}
+
   function privilegeAnalysisHtml(p) {{
     // every factor that contributed to the user's severity rating, with the
     // reason it was attributed ("via" path, naming the object type)
@@ -8619,7 +8938,8 @@ def render_report(results, tenant_name, db_path, config_path,
           + ' <span class="muted">\u2014 via ' + pEsc(viaSource(r.source)) + '</span>');
     }});
     (p.eligible_roles || []).forEach(function(r) {{
-      factors.push(pSev(r.severity) + ' ' + pEsc(r.name)
+      factors.push('<button type="button" class="elig-link dtab-sp-link" data-elig-role="' + pEsc(r.name) + '">'
+          + pSev(r.severity) + ' ' + pEsc(r.name) + '</button>'
           + ' <span class="muted">\u2014 via ' + pEsc(viaSource(r.source)) + '</span>');
     }});
     (p.priv_apps || []).forEach(function(a) {{
@@ -8671,7 +8991,11 @@ def render_report(results, tenant_name, db_path, config_path,
       return '<li>' + pSev(r.severity) + ' ' + pEsc(r.name) + ' <span class="muted">(' + pEsc(r.source) + ')</span></li>';
     }}));
     html += pSection('Eligible (PIM) roles', cappedListHtml(p.eligible_roles, function(r) {{
-      return '<li>' + pSev(r.severity) + ' ' + pEsc(r.name) + '</li>';
+      var extra = '';
+      if (r.schedule && r.schedule.permanent) extra = ' <span class="tag-chip tag-privileged">permanent</span>';
+      if (r.path && r.path.length) extra += ' <span class="muted">via ' + pEsc(r.path.join(' \u2192 ')) + '</span>';
+      return '<li><button type="button" class="elig-link dtab-sp-link" data-elig-role="' + pEsc(r.name) + '">'
+          + pSev(r.severity) + ' ' + pEsc(r.name) + '</button>' + extra + '</li>';
     }}));
     html += pSection('Privileged objects owned', cappedListHtml(p.priv_apps, function(a) {{
       var grants = a.grants.map(function(g) {{
@@ -10061,6 +10385,13 @@ def build_tenant_summary(graph, results=None):
             domains.append({"name": d["name"], "default": bool(d.get("default"))})
     domains.sort(key=lambda d: (not d["default"], d["name"]))
 
+    pim = {
+        "providers": list(graph.get("pim_providers") or []),
+        "governance": bool(graph.get("pim_resources") or graph.get("pim_alerts")
+                           or graph.get("pim_role_assignments")
+                           or graph.get("pim_role_settings")),
+    }
+
     return {
         "tenant": graph["tenant"].get("display_name") or "Unknown",
         "tenant_id": graph["tenant"].get("object_id") or "",
@@ -10070,6 +10401,7 @@ def build_tenant_summary(graph, results=None):
         "engine": engine,
         "writeback": writeback,
         "auth_mode": auth_mode,
+        "pim": pim,
         "users": users,
         "enabled": enabled,
         "synced": synced,
@@ -11803,7 +12135,7 @@ def start_serve(port, total=None, after_start=None):
 # when the database fingerprint is unchanged; when the database changed, the
 # new analysis is diffed against the cached one and surfaced in the report.
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 CACHE_FILENAME = ".entra-surface.cache"
 
 CACHE_FINGERPRINT_TABLES = (

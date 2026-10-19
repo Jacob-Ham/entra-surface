@@ -36,7 +36,7 @@ Analysis is cached in `.entra-surface.cache`: unchanged re-runs skip analysis en
 - **Tabs:** Apps / Service principals, Users, Active Directory / On-prem, Groups, Conditional Access, Azure Arc.
 - **Column manager:** add, remove, and reorder columns per table (persisted in the browser).
 - **Filters:** free-text, plus an advanced query language — `field:value`, `contains:`, `AND`/`OR`/`NOT`, and `uniq:column` to deduplicate by any column.
-- **Drawers:** per-row detail with roles, owners, Azure RBAC assignments, and a Raw tab with the full captured record.
+- **Drawers:** per-row detail with roles, owners, Azure RBAC assignments, and a Raw tab with the full captured record. PIM-eligible roles are rated one notch below the same role held actively (an eligible Global Administrator is High, not Critical), and the user/group drawers render PIM-eligible role tags as clickable underlined links that open the full PIM detail table (scope, group path, schedule, permanence).
 - **Sync summary:** engine, password writeback, authentication mode (PHS / PTA / federated), and Desktop SSO.
 - **Azure Arc:** onboarded machines, Arc role holders, onboarding service principals, and resource providers — detected by tenant-independent identifiers (resource-provider namespaces, role-definition GUIDs, first-party appIds).
 
