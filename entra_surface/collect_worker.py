@@ -6,6 +6,8 @@ imports graphcollect from the bundled ``entra_surface/collector`` checkout,
 redeems a broker refresh token, and either prints principal claims for a
 requested resource (``probe``) or runs a full collection (``run``).
 ``run-access`` collects with a Microsoft Graph access token and skips ARM.
+``run-aadgraph`` collects legacy AAD Graph (and optionally IG/PIM/ARM) using
+either a refresh token or an AAD Graph access token.
 The newest rotated refresh token is written to --token-out so the parent can
 persist it back into .entra-surface-auth.json.
 """
@@ -26,8 +28,11 @@ sys.path.insert(0, str(COLLECTOR_DIR))
 
 from graphcollect.auth import (  # noqa: E402
     ARM_RES, GRAPH_RES, AuthError, TokenProvider, _decode_jwt)
+from graphcollect.aadgraph import (  # noqa: E402
+    AAD_GRAPH_AUDIENCES, AAD_GRAPH_RES, AadGraphClient, collect_aadgraph,
+    collect_gatherall)
 from graphcollect.client import ArmClient, GraphClient  # noqa: E402
-from graphcollect.collectors import collect_all  # noqa: E402
+from graphcollect.collectors import Runner, collect_all  # noqa: E402
 from graphcollect.store import Store  # noqa: E402
 
 
@@ -73,7 +78,6 @@ GRAPH_AUDIENCES = {
     "https://graph.microsoft.com",
     "00000003-0000-0000-c000-000000000000",
 }
-AAD_GRAPH_RES = "https://graph.windows.net"
 # Legacy aliases; the GUI passes an arbitrary --resource-uri instead.
 PROBE_RESOURCES = {"graph": GRAPH_RES, "aadgraph": AAD_GRAPH_RES}
 
@@ -228,6 +232,136 @@ def run_access(args) -> int:
     return _run_collection(graph, None, args, identity, claims.get("tid") or "")
 
 
+def _is_aadgraph_access_token(claims: dict) -> bool:
+    aud = claims.get("aud") or ""
+    values = aud if isinstance(aud, list) else [aud]
+    return any(str(a).rstrip("/").lower() in AAD_GRAPH_AUDIENCES for a in values)
+
+
+def run_aadgraph(args) -> int:
+    refresh = (args.refresh_token or "").strip()
+    access = (args.access_token or "").strip()
+    client_id = (args.client_id or "").strip()
+    provider = None
+    if refresh:
+        if not client_id:
+            print("[auth] failed: client id is required when a refresh token "
+                  "is provided", file=sys.stderr)
+            return 1
+        provider = SavingProvider(refresh, client_id, args.token_out)
+
+    use_autotoken = bool((args.autotoken and provider is not None)
+                         or (refresh and not access))
+    if use_autotoken:
+        if provider is None:
+            print("[auth] failed: --autotoken requires a refresh token",
+                  file=sys.stderr)
+            return 1
+        try:
+            token = provider.get_token(AAD_GRAPH_RES)
+        except AuthError as exc:
+            print(f"[auth] failed: {exc}", file=sys.stderr)
+            return 1
+    else:
+        token = access
+    claims = _claims(token)
+    if not claims:
+        print("[auth] failed: access token is not a valid JWT", file=sys.stderr)
+        return 1
+    if not _is_aadgraph_access_token(claims):
+        print("[auth] failed: access token audience is not AAD Graph "
+              "(https://graph.windows.net)", file=sys.stderr)
+        return 1
+    expires = claims.get("exp")
+    if expires and int(expires) <= int(time.time()):
+        print("[auth] failed: access token is expired", file=sys.stderr)
+        return 1
+
+    identity = (claims.get("upn") or claims.get("unique_name")
+                or claims.get("oid") or "?")
+    tenant_id = claims.get("tid") or (args.tenant or "") or "myorganization"
+    user_agent = (args.user_agent or "").strip()
+    if args.evade and not user_agent:
+        user_agent = "Microsoft ADO.NET Data Services"
+    print(f"[auth] {identity} (tid: {tenant_id})")
+    if use_autotoken:
+        def token_getter():
+            return provider.get_token(AAD_GRAPH_RES)
+    else:
+        def token_getter():
+            return token
+
+    out_path = Path(args.out).expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    store = Store(str(out_path))
+    store.reset()
+    store.set_meta("backend", "aadgraph")
+    store.set_meta("started_at", dt.datetime.now(dt.UTC).isoformat())
+    store.set_meta("identity", identity)
+    store.set_meta("tenant_id", tenant_id)
+    store.set_meta("evade", "1" if args.evade else "0")
+    store.set_meta("gather_all", "1" if args.gather_all else "0")
+
+    client = AadGraphClient(
+        token_getter, tenant_id, user_agent=user_agent,
+        evade=args.evade, verbose=args.verbose)
+    runner = Runner(client, store, verbose=args.verbose)
+    info = collect_aadgraph(runner, mfa=args.mfa)
+
+    extra_sections = []
+    if args.gather_all:
+        if provider is None:
+            print("[gatherall] skipped: a refresh token is required for "
+                  "Microsoft Graph and ARM")
+        else:
+            graph = GraphClient(
+                lambda: provider.get_token(GRAPH_RES),
+                verbose=args.verbose, user_agent=user_agent)
+            arm = None
+            try:
+                provider.get_token(ARM_RES)
+                arm = ArmClient(
+                    lambda: provider.get_token(ARM_RES),
+                    verbose=args.verbose, user_agent=user_agent)
+            except AuthError as exc:
+                print(f"[arm] no Azure Resource Manager token ({exc}); "
+                      "Azure tables will be skipped")
+            try:
+                extra_sections = collect_gatherall(
+                    graph, arm, store, info.get("groups") or [],
+                    verbose=args.verbose)
+            except Exception as exc:
+                print(f"[gatherall] failed: {str(exc)[:250]}")
+
+    store.set_meta("finished_at", dt.datetime.now(dt.UTC).isoformat())
+    store.commit()
+    counts = {
+        name: store.count(name)
+        for name in ("Users", "Groups", "ServicePrincipals", "Applications",
+                     "Devices", "RoleAssignments", "AppRoleAssignments",
+                     "Policys", "TenantDetails")
+    }
+    store.close()
+
+    print("\n=== AAD Graph collection summary ===")
+    for sec in list(runner.sections) + list(extra_sections):
+        flag = {"ok": "+", "partial": "~", "degraded": "!", "skipped": "-",
+                "error": "X"}.get(sec.status, "?")
+        print(f"  {flag} {sec.name:52s} {sec.status:8s} {sec.count or ''}"
+              + (f"  [{sec.note}]" if sec.note else ""))
+    print("\ntables: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+    print(f"{client.requests_made} AAD Graph requests")
+    if getattr(client, "throttled", 0):
+        print(f"throttled (429) responses: {client.throttled}")
+    print(f"\nwrote {out_path}")
+    if not any(counts[name] for name in
+               ("Users", "Groups", "ServicePrincipals", "TenantDetails")):
+        print("[error] no directory data was collected; check the token's "
+              "AAD Graph permissions", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="mode", required=True)
@@ -257,6 +391,21 @@ def main(argv=None) -> int:
     a.add_argument("-ua", "--user-agent", default="")
     a.add_argument("-v", "--verbose", action="count", default=0)
     a.set_defaults(func=run_access)
+
+    g = sub.add_parser("run-aadgraph")
+    g.add_argument("-rt", "--refresh-token", default="")
+    g.add_argument("-c", "--client-id", default="")
+    g.add_argument("-at", "--access-token", default="")
+    g.add_argument("-o", "--out", required=True)
+    g.add_argument("-ua", "--user-agent", default="")
+    g.add_argument("-t", "--tenant", default="")
+    g.add_argument("--autotoken", action="store_true")
+    g.add_argument("--evade", action="store_true")
+    g.add_argument("--gather-all", action="store_true")
+    g.add_argument("--mfa", action="store_true")
+    g.add_argument("--token-out", default="")
+    g.add_argument("-v", "--verbose", action="count", default=0)
+    g.set_defaults(func=run_aadgraph)
 
     args = ap.parse_args(argv)
     try:

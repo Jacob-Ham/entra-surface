@@ -7843,7 +7843,7 @@ def render_report(results, tenant_name, db_path, config_path,
   </div>
 
   <div id="analysis-start-wrap" class="{'' if db_path is None else 'hidden'}">
-    {analysis.start_panel_html()}
+    {analysis.start_panel_html(db_path)}
   </div>
 
   <div class="tabs" id="category-tabs" role="tablist">
@@ -12417,8 +12417,10 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                            headers={"Cache-Control": "no-store"})
             elif path == "/api/tokens/resources":
                 token_id = (qs.get("id") or [""])[0]
+                client_id = (qs.get("client_id") or [""])[0]
                 try:
-                    data = collect_backend.get_token_resources(token_id)
+                    data = collect_backend.get_token_resources(
+                        token_id, client_id)
                 except ValueError as exc:
                     self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
                                "application/json; charset=utf-8", 400)
@@ -12586,7 +12588,8 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                     state = collect_backend.redeem_saved_token(
                         payload.get("id") or "",
                         payload.get("target") or "",
-                        payload.get("resource") or "")
+                        payload.get("resource") or "",
+                        payload.get("client_id") or "")
                 except ValueError as exc:
                     self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
                                "application/json; charset=utf-8", 400)
@@ -12632,12 +12635,25 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                         payload = json.loads(raw or b"{}") or {}
                 except (ValueError, json.JSONDecodeError):
                     payload = {}
+
+                def _flag(name, default=False):
+                    value = payload.get(name, default)
+                    if isinstance(value, bool):
+                        return value
+                    return str(value).strip().lower() in (
+                        "1", "true", "yes", "on")
+
                 try:
                     state = collect_backend.start_collection(
                         refresh_token=payload.get("refresh_token") or "",
                         out=payload.get("out") or "",
                         client_id=(payload.get("client_id") or "").strip(),
-                        user_agent=(payload.get("user_agent") or "").strip())
+                        user_agent=(payload.get("user_agent") or "").strip(),
+                        backend=(payload.get("backend") or "graph").strip().lower(),
+                        evade=_flag("evade"),
+                        gather_all=_flag("gather_all"),
+                        autotoken=_flag("autotoken", True),
+                        mfa=_flag("mfa"))
                 except ValueError as exc:
                     self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
                                "application/json; charset=utf-8", 400)

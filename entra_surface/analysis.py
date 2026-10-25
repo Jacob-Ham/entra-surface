@@ -7,6 +7,7 @@ small browser UI used to point the running server at a database.
 """
 from __future__ import annotations
 
+import html
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -159,8 +160,12 @@ window.ENTRA_ANALYSIS = (function() {
 </script>"""
 
 
-def start_panel_html() -> str:
-    return r"""<section class="analysis-start" id="analysis-start">
+def start_panel_html(db_path=None) -> str:
+    current_db = ""
+    if db_path is not None:
+        current_db = str(Path(db_path).expanduser().resolve())
+    return r"""<section class="analysis-start" id="analysis-start"
+         data-current-db="__CURRENT_DB__">
   <h2>Start analysis</h2>
   <p>Choose a database from <span class="mono">data/databases</span> or enter a custom path.</p>
   <div class="analysis-start-controls">
@@ -187,6 +192,9 @@ def start_panel_html() -> str:
   var cacheEl = document.getElementById('analysis-cache');
   var btn = document.getElementById('analysis-start-btn');
   var status = document.getElementById('analysis-status');
+  var startEl = document.getElementById('analysis-start');
+  var currentDb = startEl
+    ? (startEl.getAttribute('data-current-db') || '') : '';
   if (!btn) return;
   var lastSignature = null;
 
@@ -236,9 +244,20 @@ def start_panel_html() -> str:
           select.appendChild(custom);
           var keep = Array.prototype.some.call(
             select.options, function(o) { return o.value === previous; });
-          if (previous && keep) select.value = previous;
-          else if (databases.length) select.value = databases[0].path;
-          else select.value = '__custom__';
+          var keepCurrent = currentDb && Array.prototype.some.call(
+            select.options, function(o) { return o.value === currentDb; });
+          if (previous && keep) {
+            select.value = previous;
+          } else if (keepCurrent) {
+            select.value = currentDb;
+          } else if (currentDb) {
+            select.value = '__custom__';
+            input.value = currentDb;
+          } else if (databases.length) {
+            select.value = databases[0].path;
+          } else {
+            select.value = '__custom__';
+          }
           lastSignature = signature;
         }
         updateCustom(false);
@@ -247,6 +266,7 @@ def start_panel_html() -> str:
         if (!select.options.length) {
           select.innerHTML = '<option value="__custom__">Custom path...</option>';
           select.value = '__custom__';
+          if (currentDb) input.value = currentDb;
           updateCustom(false);
         }
       });
@@ -294,4 +314,4 @@ def start_panel_html() -> str:
     if (!document.hidden) loadDatabases();
   }, 3000);
 })();
-</script>"""
+</script>""".replace("__CURRENT_DB__", html.escape(current_db, quote=True))

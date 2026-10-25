@@ -10,16 +10,31 @@ BUNDLED_SCHEMA = os.path.join(os.path.dirname(__file__), "schema.sql")
 
 class Store:
     def __init__(self, out_db: str):
-        new = not os.path.exists(out_db)
         self.conn = sqlite3.connect(out_db)
         self.conn.execute("PRAGMA foreign_keys=OFF")
         self.conn.execute("PRAGMA journal_mode=WAL")
-        if new:
-            self.conn.executescript(open(BUNDLED_SCHEMA).read())
-            self.conn.execute(
-                "CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)")
+        with open(BUNDLED_SCHEMA, encoding="utf-8") as fh:
+            schema = fh.read().replace(
+                "CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
+        self.conn.executescript(schema)
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)")
         self._columns_cache = {}
         self._link_seen = set()
+
+    def reset(self) -> None:
+        """Empty every table so a collection starts from a clean snapshot."""
+        tables = [r[0] for r in self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%'").fetchall()]
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        for table in tables:
+            try:
+                self.conn.execute(f'DELETE FROM "{table}"')
+            except sqlite3.Error:
+                pass
+        self._link_seen.clear()
+        self.conn.commit()
 
     # -- helpers -------------------------------------------------------
     def _columns(self, table: str) -> list[str]:

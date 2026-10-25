@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Collection backend and Collect/Tokens tab UI for entra-surface.
 
-The actual Graph collector is bundled under ``entra_surface/collector``.  This
-module schedules its worker, streams output, persists redeemed refresh tokens
-in ``.entra-surface-auth.json``, and exposes the status to the report server.
+The actual Graph and AAD Graph collectors are bundled under
+``entra_surface/collector``.  This module schedules its worker, streams output,
+persists redeemed refresh tokens in ``.entra-surface-auth.json``, and exposes
+the status to the report server.
 
-CLI usage (auth arguments are both required):
+CLI usage:
 
     python3 -m entra_surface.collect -rt <refresh-token> -c <client-id> \
         -o data/databases/collected.db
+    python3 -m entra_surface.collect --backend aadgraph -rt <refresh-token> \
+        -c <client-id> --evade --gather-all -o data/databases/aadgraph.db
 
 Set ENTRA_COLLECTOR_DIR to override with an external collector checkout.
 """
@@ -34,12 +37,17 @@ BASE_DIR = PACKAGE_DIR.parent
 DEFAULT_COLLECTOR_DIR = PACKAGE_DIR / "collector"
 DEFAULT_DATA_DIR = BASE_DIR / "data" / "databases"
 DEFAULT_OUTPUT = DEFAULT_DATA_DIR / "collected.db"
+DEFAULT_AADGRAPH_OUTPUT = DEFAULT_DATA_DIR / "aadgraph.db"
 WORKER = PACKAGE_DIR / "collect_worker.py"
 AUTH_FILE = Path(os.environ.get("ENTRA_SURFACE_AUTH")
                  or (Path.cwd() / ".entra-surface-auth.json")).expanduser()
 GRAPH_AUDIENCES = {
     "https://graph.microsoft.com",
     "00000003-0000-0000-c000-000000000000",
+}
+AAD_GRAPH_AUDIENCES = {
+    "https://graph.windows.net",
+    "00000002-0000-0000-c000-000000000000",
 }
 REDEEM_TARGETS = {
     "graph": "https://graph.microsoft.com",
@@ -51,6 +59,7 @@ _LOCK = threading.Lock()
 _PROCESS = None
 _JOB = {
     "status": "idle",
+    "kind": "",
     "log": [],
     "output": "",
     "started_at": "",
@@ -176,10 +185,14 @@ def get_auth_status() -> dict:
         can_refresh = bool(active and active.get("refresh_token")
                            and active.get("client_id"))
         can_access = bool(active and _record_is_graph_access(active))
+        aadgraph_access = bool(active and _record_is_aadgraph_access(active))
         summaries = [_token_summary(t, active_id) for t in tokens]
         result = {
             "configured": can_refresh or can_access,
             "collect_mode": "refresh" if can_refresh else ("access" if can_access else ""),
+            "aadgraph_configured": can_refresh or aadgraph_access,
+            "aadgraph_mode": ("refresh" if can_refresh
+                              else ("access" if aadgraph_access else "")),
             "active_id": active_id,
             "tokens": summaries,
             "auth_file": str(AUTH_FILE),
@@ -281,7 +294,10 @@ def _collector_python() -> str:
 
 def _worker_command(mode: str, refresh_token: str, client_id: str,
                     token_out: str = "", out_path: Path | None = None,
-                    user_agent: str = "", access_out: str = "") -> list[str]:
+                    user_agent: str = "", access_out: str = "",
+                    access_token: str = "", evade: bool = False,
+                    gather_all: bool = False, autotoken: bool = False,
+                    mfa: bool = False) -> list[str]:
     directory = collector_dir()
     if not (directory / "graphcollect").is_dir():
         raise RuntimeError(
@@ -290,8 +306,30 @@ def _worker_command(mode: str, refresh_token: str, client_id: str,
             "external checkout)")
     if not WORKER.is_file():
         raise RuntimeError(f"collector worker not found: {WORKER}")
+    if mode == "run-aadgraph":
+        cmd = [_collector_python(), "-u", str(WORKER), "run-aadgraph"]
+        if refresh_token:
+            cmd += ["-rt", refresh_token]
+        if client_id:
+            cmd += ["-c", client_id]
+        if access_token:
+            cmd += ["-at", access_token]
+        cmd += ["-o", str(out_path)]
+        if user_agent:
+            cmd += ["-ua", user_agent]
+        if token_out:
+            cmd += ["--token-out", token_out]
+        if autotoken:
+            cmd += ["--autotoken"]
+        if evade:
+            cmd += ["--evade"]
+        if gather_all:
+            cmd += ["--gather-all"]
+        if mfa:
+            cmd += ["--mfa"]
+        return cmd
     if mode == "run-access":
-        cmd = [_collector_python(), str(WORKER), "run-access",
+        cmd = [_collector_python(), "-u", str(WORKER), "run-access",
                "-at", refresh_token, "-o", str(out_path)]
         if user_agent:
             cmd += ["-ua", user_agent]
@@ -299,7 +337,7 @@ def _worker_command(mode: str, refresh_token: str, client_id: str,
     client = (client_id or "").strip()
     if not client:
         raise ValueError("client id is required when a refresh token is provided")
-    cmd = [_collector_python(), str(WORKER), mode,
+    cmd = [_collector_python(), "-u", str(WORKER), mode,
            "-rt", refresh_token, "-c", client]
     if token_out:
         cmd += ["--token-out", token_out]
@@ -377,14 +415,18 @@ def _principal_key(principal: dict) -> tuple[str, str]:
 
 def _find_access_record(store: dict, principal: dict,
                         exclude_id: str = "",
-                        parent_id: str = "") -> dict | None:
-    """Find the record for this parent+principal+audience, if one exists."""
+                        parent_id: str = "",
+                        client_id: str = "") -> dict | None:
+    """Find the record for this parent+client+principal+audience, if one
+    exists."""
     key = _principal_key(principal)
     audience = str(principal.get("audience") or "").rstrip("/")
     for rec in store["tokens"]:
         if exclude_id and rec.get("id") == exclude_id:
             continue
         if (rec.get("parent_id") or "") != (parent_id or ""):
+            continue
+        if client_id and str(rec.get("client_id") or "").lower() != client_id.lower():
             continue
         old = rec.get("principal") or {}
         if (_principal_key(old) == key
@@ -397,7 +439,8 @@ def _store_access_token(store: dict, access_token: str, principal: dict,
                         now: str, client_id: str = "",
                         exclude_id: str = "", parent_id: str = "") -> dict:
     """Create/update the access-only record for this parent+principal+audience."""
-    match = _find_access_record(store, principal, exclude_id, parent_id)
+    match = _find_access_record(store, principal, exclude_id, parent_id,
+                                client_id=client_id)
     if match is None and parent_id:
         # Migrate an unparented record from older versions, but only when this
         # is the sole refresh token for that client. Otherwise the old record
@@ -494,12 +537,29 @@ def _is_graph_audience(claims: dict) -> bool:
     return any(str(a).rstrip("/").lower() in GRAPH_AUDIENCES for a in values)
 
 
+def _is_aadgraph_audience(claims: dict) -> bool:
+    audience = claims.get("aud") or ""
+    values = audience if isinstance(audience, list) else [audience]
+    return any(str(a).rstrip("/").lower() in AAD_GRAPH_AUDIENCES
+               for a in values)
+
+
 def _record_is_graph_access(rec: dict) -> bool:
     token = rec.get("access_token") or ""
     if not token:
         return False
     try:
         return _is_graph_audience(_decode_access_claims(token))
+    except ValueError:
+        return False
+
+
+def _record_is_aadgraph_access(rec: dict) -> bool:
+    token = rec.get("access_token") or ""
+    if not token:
+        return False
+    try:
+        return _is_aadgraph_audience(_decode_access_claims(token))
     except ValueError:
         return False
 
@@ -572,8 +632,12 @@ def set_auth(refresh_token: str, client_id: str) -> dict:
     return get_auth_status()
 
 
-def get_token_resources(token_id: str) -> dict:
-    """List the resources one saved refresh token can request tokens for."""
+def get_token_resources(token_id: str, client_id: str = "") -> dict:
+    """List the resources one saved refresh token can request tokens for.
+
+    When `client_id` names another FOCI client, the list is for that client;
+    this is how the FOCI submenu builds its resource picker.
+    """
     with _LOCK:
         store = _load_store()
         rec = next((t for t in store["tokens"] if t.get("id") == token_id),
@@ -581,13 +645,23 @@ def get_token_resources(token_id: str) -> dict:
         if rec is None:
             raise ValueError("token not found")
         has_refresh = bool(rec.get("refresh_token"))
-        client_id = rec.get("client_id") or ""
+        source_client = rec.get("client_id") or ""
     if not has_refresh:
         raise ValueError("this token has no refresh token")
-    if not client_id:
+    if not source_client:
         raise ValueError("client id is missing for this token")
-    data = token_resources.resources_for_client(client_id)
-    data["client_id"] = client_id
+    target_client = (client_id or "").strip() or source_client
+    if target_client.lower() != source_client.lower():
+        info = token_resources.client_info(source_client)
+        if not info.get("foci"):
+            raise ValueError("this token's client is not FOCI; it cannot "
+                             "redeem with another client")
+        target_info = token_resources.client_info(target_client)
+        if target_info.get("found") and not target_info.get("foci"):
+            raise ValueError("selected client is not in the FOCI family")
+    data = token_resources.resources_for_client(target_client)
+    data["client_id"] = target_client
+    data["source_client_id"] = source_client
     return data
 
 
@@ -617,23 +691,37 @@ def _resolve_redeem_resource(client_id: str, target: str,
 
 
 def redeem_saved_token(token_id: str, target: str = "graph",
-                       resource: str = "") -> dict:
-    """Redeem one saved refresh token for a mapped or custom resource."""
+                       resource: str = "", client_id: str = "") -> dict:
+    """Redeem one saved refresh token for a mapped or custom resource.
+
+    `client_id` may name a sibling FOCI client; when omitted, the token's own
+    saved client is used.
+    """
     with _LOCK:
         store = _load_store()
         rec = next((t for t in store["tokens"] if t.get("id") == token_id), None)
         if rec is None:
             raise ValueError("token not found")
         refresh_token = rec.get("refresh_token") or ""
-        client_id = rec.get("client_id") or ""
+        source_client = rec.get("client_id") or ""
     if not refresh_token:
         raise ValueError("this token has no refresh token to redeem")
-    if not client_id:
+    if not source_client:
         raise ValueError("client id is required when a refresh token is provided")
 
-    redeem_resource, _ = _resolve_redeem_resource(client_id, target, resource)
+    target_client = (client_id or "").strip() or source_client
+    if target_client.lower() != source_client.lower():
+        info = token_resources.client_info(source_client)
+        if not info.get("foci"):
+            raise ValueError("this token's client is not FOCI; it cannot "
+                             "redeem with another client")
+        target_info = token_resources.client_info(target_client)
+        if target_info.get("found") and not target_info.get("foci"):
+            raise ValueError("selected client is not in the FOCI family")
+
+    redeem_resource, _ = _resolve_redeem_resource(target_client, target, resource)
     rotated, principal, access_token = redeem_token(
-        refresh_token, client_id, redeem_resource)
+        refresh_token, target_client, redeem_resource)
     now = _timestamp()
     with _LOCK:
         store = _load_store()
@@ -653,19 +741,39 @@ def redeem_saved_token(token_id: str, target: str = "graph",
                 pass
         if old_access and old_principal.get("audience"):
             _store_access_token(store, old_access, old_principal, now,
-                                client_id=client_id, exclude_id=rec["id"],
+                                client_id=source_client, exclude_id=rec["id"],
                                 parent_id=rec["id"])
+        if old_access:
+            rec["access_token"] = ""
 
         merged = dict(old_principal)
         merged.update({k: v for k, v in principal.items() if v})
         merged["audience"] = ""
         merged["access_expires_at"] = ""
-        rec.update({
-            "refresh_token": rotated,
-            "access_token": "",
-            "principal": merged,
-            "updated_at": now,
-        })
+
+        if target_client.lower() == source_client.lower():
+            rec.update({
+                "refresh_token": rotated,
+                "access_token": "",
+                "principal": merged,
+                "updated_at": now,
+            })
+            refresh_parent_id = rec["id"]
+        else:
+            # A FOCI sibling redemption gets its own refresh entry, with the
+            # rotated refresh token and the new access token beneath it.
+            new_rec = {
+                "id": secrets.token_hex(8),
+                "added_at": now,
+                "refresh_token": rotated,
+                "access_token": "",
+                "client_id": target_client,
+                "principal": merged,
+                "updated_at": now,
+            }
+            store["tokens"].append(new_rec)
+            refresh_parent_id = new_rec["id"]
+
         access_principal = dict(merged)
         access_principal["audience"] = principal.get("audience") or ""
         access_principal["access_expires_at"] = (
@@ -673,10 +781,11 @@ def redeem_saved_token(token_id: str, target: str = "graph",
         access_principal["scopes"] = principal.get("scopes") or []
         access_principal["roles"] = principal.get("roles") or []
         _store_access_token(store, access_token, access_principal, now,
-                            client_id=client_id, exclude_id=rec["id"],
-                            parent_id=rec["id"])
-        if not store.get("active_id"):
-            store["active_id"] = rec["id"]
+                            client_id=target_client,
+                            exclude_id=refresh_parent_id,
+                            parent_id=refresh_parent_id)
+        if not store.get("active_id") or store.get("active_id") == rec["id"]:
+            store["active_id"] = refresh_parent_id
         _save_store()
     return get_auth_status()
 
@@ -685,26 +794,54 @@ def redeem_saved_token(token_id: str, target: str = "graph",
 # collection job
 
 def _resolve_credentials(refresh_token: str = "",
-                         client_id: str = "") -> tuple[str, str, str, str]:
-    """Return (mode, token, client_id, token_id) for a collection run."""
+                         client_id: str = "", backend: str = "graph",
+                         autotoken: bool = True) -> dict:
+    """Resolve the token(s) a collection backend should use."""
     token = (refresh_token or "").strip()
     client = (client_id or "").strip()
     if token:
         if not client:
             raise ValueError("client id is required when a refresh token is provided")
-        return "refresh", token, client, ""
+        return {"mode": "refresh", "refresh_token": token,
+                "access_token": "", "client_id": client, "token_id": ""}
     with _LOCK:
         store = _load_store()
         active = next((t for t in store["tokens"]
                        if t.get("id") == store.get("active_id")), None)
         if active is None:
             raise ValueError("add and select a token in Tokens first")
-        if active.get("refresh_token") and active.get("client_id"):
-            return "refresh", active["refresh_token"], active["client_id"], active["id"]
-        if _record_is_graph_access(active):
-            return "access", active["access_token"], "", active["id"]
+        active_id = active.get("id") or ""
+        rec_refresh = active.get("refresh_token") or ""
+        rec_access = active.get("access_token") or ""
+        rec_client = active.get("client_id") or ""
+    if backend == "aadgraph":
+        if rec_refresh and rec_client:
+            if autotoken:
+                return {"mode": "refresh", "refresh_token": rec_refresh,
+                        "access_token": rec_access, "client_id": rec_client,
+                        "token_id": active_id}
+            if rec_access and _record_is_aadgraph_access(active):
+                return {"mode": "access", "refresh_token": rec_refresh,
+                        "access_token": rec_access, "client_id": rec_client,
+                        "token_id": active_id}
+            raise ValueError(
+                "enable autotoken or select an AAD Graph access token")
+        if rec_access and _record_is_aadgraph_access(active):
+            return {"mode": "access", "refresh_token": "",
+                    "access_token": rec_access, "client_id": rec_client,
+                    "token_id": active_id}
         raise ValueError(
-            "select a token with a refresh token or a Microsoft Graph access token")
+            "select a token with a refresh token or AAD Graph access token")
+    if rec_refresh and rec_client:
+        return {"mode": "refresh", "refresh_token": rec_refresh,
+                "access_token": rec_access, "client_id": rec_client,
+                "token_id": active_id}
+    if rec_access and _record_is_graph_access(active):
+        return {"mode": "access", "refresh_token": "",
+                "access_token": rec_access, "client_id": rec_client,
+                "token_id": active_id}
+    raise ValueError(
+        "select a token with a refresh token or a Microsoft Graph access token")
 
 
 def _append_log(line: str) -> None:
@@ -718,6 +855,7 @@ def get_status() -> dict:
     with _LOCK:
         return {
             "status": _JOB["status"],
+            "kind": _JOB.get("kind") or "",
             "log": list(_JOB["log"]),
             "output": _JOB["output"],
             "started_at": _JOB["started_at"],
@@ -729,24 +867,46 @@ def get_status() -> dict:
 
 
 def start_collection(refresh_token: str = "", out: str = "",
-                     client_id: str = "", user_agent: str = "") -> dict:
+                     client_id: str = "", user_agent: str = "",
+                     backend: str = "graph", evade: bool = False,
+                     gather_all: bool = False, autotoken: bool = True,
+                     mfa: bool = False) -> dict:
     """Start one background collection job; only one can run at a time."""
     global _PROCESS
-    mode, token, client, token_id = _resolve_credentials(refresh_token, client_id)
-    out_path = Path(out or DEFAULT_OUTPUT).expanduser()
+    backend = (backend or "graph").strip().lower()
+    if backend not in ("graph", "aadgraph"):
+        raise ValueError("unknown collection backend")
+    creds = _resolve_credentials(refresh_token, client_id, backend, autotoken)
+    default_out = (DEFAULT_AADGRAPH_OUTPUT if backend == "aadgraph"
+                   else DEFAULT_OUTPUT)
+    out_path = Path(out or default_out).expanduser()
     if not out_path.is_absolute():
         out_path = (Path.cwd() / out_path).resolve()
     token_out = None
     access_out = None
-    if mode == "refresh":
+    if backend == "aadgraph":
+        if creds["refresh_token"]:
+            token_out = _temp_token_path()
+        cmd = _worker_command(
+            "run-aadgraph", creds["refresh_token"], creds["client_id"],
+            token_out=str(token_out) if token_out else "",
+            out_path=out_path, user_agent=user_agent,
+            access_token=creds["access_token"], evade=evade,
+            gather_all=gather_all,
+            autotoken=bool(autotoken and creds["refresh_token"]), mfa=mfa)
+        initial_log = "Starting AAD Graph collector..."
+    elif creds["mode"] == "refresh":
         token_out = _temp_token_path()
         access_out = _temp_token_path()
-        cmd = _worker_command("run", token, client, str(token_out),
+        cmd = _worker_command("run", creds["refresh_token"],
+                              creds["client_id"], str(token_out),
                               out_path=out_path, user_agent=user_agent,
                               access_out=str(access_out))
+        initial_log = "Starting collector..."
     else:
-        cmd = _worker_command("run-access", token, "", out_path=out_path,
-                              user_agent=user_agent)
+        cmd = _worker_command("run-access", creds["access_token"], "",
+                              out_path=out_path, user_agent=user_agent)
+        initial_log = "Starting collector..."
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with _LOCK:
@@ -754,7 +914,8 @@ def start_collection(refresh_token: str = "", out: str = "",
             raise RuntimeError("a collection is already running")
         _JOB.update({
             "status": "running",
-            "log": ["Starting collector..."],
+            "kind": backend,
+            "log": [initial_log],
             "output": str(out_path),
             "started_at": _timestamp(),
             "finished_at": "",
@@ -762,9 +923,11 @@ def start_collection(refresh_token: str = "", out: str = "",
             "error": "",
         })
 
-    _mark_token_used(token_id, out_path, mode)
+    _mark_token_used(creds["token_id"], out_path,
+                     "aadgraph" if backend == "aadgraph" else creds["mode"])
     thread = threading.Thread(target=_run_job,
-                              args=(cmd, token_out, access_out, token_id),
+                              args=(cmd, token_out, access_out,
+                                    creds["token_id"]),
                               daemon=True)
     thread.start()
     return get_status()
@@ -837,6 +1000,15 @@ def styles_html() -> str:
     min-height: 54px; resize: vertical;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
   }
+  .collect-check {
+    display: flex; align-items: center; gap: 8px; margin: 0 0 10px;
+    color: var(--text-secondary); font-size: 12px; cursor: pointer;
+  }
+  .collect-check input { margin: 0; }
+  .collect-check-note {
+    margin: -3px 0 12px; color: var(--text-muted);
+    font-size: 11px; line-height: 1.35;
+  }
   .client-search { position: relative; width: 100%; }
   .client-search input { width: 100%; box-sizing: border-box; }
   .client-menu {
@@ -879,11 +1051,6 @@ def styles_html() -> str:
   .collect-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .collect-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .collect-actions .muted { flex: 1; min-width: 220px; }
-  .collect-check {
-    display: flex; align-items: center; gap: 8px; margin: 0 0 14px;
-    color: var(--text-secondary); font-size: 12px; cursor: pointer;
-  }
-  .collect-check input { margin: 0; }
   .collect-status {
     margin-top: 18px; background: var(--surface-1);
     border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px;
@@ -1036,6 +1203,33 @@ def styles_html() -> str:
     font-size: 10.5px; color: var(--text-muted); line-height: 1.35;
     overflow-wrap: anywhere;
   }
+  .redeem-option.redeem-submenu {
+    flex-direction: row; align-items: center; gap: 10px;
+  }
+  .redeem-option-text {
+    display: flex; flex-direction: column; gap: 1px; min-width: 0;
+  }
+  .redeem-option-chevron {
+    margin-left: auto; color: var(--text-muted); font-size: 15px;
+  }
+  .redeem-submenu-head {
+    display: flex; align-items: center; gap: 6px;
+    padding: 2px 4px 5px; margin-bottom: 3px;
+    border-bottom: 1px solid var(--gridline);
+  }
+  .redeem-back {
+    border: 0; border-radius: 5px; background: transparent;
+    color: var(--accent); padding: 3px 6px; font: inherit;
+    font-size: 11.5px; font-weight: 600; cursor: pointer;
+  }
+  .redeem-back:hover {
+    background: color-mix(in srgb, var(--accent) 13%, transparent);
+  }
+  .redeem-submenu-title {
+    color: var(--text-muted); font-size: 10.5px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.04em;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .redeem-note {
     padding: 6px 8px; color: var(--text-muted); font-size: 11px;
     line-height: 1.35;
@@ -1085,12 +1279,72 @@ def styles_html() -> str:
     display: flex; flex-direction: column; gap: 5px;
     margin: 6px 0; color: var(--text-muted); font-size: 11px;
   }
+  .token-secret-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 8px;
+  }
+  .token-decode-btn { padding: 2px 8px; font-size: 11px; }
   .token-secret textarea {
     width: 100%; min-height: 96px; max-height: 240px; resize: vertical;
     background: var(--surface-1); color: var(--text-primary);
     border: 1px solid var(--border); border-radius: 6px;
     padding: 8px 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 12px; line-height: 1.4; overflow-wrap: anywhere;
+  }
+  .token-decode-overlay {
+    position: fixed; inset: 0; z-index: 1300;
+    background: rgba(0, 0, 0, 0.45);
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px;
+  }
+  .token-decode-overlay.hidden { display: none; }
+  .token-decode-box {
+    display: flex; flex-direction: column;
+    width: min(900px, 94vw); max-height: min(82vh, 760px);
+    background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.38);
+    overflow: hidden;
+  }
+  .token-decode-head {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 12px; padding: 14px 16px;
+    border-bottom: 1px solid var(--gridline);
+  }
+  .token-decode-head h3 { margin: 0; font-size: 15px; }
+  .token-decode-sub {
+    color: var(--text-muted); font-size: 11px; margin-top: 2px;
+    overflow-wrap: anywhere;
+  }
+  .token-decode-close {
+    background: none; border: 1px solid var(--border);
+    color: var(--text-secondary); font-size: 16px; line-height: 1;
+    cursor: pointer; padding: 5px 10px; border-radius: 6px; flex: none;
+  }
+  .token-decode-close:hover {
+    background: var(--row-hover); color: var(--text-primary);
+  }
+  .token-decode-body {
+    display: flex; flex-direction: column; gap: 14px;
+    padding: 14px 16px 18px; overflow: auto;
+  }
+  .token-decode-section h4 {
+    margin: 0 0 6px; color: var(--text-muted); font-size: 10.5px;
+    font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .token-decode-json {
+    margin: 0; padding: 10px 12px; border-radius: 8px;
+    background: var(--page-plane); border: 1px solid var(--border);
+    color: var(--text-primary);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; line-height: 1.45; white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .token-decode-error {
+    padding: 10px 12px; border-radius: 8px;
+    background: color-mix(in srgb, var(--status-critical) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--status-critical) 28%, transparent);
+    color: var(--status-critical); font-size: 12px; line-height: 1.4;
   }
   .token-empty { padding: 24px; text-align: center; color: var(--text-muted); }
   @media (max-width: 700px) {
@@ -1102,10 +1356,11 @@ def styles_html() -> str:
 def view_html() -> str:
     """Markup and JS for the sidebar's Collect view."""
     default_out = html.escape(str(DEFAULT_OUTPUT))
+    default_aad_out = html.escape(str(DEFAULT_AADGRAPH_OUTPUT))
     return r"""<section class="collect-panel">
   <h1>Collect</h1>
-  <p class="sub">Run the graphcollect backend to write a ROADrecon-compatible database.
-    Authentication is configured in the Tokens tab.</p>
+  <p class="sub">Run the Graph or AAD Graph collector to write a
+    ROADrecon-compatible database. Authentication is configured in the Tokens tab.</p>
   <div class="drawer-tabs collect-tabs" id="collect-tabs">
     <button type="button" class="drawer-tab active" data-collect-view="graph">Graph</button>
     <button type="button" class="drawer-tab" data-collect-view="aadgraph">AAD Graph</button>
@@ -1120,28 +1375,60 @@ def view_html() -> str:
         <span>User-Agent (optional)</span>
         <input id="collect-ua" type="text" autocomplete="off" spellcheck="false">
       </label>
-      <label class="collect-check">
-        <input type="checkbox" id="collect-auto-analyze" checked>
-        <span>Send for analysis once complete</span>
-      </label>
       <div class="collect-actions">
         <button type="button" class="mode-btn" id="collect-start">Start collection</button>
+        <button type="button" class="mode-btn" id="collect-go-analysis">Go to analysis</button>
         <span class="muted" id="collect-note"></span>
       </div>
-    </div>
-    <div class="collect-status hidden" id="collect-status">
-      <div class="collect-status-head">
-        <b id="collect-state">Idle</b>
-        <span class="mono" id="collect-output"></span>
-        <button type="button" class="mode-btn hidden" id="collect-analyze">Send to analysis</button>
-      </div>
-      <pre class="collect-log" id="collect-log"></pre>
     </div>
   </div>
   <div id="collect-pane-aadgraph" class="hidden">
     <div class="collect-card">
-      <p class="muted">AAD Graph collection will be added here.</p>
+      <label class="collect-field">
+        <span>Output database</span>
+        <input id="collect-aad-out" type="text" spellcheck="false" value="__DEFAULT_AADGRAPH_OUT__">
+      </label>
+      <label class="collect-field">
+        <span>User-Agent (optional)</span>
+        <input id="collect-aad-ua" type="text" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="collect-check-note">
+        AAD Graph collection recreates the output database from a fresh snapshot.
+      </div>
+      <label class="collect-check">
+        <input type="checkbox" id="collect-aad-autotoken" checked>
+        <span>Request an AAD Graph token from the refresh token automatically</span>
+      </label>
+      <label class="collect-check">
+        <input type="checkbox" id="collect-aad-evade">
+        <span>Evade AAD Graph enumeration detections (batch requests)</span>
+      </label>
+      <label class="collect-check">
+        <input type="checkbox" id="collect-aad-gatherall">
+        <span>Gather all (also collect IG, PIM, and Azure data)</span>
+      </label>
+      <div class="collect-check-note">
+        Gather all needs a refresh token so Microsoft Graph and ARM tokens can
+        be requested.
+      </div>
+      <label class="collect-check">
+        <input type="checkbox" id="collect-aad-mfa">
+        <span>Dump MFA details (requires a privileged account)</span>
+      </label>
+      <div class="collect-actions">
+        <button type="button" class="mode-btn" id="collect-aad-start">Start collection</button>
+        <button type="button" class="mode-btn" id="collect-aad-go-analysis">Go to analysis</button>
+        <span class="muted" id="collect-aad-note"></span>
+      </div>
     </div>
+  </div>
+  <div class="collect-status hidden" id="collect-status">
+    <div class="collect-status-head">
+      <b id="collect-state">Idle</b>
+      <span class="muted" id="collect-kind"></span>
+      <span class="mono" id="collect-output"></span>
+    </div>
+    <pre class="collect-log" id="collect-log"></pre>
   </div>
 </section>
 <script>
@@ -1150,19 +1437,28 @@ def view_html() -> str:
   var uaEl = document.getElementById('collect-ua');
   var startBtn = document.getElementById('collect-start');
   var noteEl = document.getElementById('collect-note');
+  var aadOutEl = document.getElementById('collect-aad-out');
+  var aadUaEl = document.getElementById('collect-aad-ua');
+  var aadStartBtn = document.getElementById('collect-aad-start');
+  var aadNoteEl = document.getElementById('collect-aad-note');
+  var aadAutoEl = document.getElementById('collect-aad-autotoken');
+  var aadEvadeEl = document.getElementById('collect-aad-evade');
+  var aadGatherEl = document.getElementById('collect-aad-gatherall');
+  var aadMfaEl = document.getElementById('collect-aad-mfa');
   var statusEl = document.getElementById('collect-status');
   var stateEl = document.getElementById('collect-state');
+  var kindEl = document.getElementById('collect-kind');
   var outputEl = document.getElementById('collect-output');
   var logEl = document.getElementById('collect-log');
-  var analyzeBtn = document.getElementById('collect-analyze');
-  var autoAnalyzeEl = document.getElementById('collect-auto-analyze');
+  var goAnalysisBtn = document.getElementById('collect-go-analysis');
+  var aadGoAnalysisBtn = document.getElementById('collect-aad-go-analysis');
   var collectTabs = Array.prototype.slice.call(
     document.querySelectorAll('#collect-tabs button[data-collect-view]'));
   var collectPanes = {
     graph: document.getElementById('collect-pane-graph'),
     aadgraph: document.getElementById('collect-pane-aadgraph')
   };
-  if (!startBtn) return;
+  if (!startBtn || !aadStartBtn) return;
 
   function showCollectPane(name) {
     Object.keys(collectPanes).forEach(function(key) {
@@ -1179,60 +1475,78 @@ def view_html() -> str:
     });
   });
   var timer = null;
-  var authConfigured = false;
+  var graphConfigured = false;
+  var aadConfigured = false;
+  var aadMode = '';
   var lastStatus = 'idle';
-  var currentOutput = '';
 
-  function setNote(text) { noteEl.textContent = text || ''; }
+  function setGraphNote(text) { noteEl.textContent = text || ''; }
+  function setAadNote(text) { aadNoteEl.textContent = text || ''; }
 
   function idleNote() {
-    if (!authConfigured) setNote('Add and select a refresh token or Microsoft Graph access token in Tokens first.');
-    else setNote('');
+    if (!graphConfigured) setGraphNote('Add and select a refresh token or Microsoft Graph access token in Tokens first.');
+    else setGraphNote('');
   }
 
-  function startAnalysisNow() {
-    if (!currentOutput) return;
-    if (!window.ENTRA_ANALYSIS) {
-      setNote('Analysis backend is not available.');
-      return;
+  function aadIdleNote() {
+    if (!aadConfigured) {
+      setAadNote('Add and select a refresh token or AAD Graph access token in Tokens first.');
+    } else if (aadMode !== 'refresh') {
+      setAadNote('Using an AAD Graph access token; autotoken and Gather all are unavailable.');
+    } else {
+      setAadNote('');
     }
-    if (analyzeBtn) analyzeBtn.disabled = true;
-    setNote('Starting analysis...');
-    window.ENTRA_ANALYSIS.start(currentOutput, function(text, failed) {
-      setNote(text);
-      if (failed && analyzeBtn) analyzeBtn.disabled = false;
-    });
+  }
+
+  function goToAnalysis() {
+    var navBtn = document.querySelector('#sidebar-nav button[data-view="analysis"]');
+    if (navBtn) navBtn.click();
+    var wrap = document.getElementById('analysis-start-wrap');
+    if (wrap && wrap.classList.contains('hidden')) {
+      var toggle = document.getElementById('reanalyze-btn');
+      if (toggle) toggle.click();
+    }
+    var select = document.getElementById('analysis-db-select');
+    if (select) select.focus();
+  }
+
+  function kindLabel(kind) {
+    return kind === 'aadgraph' ? 'AAD Graph' : (kind ? 'Microsoft Graph' : '');
+  }
+
+  function setKindNote(kind, text) {
+    if (kind === 'aadgraph') setAadNote(text);
+    else setGraphNote(text);
   }
 
   function render(data) {
     var running = data.status === 'running';
-    var previousStatus = lastStatus;
+    var kind = data.kind || 'graph';
     lastStatus = data.status;
     startBtn.disabled = running;
+    aadStartBtn.disabled = running;
     statusEl.classList.toggle('hidden', data.status === 'idle' && !(data.log || []).length);
     stateEl.textContent = {
       idle: 'Idle', running: 'Collecting...', done: 'Collection complete',
       error: 'Collection failed'
     }[data.status] || data.status;
+    kindEl.textContent = data.status === 'idle' ? '' : kindLabel(kind);
     outputEl.textContent = data.output ? data.output : '';
-    currentOutput = data.output || '';
-    if (analyzeBtn) {
-      analyzeBtn.classList.toggle('hidden', data.status !== 'done' || !currentOutput);
-    }
     logEl.textContent = (data.log || []).join('\n');
     logEl.scrollTop = logEl.scrollHeight;
     if (data.status === 'done') {
-      if (previousStatus === 'running' && autoAnalyzeEl && autoAnalyzeEl.checked) {
-        startAnalysisNow();
-      } else {
-        setNote('Done. Send it to analysis or restart with --db.');
-      }
+      setKindNote(kind, 'Done. Use Go to analysis to load it.');
+      if (kind === 'aadgraph') idleNote(); else aadIdleNote();
     } else if (data.status === 'error') {
-      setNote(data.error || 'Collection failed.');
+      setKindNote(kind, data.error || 'Collection failed.');
+      if (kind === 'aadgraph') idleNote(); else aadIdleNote();
     } else if (running) {
-      setNote('Collector is running...');
+      setKindNote(kind, 'Collector is running...');
+      setKindNote(kind === 'aadgraph' ? 'graph' : 'aadgraph',
+                  'A different collection is running.');
     } else {
       idleNote();
+      aadIdleNote();
     }
     return running;
   }
@@ -1241,8 +1555,23 @@ def view_html() -> str:
     return fetch('/api/tokens')
       .then(function(r) { return r.json(); })
       .then(function(data) {
-        authConfigured = !!data.configured;
-        if (lastStatus === 'idle') idleNote();
+        graphConfigured = !!data.configured;
+        aadConfigured = !!data.aadgraph_configured;
+        aadMode = data.aadgraph_mode || '';
+        if (aadAutoEl) {
+          var wasDisabled = aadAutoEl.disabled;
+          aadAutoEl.disabled = aadMode !== 'refresh';
+          if (aadMode !== 'refresh') aadAutoEl.checked = false;
+          else if (wasDisabled) aadAutoEl.checked = true;
+        }
+        if (aadGatherEl) {
+          aadGatherEl.disabled = aadMode !== 'refresh';
+          if (aadMode !== 'refresh') aadGatherEl.checked = false;
+        }
+        if (lastStatus === 'idle') {
+          idleNote();
+          aadIdleNote();
+        }
       })
       .catch(function() {});
   }
@@ -1259,7 +1588,7 @@ def view_html() -> str:
       });
   }
 
-  function submitFormFallback() {
+  function submitFormFallback(payload, btn, noteFn) {
     var frame = document.getElementById('collect-post-frame');
     if (!frame) {
       frame = document.createElement('iframe');
@@ -1273,14 +1602,14 @@ def view_html() -> str:
     form.action = '/api/collect';
     form.target = 'collect-post-frame';
     form.style.display = 'none';
-    [['out', outEl.value.trim()], ['user_agent', uaEl.value.trim()]]
-      .forEach(function(pair) {
-        var input = document.createElement('input');
-        input.type = 'hidden';
-        input.name = pair[0];
-        input.value = pair[1];
-        form.appendChild(input);
-      });
+    Object.keys(payload).forEach(function(key) {
+      var input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = key;
+      input.value = typeof payload[key] === 'boolean'
+        ? (payload[key] ? '1' : '0') : payload[key];
+      form.appendChild(input);
+    });
     document.body.appendChild(form);
     form.submit();
     setTimeout(function() { form.remove(); }, 1500);
@@ -1294,35 +1623,24 @@ def view_html() -> str:
           } else if (data.status === 'done' || data.status === 'error') {
             render(data);
           } else {
-            startBtn.disabled = false;
-            setNote('Could not start collection. Check that entra-surface is still running.');
+            btn.disabled = false;
+            noteFn('Could not start collection. Check that entra-surface is still running.');
           }
         })
         .catch(function() {
-          startBtn.disabled = false;
-          setNote('Could not reach the local server. Check that entra-surface is still running.');
+          btn.disabled = false;
+          noteFn('Could not reach the local server. Check that entra-surface is still running.');
         });
     }, 800);
   }
 
-  if (analyzeBtn) {
-    analyzeBtn.addEventListener('click', startAnalysisNow);
-  }
-
-  startBtn.addEventListener('click', function() {
-    if (!authConfigured) {
-      setNote('Add and select a refresh token or Microsoft Graph access token in Tokens first.');
-      return;
-    }
-    startBtn.disabled = true;
-    setNote('Starting collector...');
+  function startBackend(payload, btn, noteFn) {
+    btn.disabled = true;
+    noteFn('Starting collector...');
     fetch('/api/collect', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        out: outEl.value.trim(),
-        user_agent: uaEl.value.trim()
-      })
+      body: JSON.stringify(payload)
     }).then(function(r) {
       return r.json().then(function(data) {
         if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
@@ -1331,12 +1649,49 @@ def view_html() -> str:
     }).then(function(data) {
       render(data);
       poll();
-    }).catch(function() {
+    }).catch(function(err) {
+      if (err && err.name !== 'TypeError') {
+        btn.disabled = false;
+        noteFn(err.message || 'Could not start collection.');
+        return;
+      }
       // Some browsers/extensions block fetch to localhost; a normal form POST
       // still works and the status endpoint shows whether the job started.
-      setNote('Retrying collection start...');
-      submitFormFallback();
+      noteFn('Retrying collection start...');
+      submitFormFallback(payload, btn, noteFn);
     });
+  }
+
+  if (goAnalysisBtn) goAnalysisBtn.addEventListener('click', goToAnalysis);
+  if (aadGoAnalysisBtn) aadGoAnalysisBtn.addEventListener('click', goToAnalysis);
+
+  startBtn.addEventListener('click', function() {
+    if (!graphConfigured) {
+      setGraphNote('Add and select a refresh token or Microsoft Graph access token in Tokens first.');
+      return;
+    }
+    startBackend({
+      backend: 'graph',
+      out: outEl.value.trim(),
+      user_agent: uaEl.value.trim()
+    }, startBtn, setGraphNote);
+  });
+
+  aadStartBtn.addEventListener('click', function() {
+    if (!aadConfigured) {
+      setAadNote('Add and select a refresh token or AAD Graph access token in Tokens first.');
+      return;
+    }
+    var payload = {
+      backend: 'aadgraph',
+      out: aadOutEl.value.trim(),
+      user_agent: aadUaEl.value.trim(),
+      autotoken: !!(aadAutoEl && aadAutoEl.checked),
+      evade: !!(aadEvadeEl && aadEvadeEl.checked),
+      gather_all: !!(aadGatherEl && aadGatherEl.checked),
+      mfa: !!(aadMfaEl && aadMfaEl.checked)
+    };
+    startBackend(payload, aadStartBtn, setAadNote);
   });
 
   document.addEventListener('app:view', function(e) {
@@ -1350,7 +1705,8 @@ def view_html() -> str:
   poll();
 })();
 </script>
-""".replace("__DEFAULT_OUT__", default_out)
+""".replace("__DEFAULT_OUT__", default_out).replace(
+    "__DEFAULT_AADGRAPH_OUT__", default_aad_out)
 
 
 def tokens_view_html() -> str:
@@ -1427,6 +1783,20 @@ def tokens_view_html() -> str:
     </div>
     <div class="principal-list" id="token-list"></div>
   </div>
+  <div class="token-decode-overlay hidden" id="token-decode-overlay"
+       role="dialog" aria-modal="true" aria-labelledby="token-decode-title">
+    <div class="token-decode-box">
+      <div class="token-decode-head">
+        <div>
+          <h3 id="token-decode-title">Decoded token</h3>
+          <div class="token-decode-sub" id="token-decode-sub"></div>
+        </div>
+        <button type="button" class="token-decode-close" id="token-decode-close"
+                aria-label="Close decoded token">&times;</button>
+      </div>
+      <div class="token-decode-body" id="token-decode-body"></div>
+    </div>
+  </div>
 </section>
 <script>
 (function() {
@@ -1454,6 +1824,11 @@ def tokens_view_html() -> str:
   var filterType = document.getElementById('token-filter-type');
   var filterStatus = document.getElementById('token-filter-status');
   var filterAudience = document.getElementById('token-filter-audience');
+  var decodeOverlay = document.getElementById('token-decode-overlay');
+  var decodeTitle = document.getElementById('token-decode-title');
+  var decodeSub = document.getElementById('token-decode-sub');
+  var decodeBody = document.getElementById('token-decode-body');
+  var decodeClose = document.getElementById('token-decode-close');
   if (!saveBtn || !listEl) return;
   var lastTokenData = {tokens: []};
   var clientApps = null;
@@ -1466,9 +1841,10 @@ def tokens_view_html() -> str:
   redeemMenu.id = 'redeem-menu';
   redeemMenu.className = 'redeem-menu hidden';
   redeemMenu.setAttribute('role', 'listbox');
-  redeemMenu.setAttribute('aria-label', 'Resources');
+  redeemMenu.setAttribute('aria-label', 'Redeem options');
   document.body.appendChild(redeemMenu);
   var redeemState = null;
+  var lastDecodeButton = null;
 
   function esc(value) {
     return String(value == null ? '' : value)
@@ -1483,6 +1859,90 @@ def tokens_view_html() -> str:
     flashEl.textContent = text || '';
     flashEl.classList.toggle('hidden', !text);
     flashEl.classList.toggle('error', !!failed);
+  }
+
+  function base64UrlDecode(value) {
+    var input = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+    while (input.length % 4) input += '=';
+    var binary = atob(input);
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+
+  function decodeJwt(token) {
+    var parts = String(token || '').trim().split('.');
+    if (parts.length !== 3) {
+      throw new Error('Not a JWT; this token has no decodable header and payload.');
+    }
+    var header;
+    var payload;
+    try {
+      header = JSON.parse(base64UrlDecode(parts[0]));
+    } catch (err) {
+      throw new Error('Could not decode the JWT header.');
+    }
+    try {
+      payload = JSON.parse(base64UrlDecode(parts[1]));
+    } catch (err) {
+      throw new Error('Could not decode the JWT payload.');
+    }
+    return {header: header, payload: payload};
+  }
+
+  function closeDecode() {
+    if (!decodeOverlay) return;
+    decodeOverlay.classList.add('hidden');
+    if (lastDecodeButton && document.contains(lastDecodeButton)) {
+      lastDecodeButton.focus();
+    }
+    lastDecodeButton = null;
+  }
+
+  function openDecode(kind, token, button) {
+    if (!decodeOverlay || !decodeBody) return;
+    lastDecodeButton = button || null;
+    var label = kind === 'refresh' ? 'Refresh token' : 'Access token';
+    decodeTitle.textContent = 'Decoded ' + label.toLowerCase();
+    decodeSub.textContent = label;
+    var body;
+    if (!token) {
+      body = '<div class="token-decode-error">No token captured for this entry.</div>';
+    } else {
+      try {
+        var decoded = decodeJwt(token);
+        var details = [];
+        var alg = decoded.header && decoded.header.alg;
+        if (alg) details.push('alg ' + alg);
+        var aud = decoded.payload && decoded.payload.aud;
+        if (Array.isArray(aud)) aud = aud.join(', ');
+        if (aud) details.push('aud ' + aud);
+        var exp = decoded.payload && decoded.payload.exp;
+        if (exp) {
+          var expires = new Date(Number(exp) * 1000);
+          if (!isNaN(expires.getTime())) {
+            details.push('expires ' + expires.toISOString());
+          }
+        }
+        decodeSub.textContent = label
+          + (details.length ? ' · ' + details.join(' · ') : '');
+        body = '<div class="token-decode-section"><h4>Header</h4>'
+          + '<pre class="token-decode-json">'
+          + esc(JSON.stringify(decoded.header, null, 2))
+          + '</pre></div>'
+          + '<div class="token-decode-section"><h4>Payload</h4>'
+          + '<pre class="token-decode-json">'
+          + esc(JSON.stringify(decoded.payload, null, 2))
+          + '</pre></div>';
+      } catch (err) {
+        decodeSub.textContent = label + ' · not decodable';
+        body = '<div class="token-decode-error">'
+          + esc(err.message || 'Could not decode this token.') + '</div>';
+      }
+    }
+    decodeBody.innerHTML = body;
+    decodeOverlay.classList.remove('hidden');
+    if (decodeClose) decodeClose.focus();
   }
 
   function formatDuration(ms) {
@@ -1905,11 +2365,14 @@ def tokens_view_html() -> str:
     return [p.tenant_id || '', identity].join('|');
   }
 
-  function tokenRow(t, nested) {
+  function tokenRow(t, nested, parentClientId) {
     var p = t.principal || {};
     var hasRefresh = !!t.has_refresh_token;
     var hasAccess = !!t.has_access_token;
     var nestedAccess = !hasRefresh && !!nested;
+    var viaClient = nestedAccess && parentClientId && t.client_id
+      && String(t.client_id).toLowerCase()
+        !== String(parentClientId).toLowerCase();
     var typeLabel = hasRefresh && hasAccess ? 'Refresh + Access Token'
       : (hasRefresh ? 'Refresh Token' : 'Access Token');
     var typeClass = hasRefresh && hasAccess ? 'both'
@@ -1934,12 +2397,18 @@ def tokens_view_html() -> str:
       : '';
     var secretFields = '';
     if (t.has_access_token) {
-      secretFields += '<label class="token-secret-field">Access token'
-        + '<textarea readonly data-secret="access" spellcheck="false" placeholder="Not captured"></textarea></label>';
+      secretFields += '<div class="token-secret-field">'
+        + '<span class="token-secret-head">Access token'
+        + '<button type="button" class="mode-btn token-decode-btn"'
+        + ' data-decode-secret="access">Decode</button></span>'
+        + '<textarea readonly data-secret="access" aria-label="Access token" spellcheck="false" placeholder="Not captured"></textarea></div>';
     }
     if (t.has_refresh_token) {
-      secretFields += '<label class="token-secret-field">Refresh token'
-        + '<textarea readonly data-secret="refresh" spellcheck="false" placeholder="Not captured"></textarea></label>';
+      secretFields += '<div class="token-secret-field">'
+        + '<span class="token-secret-head">Refresh token'
+        + '<button type="button" class="mode-btn token-decode-btn"'
+        + ' data-decode-secret="refresh">Decode</button></span>'
+        + '<textarea readonly data-secret="refresh" aria-label="Refresh token" spellcheck="false" placeholder="Not captured"></textarea></div>';
     }
     var clientHtml = t.client_name
       ? '<span>' + esc(t.client_name) + '</span>'
@@ -1959,7 +2428,7 @@ def tokens_view_html() -> str:
       : '<span class="token-row-client"' + clientTitle + '>'
         + '<span class="token-row-label">Client:</span> '
         + clientHtml + '</span>';
-    var actions = '<button type="button" class="mode-btn" data-action="view" data-id="' + esc(t.id) + '">View tokens</button>';
+    var actions = '';
     if (t.has_refresh_token) {
       actions += '<input type="search" class="redeem-input" data-redeem-id="'
         + esc(t.id) + '" placeholder="Redeem for..." aria-label="Redeem for"'
@@ -1967,6 +2436,7 @@ def tokens_view_html() -> str:
         + ' aria-expanded="false" aria-controls="redeem-menu"'
         + ' autocomplete="off" spellcheck="false">';
     }
+    actions += '<button type="button" class="mode-btn" data-action="view" data-id="' + esc(t.id) + '">View tokens</button>';
     actions += t.active
       ? '<span class="tag-chip tag-privileged">Active</span>'
       : '<button type="button" class="mode-btn" data-action="use" data-id="' + esc(t.id) + '">Use</button>';
@@ -1982,6 +2452,9 @@ def tokens_view_html() -> str:
         : '<div class="token-row-meta"' + audienceTitle + '>'
           + '<span class="token-row-label">Audience:</span> '
           + esc(audienceText) + '</div>')
+      + (viaClient ? '<div class="token-row-meta">'
+        + '<span class="token-row-label">Client:</span> '
+        + clientHtml + '</div>' : '')
       + (savedLine ? '<div class="token-row-meta">' + esc(savedLine) + '</div>' : '')
       + (usedLine ? '<div class="token-row-meta">' + esc(usedLine) + '</div>' : '')
       + (expiresLine ? '<div class="token-row-meta">' + esc(expiresLine) + '</div>' : '')
@@ -2006,7 +2479,9 @@ def tokens_view_html() -> str:
       children.forEach(function(at) { used[at.id] = true; });
       if (children.length) {
         html += '<div class="token-access-children">'
-          + children.map(function(at) { return tokenRow(at, true); }).join('')
+          + children.map(function(at) {
+              return tokenRow(at, true, rt.client_id);
+            }).join('')
           + '</div>';
       }
     });
@@ -2298,100 +2773,324 @@ def tokens_view_html() -> str:
 
   function submitCustomRedeem() {
     if (!redeemState) return;
+    var state = redeemState;
     var customInput = redeemMenu.querySelector('.redeem-custom-input');
     var value = customInput
-      ? customInput.value.trim() : redeemState.customValue;
+      ? customInput.value.trim() : state.customValue;
     if (!value) {
       if (customInput) customInput.focus();
       return;
     }
-    redeemState.customValue = value;
+    state.customValue = value;
     if (!looksLikeResource(value)) {
-      redeemState.customError = 'Enter a client ID or resource URI.';
+      state.customError = 'Enter a client ID or resource URI.';
       renderRedeemMenu();
       focusCustomInput();
       return;
     }
+    state.customError = '';
+    var client = state.fociClient;
+    redeemFor(state.tokenId, state.input, value, value,
+              client ? client.id : '',
+              client ? (client.name || client.id) : '');
+  }
+
+  function redeemStatusFor(data) {
+    var result = {error: '', note: ''};
+    if (data.allow_custom) {
+      if (data.error) {
+        result.error = data.error;
+        result.note = 'Common resources are listed; type a resource URI to use a custom one.';
+      } else {
+        var reason = data.reason || 'This client is not in the entrascopes dataset';
+        reason = reason.charAt(0).toUpperCase() + reason.slice(1);
+        result.note = reason
+          + '. Common resources are listed; type a resource URI to use a custom one.';
+      }
+    }
+    return result;
+  }
+
+  function redeemSubmenuHtml(index, name, meta) {
+    return '<button type="button" class="redeem-option redeem-submenu"'
+      + ' id="redeem-option-' + index + '"'
+      + ' data-redeem-index="' + index + '" role="option">'
+      + '<span class="redeem-option-text">'
+      + '<span class="redeem-option-name">' + esc(name) + '</span>'
+      + '<span class="redeem-option-meta">' + esc(meta) + '</span>'
+      + '</span><span class="redeem-option-chevron" aria-hidden="true">›</span>'
+      + '</button>';
+  }
+
+  function redeemBackBarHtml(title) {
+    return '<div class="redeem-submenu-head">'
+      + '<button type="button" class="redeem-back" data-redeem-back="1">'
+      + '‹ Back</button>'
+      + '<span class="redeem-submenu-title">' + esc(title) + '</span>'
+      + '</div>';
+  }
+
+  function resetRedeemQuery() {
+    if (!redeemState) return;
+    redeemState.query = '';
+    redeemState.input.value = '';
+    redeemState.customOpen = false;
     redeemState.customError = '';
-    redeemFor(redeemState.tokenId, redeemState.input, value, value);
+  }
+
+  function showRedeemRoot() {
+    if (!redeemState) return;
+    var state = redeemState;
+    resetRedeemQuery();
+    state.view = 'root';
+    state.fociClient = null;
+    state.loading = false;
+    renderRedeemMenu();
+    state.input.focus();
+  }
+
+  function showRedeemAccess() {
+    if (!redeemState) return;
+    var state = redeemState;
+    resetRedeemQuery();
+    state.view = 'access';
+    state.fociClient = null;
+    state.loading = false;
+    state.items = state.sourceResources || [];
+    state.clientName = state.sourceClientName || '';
+    state.error = state.sourceError || '';
+    state.note = state.sourceNote || '';
+    renderRedeemMenu();
+    state.input.focus();
+  }
+
+  function showRedeemFoci() {
+    if (!redeemState) return;
+    var state = redeemState;
+    resetRedeemQuery();
+    state.view = 'foci';
+    state.fociClient = null;
+    state.loading = false;
+    state.items = [];
+    state.error = '';
+    state.note = '';
+    state.fociLoading = !state.fociClients;
+    renderRedeemMenu();
+    state.input.focus();
+    loadFociClients();
+  }
+
+  function loadFociClients() {
+    if (!redeemState) return;
+    var state = redeemState;
+    if (state.fociClients) return;
+    state.fociLoading = true;
+    state.fociError = '';
+    renderRedeemMenu();
+    loadClientApps().then(function() {
+      if (!redeemState || redeemState !== state) return;
+      state.fociLoading = false;
+      var current = String(state.sourceClientId || '').toLowerCase();
+      state.fociClients = (clientApps || []).filter(function(app) {
+        return app.foci
+          && String(app.id || '').toLowerCase() !== current;
+      });
+      if (clientError && !state.fociClients.length) {
+        state.fociError = clientError;
+      }
+      renderRedeemMenu();
+    });
+  }
+
+  function chooseFociClient(index) {
+    if (!redeemState) return;
+    var state = redeemState;
+    var app = (state.fociClients || [])[index];
+    if (!app) return;
+    resetRedeemQuery();
+    state.view = 'foci-access';
+    state.fociClient = app;
+    state.items = [];
+    state.matches = [];
+    state.custom = '';
+    state.loading = true;
+    state.error = '';
+    state.note = '';
+    renderRedeemMenu();
+    state.input.focus();
+    loadTokenResources(state.tokenId, app.id).then(function(data) {
+      if (!redeemState || redeemState !== state) return;
+      state.loading = false;
+      state.items = data.resources || [];
+      state.clientName = data.client_name || app.name || '';
+      var status = redeemStatusFor(data);
+      state.error = status.error;
+      state.note = status.note;
+      renderRedeemMenu();
+    }).catch(function(err) {
+      if (!redeemState || redeemState !== state) return;
+      state.loading = false;
+      state.error = err.message || 'Could not load resources.';
+      renderRedeemMenu();
+    });
+  }
+
+  function backRedeem() {
+    if (!redeemState) return;
+    var state = redeemState;
+    if (state.view === 'foci-access') {
+      resetRedeemQuery();
+      state.view = 'foci';
+      state.fociClient = null;
+      state.items = [];
+      state.matches = [];
+      state.custom = '';
+      state.loading = false;
+      state.error = '';
+      state.note = '';
+      renderRedeemMenu();
+      state.input.focus();
+      return;
+    }
+    showRedeemRoot();
   }
 
   function renderRedeemMenu() {
     if (!redeemState) return;
     var state = redeemState;
-    var html = redeemCustomBarHtml();
-    if (state.loading) {
-      redeemMenu.innerHTML = html
-        + '<div class="redeem-note">Loading resources...</div>';
-      positionRedeemMenu(state.input);
-      return;
-    }
-    if (state.error) {
-      html += '<div class="redeem-note error">' + esc(state.error) + '</div>';
-    }
-    if (state.customError) {
-      html += '<div class="redeem-note error redeem-custom-error">'
-        + esc(state.customError) + '</div>';
-    }
-    if (state.note) {
-      html += '<div class="redeem-note">' + esc(state.note) + '</div>';
-    }
-    var query = state.query.trim();
-    var matches = redeemMatches();
-    var limit = 80;
-    var visible = matches.slice(0, limit);
-    state.matches = visible;
-    var normalizedQuery = normalizeRedeemQuery(query);
-    var exactMatch = matches.some(function(item) {
-      var values = [item.id, item.resource, item.display]
-        .concat(item.aliases || []);
-      return values.some(function(value) {
-        return normalizeRedeemQuery(value) === normalizedQuery;
-      });
-    });
-    var customAvailable = looksLikeResource(query) && !exactMatch;
-    if (!matches.length && !customAvailable) {
-      html += '<div class="redeem-note">'
-        + (query
-          ? 'No matching resources for this client.'
-          : 'No resources are listed for this client.')
-        + '</div>';
-    } else if (matches.length) {
-      if (matches.length > limit) {
-        var clientLabel = state.clientName
-          ? ' for ' + state.clientName : '';
-        html += '<div class="redeem-note subtle">Showing ' + limit + ' of '
-          + matches.length + ' resources' + esc(clientLabel)
-          + '. Keep typing to narrow the list.</div>';
-      }
-      visible.forEach(function(item, idx) {
-        var meta = item.resource || item.display || item.id || '';
-        var metaLower = meta.toLowerCase();
-        if (item.display && item.display.toLowerCase() !== metaLower) {
-          meta += ' · ' + item.display;
-          metaLower = meta.toLowerCase();
-        }
-        if (item.id && item.id.toLowerCase() !== metaLower
-            && meta.indexOf(item.id) < 0) {
-          meta += ' · ' + item.id;
-        }
-        html += '<button type="button" class="redeem-option"'
-          + ' id="redeem-option-' + idx + '"'
-          + ' data-redeem-index="' + idx + '" role="option">'
-          + '<span class="redeem-option-name">'
-          + esc(item.name || item.id || item.resource) + '</span>'
-          + '<span class="redeem-option-meta">' + esc(meta) + '</span>'
-          + '</button>';
-      });
-    }
+    var html = '';
     state.custom = '';
-    if (customAvailable) {
-      state.custom = query;
-      html += '<button type="button" class="redeem-option"'
-        + ' id="redeem-option-custom" data-redeem-custom="1" role="option">'
-        + '<span class="redeem-option-name">Use custom resource</span>'
-        + '<span class="redeem-option-meta">' + esc(query) + '</span>'
-        + '</button>';
+    if (state.view === 'root') {
+      state.matches = state.sourceFoci
+        ? [{kind: 'access'}, {kind: 'foci'}]
+        : [{kind: 'access'}];
+      html += redeemSubmenuHtml(0, 'Access Token',
+        'Redeem for a resource with this client');
+      if (state.sourceFoci) {
+        html += redeemSubmenuHtml(1, 'FOCI',
+          'Redeem with another FOCI client');
+      }
+    } else if (state.view === 'foci') {
+      html += redeemBackBarHtml('FOCI clients');
+      if (state.fociLoading) {
+        state.matches = [];
+        html += '<div class="redeem-note">Loading FOCI clients...</div>';
+      } else {
+        if (state.fociError) {
+          html += '<div class="redeem-note error">'
+            + esc(state.fociError) + '</div>';
+        }
+        var query = normalizeRedeemQuery(state.query);
+        var apps = (state.fociClients || []).filter(function(app) {
+          if (!query) return true;
+          return clientScore(app, query) >= 0;
+        });
+        var limit = 80;
+        var visible = apps.slice(0, limit);
+        state.matches = visible;
+        if (!visible.length) {
+          if (!state.fociError) {
+            html += '<div class="redeem-note">'
+              + (query ? 'No matching FOCI clients.'
+                       : 'No FOCI clients are available.')
+              + '</div>';
+          }
+        } else {
+          if (apps.length > limit) {
+            html += '<div class="redeem-note subtle">Showing ' + limit
+              + ' of ' + apps.length + ' FOCI clients. Keep typing to '
+              + 'narrow the list.</div>';
+          }
+          visible.forEach(function(app, idx) {
+            html += '<button type="button" class="redeem-option"'
+              + ' id="redeem-option-' + idx + '"'
+              + ' data-redeem-index="' + idx + '" role="option">'
+              + '<span class="redeem-option-name">'
+              + esc(app.name || app.id) + '</span>'
+              + '<span class="redeem-option-meta">' + esc(app.id) + '</span>'
+              + '</button>';
+          });
+        }
+      }
+    } else {
+      if (state.sourceFoci) {
+        var title = state.fociClient
+          ? 'FOCI · ' + (state.fociClient.name || state.fociClient.id)
+          : 'Access Token';
+        html += redeemBackBarHtml(title);
+      }
+      html += redeemCustomBarHtml();
+      if (state.loading) {
+        state.matches = [];
+        html += '<div class="redeem-note">Loading resources...</div>';
+      } else {
+        if (state.error) {
+          html += '<div class="redeem-note error">' + esc(state.error) + '</div>';
+        }
+        if (state.customError) {
+          html += '<div class="redeem-note error redeem-custom-error">'
+            + esc(state.customError) + '</div>';
+        }
+        if (state.note) {
+          html += '<div class="redeem-note">' + esc(state.note) + '</div>';
+        }
+        var query = state.query.trim();
+        var matches = redeemMatches();
+        var limit = 80;
+        var visible = matches.slice(0, limit);
+        state.matches = visible;
+        var normalizedQuery = normalizeRedeemQuery(query);
+        var exactMatch = matches.some(function(item) {
+          var values = [item.id, item.resource, item.display]
+            .concat(item.aliases || []);
+          return values.some(function(value) {
+            return normalizeRedeemQuery(value) === normalizedQuery;
+          });
+        });
+        var customAvailable = looksLikeResource(query) && !exactMatch;
+        if (!matches.length && !customAvailable) {
+          html += '<div class="redeem-note">'
+            + (query
+              ? 'No matching resources for this client.'
+              : 'No resources are listed for this client.')
+            + '</div>';
+        } else if (matches.length) {
+          if (matches.length > limit) {
+            var clientLabel = state.clientName
+              ? ' for ' + state.clientName : '';
+            html += '<div class="redeem-note subtle">Showing ' + limit
+              + ' of ' + matches.length + ' resources' + esc(clientLabel)
+              + '. Keep typing to narrow the list.</div>';
+          }
+          visible.forEach(function(item, idx) {
+            var meta = item.resource || item.display || item.id || '';
+            var metaLower = meta.toLowerCase();
+            if (item.display && item.display.toLowerCase() !== metaLower) {
+              meta += ' · ' + item.display;
+              metaLower = meta.toLowerCase();
+            }
+            if (item.id && item.id.toLowerCase() !== metaLower
+                && meta.indexOf(item.id) < 0) {
+              meta += ' · ' + item.id;
+            }
+            html += '<button type="button" class="redeem-option"'
+              + ' id="redeem-option-' + idx + '"'
+              + ' data-redeem-index="' + idx + '" role="option">'
+              + '<span class="redeem-option-name">'
+              + esc(item.name || item.id || item.resource) + '</span>'
+              + '<span class="redeem-option-meta">' + esc(meta) + '</span>'
+              + '</button>';
+          });
+        }
+        if (customAvailable) {
+          state.custom = query;
+          html += '<button type="button" class="redeem-option"'
+            + ' id="redeem-option-custom" data-redeem-custom="1" role="option">'
+            + '<span class="redeem-option-name">Use custom resource</span>'
+            + '<span class="redeem-option-meta">' + esc(query) + '</span>'
+            + '</button>';
+        }
+      }
     }
     redeemMenu.innerHTML = html;
     state.active = -1;
@@ -2399,13 +3098,20 @@ def tokens_view_html() -> str:
     positionRedeemMenu(state.input);
   }
 
-  function loadTokenResources(tokenId) {
-    if (resourceCache[tokenId]) {
-      return Promise.resolve(resourceCache[tokenId]);
+  function redeemResourceKey(tokenId, clientId) {
+    return String(tokenId || '') + '|'
+      + String(clientId || '').toLowerCase();
+  }
+
+  function loadTokenResources(tokenId, clientId) {
+    var key = redeemResourceKey(tokenId, clientId);
+    if (resourceCache[key]) {
+      return Promise.resolve(resourceCache[key]);
     }
-    if (resourcePromises[tokenId]) return resourcePromises[tokenId];
-    resourcePromises[tokenId] = fetch(
-      '/api/tokens/resources?id=' + encodeURIComponent(tokenId))
+    if (resourcePromises[key]) return resourcePromises[key];
+    var url = '/api/tokens/resources?id=' + encodeURIComponent(tokenId);
+    if (clientId) url += '&client_id=' + encodeURIComponent(clientId);
+    resourcePromises[key] = fetch(url)
       .then(function(r) {
         return r.json().then(function(data) {
           if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
@@ -2413,15 +3119,15 @@ def tokens_view_html() -> str:
         });
       })
       .then(function(data) {
-        resourceCache[tokenId] = data;
-        delete resourcePromises[tokenId];
+        resourceCache[key] = data;
+        delete resourcePromises[key];
         return data;
       })
       .catch(function(err) {
-        delete resourcePromises[tokenId];
+        delete resourcePromises[key];
         throw err;
       });
-    return resourcePromises[tokenId];
+    return resourcePromises[key];
   }
 
   function openRedeem(input) {
@@ -2440,6 +3146,17 @@ def tokens_view_html() -> str:
       error: '',
       note: '',
       clientName: '',
+      sourceClientId: '',
+      sourceClientName: '',
+      sourceFoci: false,
+      sourceResources: [],
+      sourceError: '',
+      sourceNote: '',
+      view: 'access',
+      fociClients: null,
+      fociLoading: false,
+      fociError: '',
+      fociClient: null,
       customOpen: false,
       customValue: '',
       customError: '',
@@ -2452,20 +3169,20 @@ def tokens_view_html() -> str:
     positionRedeemMenu(input);
     loadTokenResources(tokenId).then(function(data) {
       if (!redeemState || redeemState.input !== input) return;
-      redeemState.loading = false;
-      redeemState.items = data.resources || [];
-      redeemState.clientName = data.client_name || '';
-      if (data.allow_custom) {
-        if (data.error) {
-          redeemState.error = data.error;
-          redeemState.note = 'Common resources are listed; type a resource URI to use a custom one.';
-        } else {
-          var reason = data.reason || 'This client is not in the entrascopes dataset';
-          reason = reason.charAt(0).toUpperCase() + reason.slice(1);
-          redeemState.note = reason
-            + '. Common resources are listed; type a resource URI to use a custom one.';
-        }
-      }
+      var state = redeemState;
+      state.loading = false;
+      state.items = data.resources || [];
+      state.sourceResources = data.resources || [];
+      state.clientName = data.client_name || '';
+      state.sourceClientName = data.client_name || '';
+      state.sourceClientId = data.client_id || '';
+      state.sourceFoci = !!data.foci;
+      var status = redeemStatusFor(data);
+      state.error = status.error;
+      state.note = status.note;
+      state.sourceError = status.error;
+      state.sourceNote = status.note;
+      if (state.sourceFoci) state.view = 'root';
       renderRedeemMenu();
     }).catch(function(err) {
       if (!redeemState || redeemState.input !== input) return;
@@ -2475,17 +3192,20 @@ def tokens_view_html() -> str:
     });
   }
 
-  function redeemFor(tokenId, input, resource, label) {
+  function redeemFor(tokenId, input, resource, label, clientId, clientName) {
     closeRedeemMenu();
     if (input) {
       input.value = '';
       input.disabled = true;
     }
-    flash('Redeeming for ' + label + '...', false);
+    var via = clientName ? ' via ' + clientName : '';
+    flash('Redeeming for ' + label + via + '...', false);
+    var body = { id: tokenId, resource: resource };
+    if (clientId) body.client_id = clientId;
     fetch('/api/tokens/redeem', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: tokenId, resource: resource })
+      body: JSON.stringify(body)
     }).then(function(r) {
       return r.json().then(function(data) {
         if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
@@ -2493,7 +3213,7 @@ def tokens_view_html() -> str:
       });
     }).then(function(data) {
       renderTokens(data);
-      flash('Token redeemed for ' + label + '.', false);
+      flash('Token redeemed for ' + label + via + '.', false);
     }).catch(function(err) {
       if (input) input.disabled = false;
       flash(err.message || 'Could not redeem token.', true);
@@ -2503,15 +3223,31 @@ def tokens_view_html() -> str:
   function chooseRedeem(index) {
     if (!redeemState) return;
     var state = redeemState;
+    if (state.view === 'root') {
+      var entry = state.matches[index];
+      if (!entry) return;
+      if (entry.kind === 'foci') showRedeemFoci();
+      else showRedeemAccess();
+      return;
+    }
+    if (state.view === 'foci') {
+      chooseFociClient(index);
+      return;
+    }
+    var client = state.fociClient;
+    var clientId = client ? client.id : '';
+    var clientName = client ? (client.name || client.id) : '';
     if (index >= state.matches.length) {
       if (!state.custom) return;
-      redeemFor(state.tokenId, state.input, state.custom, state.custom);
+      redeemFor(state.tokenId, state.input, state.custom, state.custom,
+                clientId, clientName);
       return;
     }
     var item = state.matches[index];
     if (!item) return;
     redeemFor(state.tokenId, state.input, item.resource || item.id,
-              item.name || item.resource || item.id);
+              item.name || item.resource || item.id,
+              clientId, clientName);
   }
 
   listEl.addEventListener('focusin', function(event) {
@@ -2532,6 +3268,14 @@ def tokens_view_html() -> str:
     redeemState.query = input.value;
     redeemState.customOpen = false;
     redeemState.customError = '';
+    if (redeemState.view === 'root' && input.value.trim()) {
+      redeemState.view = 'access';
+      redeemState.fociClient = null;
+      redeemState.items = redeemState.sourceResources || [];
+      redeemState.clientName = redeemState.sourceClientName || '';
+      redeemState.error = redeemState.sourceError || '';
+      redeemState.note = redeemState.sourceNote || '';
+    }
     renderRedeemMenu();
   });
 
@@ -2564,7 +3308,14 @@ def tokens_view_html() -> str:
   });
 
   redeemMenu.addEventListener('click', function(event) {
+    event.stopPropagation();
     if (!redeemState) return;
+    var back = event.target.closest('[data-redeem-back]');
+    if (back) {
+      event.stopPropagation();
+      backRedeem();
+      return;
+    }
     var toggle = event.target.closest('[data-redeem-custom-toggle]');
     if (toggle) {
       event.stopPropagation();
@@ -2709,6 +3460,15 @@ def tokens_view_html() -> str:
   });
 
   listEl.addEventListener('click', function(event) {
+    var decodeBtn = event.target.closest('button[data-decode-secret]');
+    if (decodeBtn) {
+      var kind = decodeBtn.getAttribute('data-decode-secret');
+      var secretPanel = decodeBtn.closest('.token-secret');
+      var field = secretPanel
+        ? secretPanel.querySelector('[data-secret="' + kind + '"]') : null;
+      openDecode(kind, field ? field.value : '', decodeBtn);
+      return;
+    }
     var btn = event.target.closest('button[data-action]');
     if (!btn) return;
     var id = btn.getAttribute('data-id');
@@ -2776,12 +3536,27 @@ def tokens_view_html() -> str:
     });
   });
 
+  if (decodeClose) decodeClose.addEventListener('click', closeDecode);
+  if (decodeOverlay) {
+    decodeOverlay.addEventListener('click', function(event) {
+      if (event.target === decodeOverlay) closeDecode();
+    });
+  }
+  document.addEventListener('keydown', function(event) {
+    if (event.key === 'Escape' && decodeOverlay
+        && !decodeOverlay.classList.contains('hidden')) {
+      event.preventDefault();
+      closeDecode();
+    }
+  });
+
   document.addEventListener('app:view', function(e) {
     if (e.detail === 'tokens') {
       refresh();
     } else {
       closeRedeemMenu();
       closeClientMenu();
+      closeDecode();
     }
   });
 
@@ -2793,25 +3568,58 @@ def tokens_view_html() -> str:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("-rt", "--refresh-token", required=True,
+    ap.add_argument("-rt", "--refresh-token", default="",
                     help="MS auth broker refresh token")
-    ap.add_argument("-c", "--client-id", required=True,
+    ap.add_argument("-at", "--access-token", default="",
+                    help="saved access token (Graph or AAD Graph audience)")
+    ap.add_argument("-c", "--client-id", default="",
                     help="public client id used to redeem the token")
-    ap.add_argument("-o", "--out", default=str(DEFAULT_OUTPUT),
-                    help="output database (default: data/databases/collected.db)")
+    ap.add_argument("-o", "--out", default=None,
+                    help="output database (default: data/databases/collected.db "
+                         "or data/databases/aadgraph.db)")
     ap.add_argument("-ua", "--user-agent", default="",
-                    help="custom User-Agent for Graph/ARM requests")
+                    help="custom User-Agent for HTTP requests")
+    ap.add_argument("--backend", choices=("graph", "aadgraph"), default="graph",
+                    help="collection backend")
+    ap.add_argument("--autotoken", action="store_true",
+                    help="redeem the refresh token for an AAD Graph token")
+    ap.add_argument("--evade", action="store_true",
+                    help="use AAD Graph batch requests / ADO.NET user agent")
+    ap.add_argument("--gather-all", action="store_true",
+                    help="also collect IG, PIM, and Azure data")
+    ap.add_argument("--mfa", action="store_true",
+                    help="include MFA details (requires privileged access)")
     ap.add_argument("--collector-dir", default=None,
                     help="collector checkout (default: bundled entra_surface/collector)")
     args = ap.parse_args(argv)
 
     if args.collector_dir:
         os.environ["ENTRA_COLLECTOR_DIR"] = args.collector_dir
-    out_path = Path(args.out).expanduser().resolve()
+    default_out = (DEFAULT_AADGRAPH_OUTPUT if args.backend == "aadgraph"
+                   else DEFAULT_OUTPUT)
+    out_path = Path(args.out or default_out).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        cmd = _worker_command("run", args.refresh_token, args.client_id,
-                              out_path=out_path, user_agent=args.user_agent)
+        if args.backend == "aadgraph":
+            if not args.refresh_token and not args.access_token:
+                raise ValueError("a refresh or access token is required")
+            cmd = _worker_command(
+                "run-aadgraph", args.refresh_token, args.client_id,
+                out_path=out_path, user_agent=args.user_agent,
+                access_token=args.access_token, evade=args.evade,
+                gather_all=args.gather_all, autotoken=args.autotoken,
+                mfa=args.mfa)
+        elif args.access_token and not args.refresh_token:
+            cmd = _worker_command("run-access", args.access_token, "",
+                                  out_path=out_path,
+                                  user_agent=args.user_agent)
+        else:
+            if not args.refresh_token or not args.client_id:
+                raise ValueError(
+                    "refresh token and client id are required for Graph")
+            cmd = _worker_command("run", args.refresh_token, args.client_id,
+                                  out_path=out_path,
+                                  user_agent=args.user_agent)
     except (RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
