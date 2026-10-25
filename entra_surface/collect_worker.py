@@ -6,6 +6,7 @@ imports graphcollect from the bundled ``entra_surface/collector`` checkout,
 redeems a broker refresh token, and either prints principal claims for a
 requested resource (``probe``) or runs a full collection (``run``).
 ``run-access`` collects with a Microsoft Graph access token and skips ARM.
+Graph collection supports ``--evade`` JSON batching for relationship requests.
 ``run-aadgraph`` collects legacy AAD Graph (and optionally IG/PIM/ARM) using
 either a refresh token or an AAD Graph access token.
 The newest rotated refresh token is written to --token-out so the parent can
@@ -166,13 +167,17 @@ def run(args) -> int:
         return 1
     print(f"[auth] {provider.identity} (tid: {claims.get('tid')})")
 
+    user_agent = (args.user_agent or "").strip()
+    evade = bool(getattr(args, "evade", False))
+    if evade and not user_agent:
+        user_agent = "Microsoft ADO.NET Data Services"
     graph = GraphClient(lambda: provider.get_token(GRAPH_RES), verbose=args.verbose,
-                        user_agent=args.user_agent)
+                        user_agent=user_agent, batch=evade)
     arm = None
     try:
         provider.get_token(ARM_RES)
         arm = ArmClient(lambda: provider.get_token(ARM_RES), verbose=args.verbose,
-                        user_agent=args.user_agent)
+                        user_agent=user_agent)
     except AuthError as exc:
         print(f"[arm] no Azure Resource Manager token ({exc}); "
               f"Azure tables will be skipped")
@@ -198,6 +203,8 @@ def _run_collection(graph: GraphClient, arm, args, identity: str,
         print(f"  {flag} {sec.name:52s} {sec.status:8s} {sec.count or ''}"
               + (f"  [{sec.note}]" if sec.note else ""))
     print(f"\n{graph.requests_made} Graph requests"
+          + (f", {getattr(graph, 'subrequests_made', 0)} batched subrequests"
+             if getattr(graph, "batch", False) else "")
           + (f", {arm.requests_made} ARM requests" if arm else ""))
     slow = sorted(runner.sections, key=lambda s: s.seconds, reverse=True)[:5]
     print("slowest sections: " + ", ".join(
@@ -227,8 +234,12 @@ def run_access(args) -> int:
 
     identity = claims.get("upn") or claims.get("unique_name") or claims.get("oid") or "?"
     print(f"[auth] {identity} (tid: {claims.get('tid')})")
+    user_agent = (args.user_agent or "").strip()
+    evade = bool(getattr(args, "evade", False))
+    if evade and not user_agent:
+        user_agent = "Microsoft ADO.NET Data Services"
     graph = GraphClient(lambda: token, verbose=args.verbose,
-                        user_agent=args.user_agent)
+                        user_agent=user_agent, batch=evade)
     return _run_collection(graph, None, args, identity, claims.get("tid") or "")
 
 
@@ -383,6 +394,8 @@ def main(argv=None) -> int:
     r.add_argument("-v", "--verbose", action="count", default=0)
     r.add_argument("--token-out", default="")
     r.add_argument("--access-out", default="")
+    r.add_argument("--evade", action="store_true",
+                   help="batch relationship requests and use the evade UA")
     r.set_defaults(func=run)
 
     a = sub.add_parser("run-access")
@@ -390,6 +403,8 @@ def main(argv=None) -> int:
     a.add_argument("-o", "--out", required=True)
     a.add_argument("-ua", "--user-agent", default="")
     a.add_argument("-v", "--verbose", action="count", default=0)
+    a.add_argument("--evade", action="store_true",
+                   help="batch relationship requests and use the evade UA")
     a.set_defaults(func=run_access)
 
     g = sub.add_parser("run-aadgraph")

@@ -7448,6 +7448,95 @@ def render_report(results, tenant_name, db_path, config_path,
     margin: 0; color: var(--text-muted); font-size: 10px; font-weight: 600;
     letter-spacing: 0.08em; text-transform: uppercase;
   }}
+  .sidebar-head {{
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 8px; position: relative;
+  }}
+  .sidebar-settings-btn {{
+    width: 24px; height: 24px; padding: 0; flex: none;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent; color: var(--text-muted);
+    border: 1px solid transparent; border-radius: 6px;
+    font-family: inherit; cursor: pointer;
+  }}
+  .sidebar-settings-btn:hover,
+  .sidebar-settings-btn[aria-expanded="true"] {{
+    background: var(--row-hover); color: var(--text-primary);
+    border-color: var(--border);
+  }}
+  .sidebar-theme {{
+    margin-top: 14px; padding-top: 14px;
+    border-top: 1px solid var(--gridline);
+  }}
+  .sidebar-theme .theme-toggle {{ width: 100%; }}
+  .sidebar-theme .theme-toggle button {{
+    flex: 1; padding: 6px 8px; font-size: 12px;
+  }}
+  .settings-overlay {{
+    position: fixed; inset: 0; z-index: 200;
+    background: rgba(0,0,0,0.45);
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px;
+  }}
+  .settings-overlay.hidden {{ display: none; }}
+  body.settings-open {{ overflow: hidden; }}
+  .settings-box {{
+    width: min(620px, 94vw); max-height: min(82vh, 720px);
+    display: flex; flex-direction: column; overflow: hidden;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; box-shadow: 0 24px 70px rgba(0,0,0,0.38);
+  }}
+  .settings-head {{
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 12px; padding: 14px 18px;
+    border-bottom: 1px solid var(--gridline);
+  }}
+  .settings-head h3 {{ margin: 0; font-size: 16px; }}
+  .settings-head .sub {{
+    margin: 2px 0 0; color: var(--text-secondary); font-size: 12px;
+  }}
+  .settings-tabs {{
+    display: flex; gap: 4px; padding: 10px 14px 0;
+    border-bottom: 1px solid var(--gridline);
+  }}
+  .settings-tab {{
+    background: transparent; border: 1px solid transparent; border-bottom: 0;
+    border-radius: 7px 7px 0 0; color: var(--text-secondary);
+    padding: 7px 14px; font: inherit; font-size: 12.5px; cursor: pointer;
+  }}
+  .settings-tab:hover {{ color: var(--text-primary); background: var(--row-hover); }}
+  .settings-tab.active {{
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+    font-weight: 600;
+  }}
+  .settings-body {{ padding: 16px 18px; overflow: auto; }}
+  .settings-panel.hidden {{ display: none; }}
+  .settings-section + .settings-section {{
+    margin-top: 16px; padding-top: 16px;
+    border-top: 1px solid var(--gridline);
+  }}
+  .settings-section h4 {{
+    margin: 0 0 6px; color: var(--text-muted); font-size: 10.5px;
+    font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+  }}
+  .settings-value {{
+    color: var(--text-secondary); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px; line-height: 1.45; overflow-wrap: anywhere;
+  }}
+  .settings-note {{
+    margin: 0; color: var(--text-secondary); font-size: 12.5px; line-height: 1.5;
+  }}
+  .settings-placeholder {{
+    padding: 14px 16px; border: 1px dashed var(--border); border-radius: 8px;
+    background: var(--page-plane); color: var(--text-muted);
+    font-size: 12.5px; line-height: 1.5;
+  }}
+  .settings-foot {{
+    display: flex; justify-content: flex-end; gap: 8px;
+    padding: 12px 18px; border-top: 1px solid var(--gridline);
+  }}
   .sidebar-nav {{ display: flex; flex-direction: column; gap: 4px; margin-top: 14px; }}
   .sidebar-nav-item {{
     display: flex; align-items: center; width: 100%;
@@ -7809,7 +7898,16 @@ def render_report(results, tenant_name, db_path, config_path,
 <body class="sidebar-open">
 {analysis.client_js()}
 <aside class="sidebar" id="sidebar" aria-label="Sidebar" aria-hidden="false">
-  <h2 class="sidebar-title">Workspace</h2>
+  <div class="sidebar-head">
+    <h2 class="sidebar-title">Workspace</h2>
+    <button type="button" class="sidebar-settings-btn" id="sidebar-settings-btn"
+            aria-label="Settings" aria-haspopup="dialog" aria-expanded="false"
+            aria-controls="settings-overlay" title="Settings">
+      <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path fill="currentColor" d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"/>
+      </svg>
+    </button>
+  </div>
   <nav class="sidebar-nav" id="sidebar-nav" aria-label="Workspace sections">
     <button type="button" class="sidebar-nav-item active" data-view="analysis" aria-current="page">Analysis</button>
     <button type="button" class="sidebar-nav-item" data-view="collect">Collect</button>
@@ -7819,6 +7917,12 @@ def render_report(results, tenant_name, db_path, config_path,
     <div class="sidebar-title">Active token</div>
     <div class="sidebar-principal-body" id="sidebar-principal-body">
       <span class="sidebar-principal-empty">Loading...</span>
+    </div>
+  </div>
+  <div class="sidebar-theme">
+    <div class="theme-toggle" role="group" aria-label="Color theme">
+      <button type="button" id="theme-light-btn" aria-pressed="false">Light</button>
+      <button type="button" id="theme-dark-btn" aria-pressed="false">Dark</button>
     </div>
   </div>
 </aside>
@@ -7831,10 +7935,6 @@ def render_report(results, tenant_name, db_path, config_path,
   <header>
     <div>
       <h1>Entra ID Attack Surface</h1>
-    </div>
-    <div class="theme-toggle" role="group" aria-label="Color theme">
-      <button type="button" id="theme-light-btn" aria-pressed="false">Light</button>
-      <button type="button" id="theme-dark-btn" aria-pressed="false">Dark</button>
     </div>
   </header>
 
@@ -7867,6 +7967,54 @@ def render_report(results, tenant_name, db_path, config_path,
   <div class="app-view hidden" data-view="collect">{collect_backend.view_html()}</div>
   <div class="app-view hidden" data-view="tokens">{collect_backend.tokens_view_html()}</div>
 </div>
+</div>
+
+<div class="settings-overlay hidden" id="settings-overlay"
+     role="dialog" aria-modal="true" aria-labelledby="settings-title">
+  <div class="settings-box">
+    <div class="settings-head">
+      <div>
+        <h3 id="settings-title">Settings</h3>
+        <p class="sub">Local report and collection preferences.</p>
+      </div>
+      <button type="button" class="icon-btn" id="settings-close"
+              aria-label="Close settings">&times;</button>
+    </div>
+    <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+      <button type="button" class="settings-tab active" id="settings-tab-general"
+              data-settings-tab="general" role="tab" aria-selected="true"
+              aria-controls="settings-panel-general">General</button>
+      <button type="button" class="settings-tab" id="settings-tab-proxy"
+              data-settings-tab="proxy" role="tab" aria-selected="false"
+              aria-controls="settings-panel-proxy">Proxy</button>
+    </div>
+    <div class="settings-body">
+      <section class="settings-panel" id="settings-panel-general"
+               role="tabpanel" aria-labelledby="settings-tab-general">
+        <div class="settings-section">
+          <h4>Database</h4>
+          <div class="settings-value"
+               title="{esc(str(db_path)) if db_path is not None else 'No database loaded'}">{esc(str(db_path)) if db_path is not None else 'No database loaded'}</div>
+        </div>
+        <div class="settings-section">
+          <h4>Appearance</h4>
+          <p class="settings-note">Use the Light / Dark toggle at the bottom of
+            the sidebar.</p>
+        </div>
+      </section>
+      <section class="settings-panel hidden" id="settings-panel-proxy"
+               role="tabpanel" aria-labelledby="settings-tab-proxy">
+        <div class="settings-section">
+          <h4>Proxy</h4>
+          <div class="settings-placeholder">Proxy configuration will be added
+            here. No proxy is currently used for collection or analysis.</div>
+        </div>
+      </section>
+    </div>
+    <div class="settings-foot">
+      <button type="button" class="mode-btn" id="settings-done">Done</button>
+    </div>
+  </div>
 </div>
 
 <div class="overlay hidden" id="drilldown-overlay">
@@ -7933,6 +8081,72 @@ def render_report(results, tenant_name, db_path, config_path,
   lightBtn.addEventListener('click', function() {{ setTheme('light'); }});
   darkBtn.addEventListener('click', function() {{ setTheme('dark'); }});
   updateThemeButtons();
+}})();
+
+(function() {{
+  var gear = document.getElementById('sidebar-settings-btn');
+  var overlay = document.getElementById('settings-overlay');
+  var closeBtn = document.getElementById('settings-close');
+  var doneBtn = document.getElementById('settings-done');
+  var tabs = Array.prototype.slice.call(
+    document.querySelectorAll('#settings-overlay button[data-settings-tab]'));
+  if (!gear || !overlay) return;
+
+  function selectTab(name) {{
+    tabs.forEach(function(tab) {{
+      var active = tab.getAttribute('data-settings-tab') === name;
+      tab.classList.toggle('active', active);
+      tab.setAttribute('aria-selected', String(active));
+      var panel = document.getElementById(
+        'settings-panel-' + tab.getAttribute('data-settings-tab'));
+      if (panel) panel.classList.toggle('hidden', !active);
+    }});
+  }}
+
+  function setOpen(open) {{
+    if (open) {{
+      selectTab('general');
+      overlay.classList.remove('hidden');
+      document.body.classList.add('settings-open');
+      gear.setAttribute('aria-expanded', 'true');
+      if (closeBtn) closeBtn.focus();
+    }} else {{
+      overlay.classList.add('hidden');
+      document.body.classList.remove('settings-open');
+      gear.setAttribute('aria-expanded', 'false');
+      gear.focus();
+    }}
+  }}
+
+  gear.addEventListener('click', function(event) {{
+    event.stopPropagation();
+    setOpen(true);
+  }});
+  if (closeBtn) closeBtn.addEventListener('click', function() {{ setOpen(false); }});
+  if (doneBtn) doneBtn.addEventListener('click', function() {{ setOpen(false); }});
+  overlay.addEventListener('click', function(event) {{
+    if (event.target === overlay) setOpen(false);
+  }});
+  tabs.forEach(function(tab) {{
+    tab.addEventListener('click', function() {{
+      selectTab(tab.getAttribute('data-settings-tab'));
+    }});
+    tab.addEventListener('keydown', function(event) {{
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+      event.preventDefault();
+      var index = tabs.indexOf(tab);
+      var step = event.key === 'ArrowRight' ? 1 : -1;
+      var next = tabs[(index + step + tabs.length) % tabs.length];
+      selectTab(next.getAttribute('data-settings-tab'));
+      next.focus();
+    }});
+  }});
+  document.addEventListener('keydown', function(event) {{
+    if (event.key !== 'Escape' || overlay.classList.contains('hidden')) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    setOpen(false);
+  }});
 }})();
 
 (function() {{

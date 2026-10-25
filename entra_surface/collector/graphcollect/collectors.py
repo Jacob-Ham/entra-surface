@@ -9,7 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
-from .client import ArmClient, Degraded, GraphClient
+from .client import ArmClient, BatchPagedResult, Degraded, GraphClient
 from .store import Store
 
 API = "v1.0"
@@ -23,6 +23,31 @@ def parallel_map(fn: Callable, items: list, workers: int = WORKERS) -> list:
         return []
     with ThreadPoolExecutor(max_workers=min(workers, len(items))) as ex:
         return list(ex.map(fn, items))
+
+
+def fetch_paged_batch(client, requests: list[dict]) -> dict[str, BatchPagedResult]:
+    """Fetch independent paged endpoints, using Graph $batch when enabled."""
+    if getattr(client, "batch", False):
+        return client.batch_paged_many(requests)
+    results: dict[str, BatchPagedResult] = {}
+
+    def fetch(request):
+        try:
+            items = list(client.paged(
+                request["path"], api=request.get("api", API)))
+            return request["key"], items, 0, ""
+        except Degraded as exc:
+            return request["key"], [], exc.status, exc.body
+
+    for key, items, status, body in parallel_map(fetch, requests):
+        result = BatchPagedResult()
+        result.items = items
+        result.status = status
+        result.body = body
+        if status or body:
+            result.error = f"{status} {body[:200]}"
+        results[key] = result
+    return results
 
 # --------------------------------------------------------------------------
 # small helpers
@@ -117,6 +142,24 @@ def dir_row(obj: dict, obj_type: str, renames: Optional[dict] = None,
             if v is not None:
                 row[k] = jstr(v)
     return row
+
+
+def app_role_row(ara: dict, resource_id: Optional[str] = None,
+                 display_name: Optional[str] = None) -> dict:
+    """Map a Graph appRoleAssignment object to the ROADrecon table row."""
+    return {
+        "objectId": ara.get("id"),
+        "objectType": "AppRoleAssignment",
+        "id": ara.get("appRoleId"),
+        "principalId": ara.get("principalId"),
+        "principalType": ara.get("principalType"),
+        "principalDisplayName": ara.get("principalDisplayName"),
+        "resourceId": ara.get("resourceId") or resource_id,
+        "resourceDisplayName": (ara.get("resourceDisplayName")
+                                or display_name),
+        "creationTimestamp": ara.get("createdDateTime"),
+        "deletionTimestamp": ara.get("deletedDateTime"),
+    }
 
 
 def objtype(o: dict) -> str:
@@ -274,28 +317,17 @@ def collect_users(runner: Runner) -> list[dict]:
             sec.note = (sec.note or "") + f" pw-change: {extra_n}"
     except Degraded:
         pass
-    # user-principal app role assignments (fetched in parallel)
-    def fetch_user_aras(uid):
-        try:
-            return uid, list(runner.c.paged(f"/users/{uid}/appRoleAssignments"))
-        except Degraded:
-            return uid, []
-
+    # user-principal app role assignments
     approl_n = 0
-    for uid, aras in parallel_map(fetch_user_aras, [u["id"] for u in users]):
-        for ara in aras:
-            runner.s.upsert("AppRoleAssignments", "objectId", {
-                "objectId": ara.get("id"),
-                "objectType": "AppRoleAssignment",
-                "id": ara.get("appRoleId"),
-                "principalId": ara.get("principalId"),
-                "principalType": ara.get("principalType"),
-                "principalDisplayName": ara.get("principalDisplayName"),
-                "resourceId": ara.get("resourceId"),
-                "resourceDisplayName": ara.get("resourceDisplayName"),
-                "creationTimestamp": ara.get("createdDateTime"),
-                "deletionTimestamp": ara.get("deletedDateTime"),
-            })
+    user_ids = [u["id"] for u in users]
+    requests = [{"key": uid, "path": f"/users/{uid}/appRoleAssignments",
+                 "api": API} for uid in user_ids]
+    for uid, result in fetch_paged_batch(runner.c, requests).items():
+        if result.error:
+            continue
+        for ara in result.items:
+            runner.s.upsert("AppRoleAssignments", "objectId",
+                            app_role_row(ara))
             approl_n += 1
     if approl_n:
         sec.note = f"user appRoleAssignments: {approl_n}"
@@ -331,57 +363,48 @@ def collect_groups(runner: Runner) -> list[dict]:
     members_n = owners_n = 0
     failed = 0
     approl_n = 0
+    group_ids = [g["id"] for g in groups]
+    requests = []
+    for gid in group_ids:
+        requests.extend([
+            {"key": f"{gid}|members",
+             "path": f"/groups/{gid}/transitiveMembers", "api": API},
+            {"key": f"{gid}|owners",
+             "path": f"/groups/{gid}/owners", "api": API},
+            {"key": f"{gid}|sp_members",
+             "path": f"/groups/{gid}/members/microsoft.graph.servicePrincipal",
+             "api": API},
+            {"key": f"{gid}|aras",
+             "path": f"/groups/{gid}/appRoleAssignments", "api": API},
+        ])
+    results = fetch_paged_batch(runner.c, requests)
 
-    def fetch_group(gid):
-        data = {"members": [], "owners": [], "sp_members": [], "aras": []}
-        try:
-            data["members"] = list(runner.c.paged(f"/groups/{gid}/transitiveMembers"))
-        except Degraded:
-            data["members"] = None
-        try:
-            data["owners"] = list(runner.c.paged(f"/groups/{gid}/owners"))
-        except Degraded:
-            data["owners"] = None
-        # Graph's default members/transitiveMembers navs omit service
-        # principals; the typed cast returns them (without @odata.type).
-        try:
-            sp_members = list(runner.c.paged(
-                f"/groups/{gid}/members/microsoft.graph.servicePrincipal"))
-            for m in sp_members:
-                m.setdefault("@odata.type", "#microsoft.graph.servicePrincipal")
-            data["sp_members"] = sp_members
-        except Degraded:
-            pass
-        try:
-            data["aras"] = list(runner.c.paged(f"/groups/{gid}/appRoleAssignments"))
-        except Degraded:
-            pass
-        return gid, data
-
-    for gid, data in parallel_map(fetch_group, [g["id"] for g in groups]):
-        if data["members"] is None:
+    for gid in group_ids:
+        members = results.get(f"{gid}|members")
+        owners = results.get(f"{gid}|owners")
+        sp_members = results.get(f"{gid}|sp_members")
+        aras = results.get(f"{gid}|aras")
+        if members is None or members.error:
             failed += 1
         else:
-            members_n += add_dir_links(runner.s, "member", "Group", gid, data["members"])
-        if data["owners"] is None:
+            members_n += add_dir_links(
+                runner.s, "member", "Group", gid, members.items)
+        if owners is None or owners.error:
             failed += 1
         else:
-            owners_n += add_dir_links(runner.s, "owner", "Group", gid, data["owners"])
-        members_n += add_dir_links(runner.s, "member", "Group", gid, data["sp_members"])
-        for ara in data["aras"]:
-            runner.s.upsert("AppRoleAssignments", "objectId", {
-                "objectId": ara.get("id"),
-                "objectType": "AppRoleAssignment",
-                "id": ara.get("appRoleId"),
-                "principalId": ara.get("principalId"),
-                "principalType": ara.get("principalType"),
-                "principalDisplayName": ara.get("principalDisplayName"),
-                "resourceId": ara.get("resourceId"),
-                "resourceDisplayName": ara.get("resourceDisplayName"),
-                "creationTimestamp": ara.get("createdDateTime"),
-                "deletionTimestamp": ara.get("deletedDateTime"),
-            })
-            approl_n += 1
+            owners_n += add_dir_links(
+                runner.s, "owner", "Group", gid, owners.items)
+        if sp_members is not None and not sp_members.error:
+            for member in sp_members.items:
+                member.setdefault(
+                    "@odata.type", "#microsoft.graph.servicePrincipal")
+            members_n += add_dir_links(
+                runner.s, "member", "Group", gid, sp_members.items)
+        if aras is not None and not aras.error:
+            for ara in aras.items:
+                runner.s.upsert("AppRoleAssignments", "objectId",
+                                app_role_row(ara))
+                approl_n += 1
     runner.finish(sec, "ok" if failed == 0 else "partial", n,
                   f"links: {members_n} members / {owners_n} owners, "
                   f"group appRoleAssignments: {approl_n}")
@@ -434,36 +457,38 @@ def collect_applications(runner: Runner) -> list[dict]:
         return apps
     owners_n = 0
     approles_defined = 0
-
-    def fetch_app(app):
-        aid = app["id"]
-        owners, ext_props = [], []
-        try:
-            owners = list(runner.c.paged(f"/applications/{aid}/owners"))
-        except Degraded:
-            pass
-        try:
-            ext_props = list(runner.c.paged(f"/applications/{aid}/extensionProperties"))
-        except Degraded:
-            pass
-        return app, owners, ext_props
-
     ext_n = 0
-    for a, objs, ext_props in parallel_map(fetch_app, apps):
-        owners_n += add_dir_links(runner.s, "appowner", "Application", a["id"], objs)
-        if a.get("appRoles"):
+    requests = []
+    for app in apps:
+        aid = app["id"]
+        requests.extend([
+            {"key": f"{aid}|owners",
+             "path": f"/applications/{aid}/owners", "api": API},
+            {"key": f"{aid}|ext",
+             "path": f"/applications/{aid}/extensionProperties", "api": API},
+        ])
+    results = fetch_paged_batch(runner.c, requests)
+    for app in apps:
+        aid = app["id"]
+        owners = results.get(f"{aid}|owners")
+        ext_props = results.get(f"{aid}|ext")
+        if owners is not None and not owners.error:
+            owners_n += add_dir_links(
+                runner.s, "appowner", "Application", aid, owners.items)
+        if app.get("appRoles"):
             approles_defined += 1
-        for ep in ext_props:
-            runner.s.upsert("ExtensionPropertys", "objectId", {
-                "objectId": ep.get("id"),
-                "objectType": "ExtensionProperty",
-                "appDisplayName": a.get("displayName"),
-                "name": ep.get("name"),
-                "dataType": ep.get("dataType"),
-                "isSyncedFromOnPremises": ep.get("isSyncedFromOnPremises"),
-                "targetObjects": ep.get("targetObjects"),
-            })
-            ext_n += 1
+        if ext_props is not None and not ext_props.error:
+            for ep in ext_props.items:
+                runner.s.upsert("ExtensionPropertys", "objectId", {
+                    "objectId": ep.get("id"),
+                    "objectType": "ExtensionProperty",
+                    "appDisplayName": app.get("displayName"),
+                    "name": ep.get("name"),
+                    "dataType": ep.get("dataType"),
+                    "isSyncedFromOnPremises": ep.get("isSyncedFromOnPremises"),
+                    "targetObjects": ep.get("targetObjects"),
+                })
+                ext_n += 1
     runner.finish(sec, "ok", n, f"owners: {owners_n}, "
                   f"apps defining appRoles: {approles_defined}, "
                   f"extensionProperties: {ext_n}")
@@ -540,48 +565,39 @@ def collect_serviceprincipals(runner: Runner) -> list[dict]:
         sps.append(sp)
     owners_n = approl_n = 0
     sps_with_roles = 0
-
-    def fetch_sp(sp):
+    requests = []
+    for sp in sps:
         sid = sp["id"]
-        data = {"owners": [], "assignments": [], "assigned_to": []}
-        try:
-            data["owners"] = list(runner.c.paged(f"/servicePrincipals/{sid}/owners"))
-        except Degraded:
-            pass
-        # assignments where this SP is the principal
-        try:
-            data["assignments"] = list(
-                runner.c.paged(f"/servicePrincipals/{sid}/appRoleAssignments"))
-        except Degraded:
-            pass
-        # assignments where this SP is the resource (catches non-local principals)
-        try:
-            data["assigned_to"] = list(
-                runner.c.paged(f"/servicePrincipals/{sid}/appRoleAssignedTo"))
-        except Degraded:
-            pass
-        return sp, data
-
-    sp_by_id = {sp["id"]: sp for sp in sps}
-    for sp, data in parallel_map(fetch_sp, sps):
+        requests.extend([
+            {"key": f"{sid}|owners",
+             "path": f"/servicePrincipals/{sid}/owners", "api": API},
+            {"key": f"{sid}|assignments",
+             "path": f"/servicePrincipals/{sid}/appRoleAssignments",
+             "api": API},
+            {"key": f"{sid}|assigned_to",
+             "path": f"/servicePrincipals/{sid}/appRoleAssignedTo",
+             "api": API},
+        ])
+    results = fetch_paged_batch(runner.c, requests)
+    for sp in sps:
         sid = sp["id"]
         if sp.get("appRoles"):
             sps_with_roles += 1
-        owners_n += add_dir_links(runner.s, "spowner", "ServicePrincipal",
-                                  sid, data["owners"])
-        for ara in data["assignments"] + data["assigned_to"]:
-            runner.s.upsert("AppRoleAssignments", "objectId", {
-                "objectId": ara.get("id"),
-                "objectType": "AppRoleAssignment",
-                "id": ara.get("appRoleId"),
-                "principalId": ara.get("principalId"),
-                "principalType": ara.get("principalType"),
-                "principalDisplayName": ara.get("principalDisplayName"),
-                "resourceId": ara.get("resourceId") or sid,
-                "resourceDisplayName": ara.get("resourceDisplayName") or sp.get("displayName"),
-                "creationTimestamp": ara.get("createdDateTime"),
-                "deletionTimestamp": ara.get("deletedDateTime"),
-            })
+        owners = results.get(f"{sid}|owners")
+        if owners is not None and not owners.error:
+            owners_n += add_dir_links(
+                runner.s, "spowner", "ServicePrincipal", sid, owners.items)
+        assignments = results.get(f"{sid}|assignments")
+        assigned_to = results.get(f"{sid}|assigned_to")
+        aras = []
+        if assignments is not None and not assignments.error:
+            aras.extend(assignments.items)
+        if assigned_to is not None and not assigned_to.error:
+            aras.extend(assigned_to.items)
+        for ara in aras:
+            runner.s.upsert("AppRoleAssignments", "objectId",
+                            app_role_row(ara, resource_id=sid,
+                                         display_name=sp.get("displayName")))
             approl_n += 1
     runner.finish(sec, "ok", n, f"owners: {owners_n}, "
                   f"appRoleAssignments: {approl_n}, "
@@ -620,12 +636,14 @@ def collect_devices(runner: Runner) -> None:
     if n is None:
         return
     owners_n = 0
-    for d in devices:
-        try:
-            objs = list(runner.c.paged(f"/devices/{d['id']}/registeredOwners"))
-        except Degraded:
-            continue
-        owners_n += add_dir_links(runner.s, "devowner", "Device", d["id"], objs)
+    requests = [{"key": d["id"], "path": f"/devices/{d['id']}/registeredOwners",
+                 "api": API} for d in devices]
+    results = fetch_paged_batch(runner.c, requests)
+    for device in devices:
+        result = results.get(device["id"])
+        if result is not None and not result.error:
+            owners_n += add_dir_links(
+                runner.s, "devowner", "Device", device["id"], result.items)
     runner.finish(sec, "ok", n, f"owners: {owners_n}")
 
 
@@ -660,16 +678,15 @@ def collect_directoryroles(runner: Runner) -> None:
     if n is None:
         return
     members_n = 0
-
-    def fetch_members(role):
-        rid = role["id"]
-        try:
-            return rid, list(runner.c.paged(f"/directoryRoles/{rid}/members"))
-        except Degraded:
-            return rid, []
-
-    for rid, objs in parallel_map(fetch_members, roles):
-        members_n += add_dir_links(runner.s, "role", "DirectoryRole", rid, objs)
+    requests = [{"key": role["id"],
+                 "path": f"/directoryRoles/{role['id']}/members", "api": API}
+                for role in roles]
+    results = fetch_paged_batch(runner.c, requests)
+    for role in roles:
+        result = results.get(role["id"])
+        if result is not None and not result.error:
+            members_n += add_dir_links(
+                runner.s, "role", "DirectoryRole", role["id"], result.items)
     runner.finish(sec, "ok", n, f"members: {members_n}")
 
 
@@ -684,12 +701,15 @@ def collect_adminunits(runner: Runner) -> None:
     n = guard(sec, runner, go, auto_finish=False)
     if n is None:
         return
+    requests = [{"key": au["id"],
+                 "path": f"/directory/administrativeUnits/{au['id']}/members",
+                 "api": API} for au in aus]
+    results = fetch_paged_batch(runner.c, requests)
     for au in aus:
-        try:
-            objs = list(runner.c.paged(f"/directory/administrativeUnits/{au['id']}/members"))
-        except Degraded:
-            continue
-        add_dir_links(runner.s, "au", "AdministrativeUnit", au["id"], objs)
+        result = results.get(au["id"])
+        if result is not None and not result.error:
+            add_dir_links(runner.s, "au", "AdministrativeUnit",
+                          au["id"], result.items)
     runner.finish(sec, "ok", n)
 
 
@@ -962,62 +982,72 @@ def collect_pim_groups(runner: Runner, groups: list[dict]) -> None:
             return
     n_ra = n_req = 0
     perm_denied = 0
+    requests = []
+    for group in groups:
+        gid = group["id"]
+        requests.extend([
+            {"key": f"{gid}|active",
+             "path": ("/identityGovernance/privilegedAccess/group/"
+                      f"assignmentSchedules?$filter=groupId eq '{gid}'"),
+             "api": API},
+            {"key": f"{gid}|eligible",
+             "path": ("/identityGovernance/privilegedAccess/group/"
+                      f"eligibilitySchedules?$filter=groupId eq '{gid}'"),
+             "api": API},
+            {"key": f"{gid}|assignment_requests",
+             "path": ("/identityGovernance/privilegedAccess/group/"
+                      "assignmentScheduleRequests"
+                      f"?$filter=groupId eq '{gid}'"),
+             "api": API},
+            {"key": f"{gid}|eligibility_requests",
+             "path": ("/identityGovernance/privilegedAccess/group/"
+                      "eligibilityScheduleRequests"
+                      f"?$filter=groupId eq '{gid}'"),
+             "api": API},
+        ])
+    results = fetch_paged_batch(runner.c, requests)
 
-    def fetch_group(g):
-        gid = g["id"]
-        data = {"active": [], "eligible": [], "requests": []}
-        for key, path in (
-            ("active",
-             f"/identityGovernance/privilegedAccess/group/assignmentSchedules?$filter=groupId eq '{gid}'"),
-            ("eligible",
-             f"/identityGovernance/privilegedAccess/group/eligibilitySchedules?$filter=groupId eq '{gid}'"),
-        ):
-            try:
-                data[key] = list(runner.c.paged(path))
-            except Degraded as d:
-                if "PermissionScopeNotGranted" in d.body or d.status == 403:
-                    data[key] = None
-        for path in (
-            f"/identityGovernance/privilegedAccess/group/assignmentScheduleRequests?$filter=groupId eq '{gid}'",
-            f"/identityGovernance/privilegedAccess/group/eligibilityScheduleRequests?$filter=groupId eq '{gid}'",
-        ):
-            try:
-                data["requests"] += list(runner.c.paged(path))
-            except Degraded:
-                pass
-        return gid, data
-
-    for gid, data in parallel_map(fetch_group, groups):
-        for state, items in (("Active", data["active"]), ("Eligible", data["eligible"])):
-            if items is None:
-                perm_denied += 1
+    for group in groups:
+        gid = group["id"]
+        for state, suffix in (("Active", "active"), ("Eligible", "eligible")):
+            result = results.get(f"{gid}|{suffix}")
+            if result is None:
                 continue
-            for s in items:
+            if result.error:
+                if (result.status == 403
+                        or "PermissionScopeNotGranted" in (result.body or "")):
+                    perm_denied += 1
+                continue
+            for schedule in result.items:
                 runner.s.upsert("PIMgovernanceRoleAssignments", "id", {
-                    "id": s.get("id"), "resourceId": gid,
-                    "roleDefinitionId": s.get("accessId"),
-                    "subjectId": s.get("principalId"),
+                    "id": schedule.get("id"), "resourceId": gid,
+                    "roleDefinitionId": schedule.get("accessId"),
+                    "subjectId": schedule.get("principalId"),
                     "scopedResourceId": gid,
-                    "startDateTime": s.get("startDateTime"),
-                    "endDateTime": s.get("endDateTime"),
-                    "memberType": s.get("memberType"),
+                    "startDateTime": schedule.get("startDateTime"),
+                    "endDateTime": schedule.get("endDateTime"),
+                    "memberType": schedule.get("memberType"),
                     "assignmentState": state,
-                    "status": s.get("status"),
+                    "status": schedule.get("status"),
                 })
                 n_ra += 1
-        for rq in data["requests"]:
-            runner.s.upsert("PIMgovernanceRoleAssignmentRequests", "id", {
-                "id": rq.get("id"), "resourceId": gid,
-                "roleDefinitionId": rq.get("accessId"),
-                "subjectId": rq.get("principalId"),
-                "type": rq.get("type"),
-                "assignmentState": rq.get("action"),
-                "requestedDateTime": rq.get("createdDateTime"),
-                "reason": rq.get("justification"),
-                "status": rq.get("status"),
-                "schedule": rq.get("scheduleInfo"),
-            })
-            n_req += 1
+        for suffix in ("assignment_requests", "eligibility_requests"):
+            result = results.get(f"{gid}|{suffix}")
+            if result is None or result.error:
+                continue
+            for request in result.items:
+                runner.s.upsert("PIMgovernanceRoleAssignmentRequests", "id", {
+                    "id": request.get("id"), "resourceId": gid,
+                    "roleDefinitionId": request.get("accessId"),
+                    "subjectId": request.get("principalId"),
+                    "type": request.get("type"),
+                    "assignmentState": request.get("action"),
+                    "requestedDateTime": request.get("createdDateTime"),
+                    "reason": request.get("justification"),
+                    "status": request.get("status"),
+                    "schedule": request.get("scheduleInfo"),
+                })
+                n_req += 1
     if perm_denied >= len(groups):
         runner.finish(sec, "degraded", note="no PIM-for-groups permission")
     else:
@@ -1068,29 +1098,43 @@ def collect_ig(runner: Runner) -> None:
             n["requests"] += 1
     except Degraded:
         pass
+    resources = []
     try:
         for r in runner.c.paged("/identityGovernance/entitlementManagement/resources"):
             runner.s.upsert("IGaccessPackageResources", "id", r)
             n["resources"] += 1
-            try:
-                for role in runner.c.paged(
-                        f"/identityGovernance/entitlementManagement/resources/{r['id']}/roles"):
-                    runner.s.upsert("IGaccessPackageResourceRoles", "id", role)
-                    n["roles"] += 1
-                    runner.s.add_link("lnk_ig_ap_rr", {
-                        "IGaccessPackageResource": r["id"],
-                        "IGaccessPackageResourceRole": role["id"]})
-            except Degraded:
-                pass
-            try:
-                for sc in runner.c.paged(
-                        f"/identityGovernance/entitlementManagement/resources/{r['id']}/scopes"):
-                    runner.s.upsert("IGaccessPackageResourceScopes", "id", sc)
-                    n["scopes"] += 1
-            except Degraded:
-                pass
+            resources.append(r)
     except Degraded:
         pass
+    requests = []
+    for resource in resources:
+        rid = resource["id"]
+        requests.extend([
+            {"key": f"{rid}|roles",
+             "path": ("/identityGovernance/entitlementManagement/resources/"
+                      f"{rid}/roles"),
+             "api": API},
+            {"key": f"{rid}|scopes",
+             "path": ("/identityGovernance/entitlementManagement/resources/"
+                      f"{rid}/scopes"),
+             "api": API},
+        ])
+    results = fetch_paged_batch(runner.c, requests)
+    for resource in resources:
+        rid = resource["id"]
+        roles = results.get(f"{rid}|roles")
+        if roles is not None and not roles.error:
+            for role in roles.items:
+                runner.s.upsert("IGaccessPackageResourceRoles", "id", role)
+                n["roles"] += 1
+                runner.s.add_link("lnk_ig_ap_rr", {
+                    "IGaccessPackageResource": rid,
+                    "IGaccessPackageResourceRole": role["id"]})
+        scopes = results.get(f"{rid}|scopes")
+        if scopes is not None and not scopes.error:
+            for scope in scopes.items:
+                runner.s.upsert("IGaccessPackageResourceScopes", "id", scope)
+                n["scopes"] += 1
     try:
         for rr in runner.c.paged("/identityGovernance/entitlementManagement/resourceRequests"):
             runner.s.upsert("IGaccessPackageResourceRequests", "id", rr)

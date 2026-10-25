@@ -333,6 +333,8 @@ def _worker_command(mode: str, refresh_token: str, client_id: str,
                "-at", refresh_token, "-o", str(out_path)]
         if user_agent:
             cmd += ["-ua", user_agent]
+        if evade:
+            cmd += ["--evade"]
         return cmd
     client = (client_id or "").strip()
     if not client:
@@ -347,6 +349,8 @@ def _worker_command(mode: str, refresh_token: str, client_id: str,
             cmd += ["-ua", user_agent]
         if access_out:
             cmd += ["--access-out", access_out]
+        if evade:
+            cmd += ["--evade"]
     return cmd
 
 
@@ -901,11 +905,12 @@ def start_collection(refresh_token: str = "", out: str = "",
         cmd = _worker_command("run", creds["refresh_token"],
                               creds["client_id"], str(token_out),
                               out_path=out_path, user_agent=user_agent,
-                              access_out=str(access_out))
+                              access_out=str(access_out), evade=evade)
         initial_log = "Starting collector..."
     else:
         cmd = _worker_command("run-access", creds["access_token"], "",
-                              out_path=out_path, user_agent=user_agent)
+                              out_path=out_path, user_agent=user_agent,
+                              evade=evade)
         initial_log = "Starting collector..."
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1375,6 +1380,15 @@ def view_html() -> str:
         <span>User-Agent (optional)</span>
         <input id="collect-ua" type="text" autocomplete="off" spellcheck="false">
       </label>
+      <label class="collect-check">
+        <input type="checkbox" id="collect-evade">
+        <span>Evade Graph detections (batch relationship requests)</span>
+      </label>
+      <div class="collect-check-note">
+        Batches up to 20 relationship GETs per request. Top-level directory
+        listings stay as normal paged requests. Uses the ADO.NET user agent
+        when no User-Agent is supplied.
+      </div>
       <div class="collect-actions">
         <button type="button" class="mode-btn" id="collect-start">Start collection</button>
         <button type="button" class="mode-btn" id="collect-go-analysis">Go to analysis</button>
@@ -1435,6 +1449,7 @@ def view_html() -> str:
 (function() {
   var outEl = document.getElementById('collect-out');
   var uaEl = document.getElementById('collect-ua');
+  var graphEvadeEl = document.getElementById('collect-evade');
   var startBtn = document.getElementById('collect-start');
   var noteEl = document.getElementById('collect-note');
   var aadOutEl = document.getElementById('collect-aad-out');
@@ -1673,7 +1688,8 @@ def view_html() -> str:
     startBackend({
       backend: 'graph',
       out: outEl.value.trim(),
-      user_agent: uaEl.value.trim()
+      user_agent: uaEl.value.trim(),
+      evade: !!(graphEvadeEl && graphEvadeEl.checked)
     }, startBtn, setGraphNote);
   });
 
@@ -3584,7 +3600,7 @@ def main(argv=None) -> int:
     ap.add_argument("--autotoken", action="store_true",
                     help="redeem the refresh token for an AAD Graph token")
     ap.add_argument("--evade", action="store_true",
-                    help="use AAD Graph batch requests / ADO.NET user agent")
+                    help="batch relationship requests and use the evade user agent")
     ap.add_argument("--gather-all", action="store_true",
                     help="also collect IG, PIM, and Azure data")
     ap.add_argument("--mfa", action="store_true",
@@ -3612,14 +3628,16 @@ def main(argv=None) -> int:
         elif args.access_token and not args.refresh_token:
             cmd = _worker_command("run-access", args.access_token, "",
                                   out_path=out_path,
-                                  user_agent=args.user_agent)
+                                  user_agent=args.user_agent,
+                                  evade=args.evade)
         else:
             if not args.refresh_token or not args.client_id:
                 raise ValueError(
                     "refresh token and client id are required for Graph")
             cmd = _worker_command("run", args.refresh_token, args.client_id,
                                   out_path=out_path,
-                                  user_agent=args.user_agent)
+                                  user_agent=args.user_agent,
+                                  evade=args.evade)
     except (RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
