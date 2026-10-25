@@ -70,8 +70,8 @@ import urllib.parse
 from collections import defaultdict, Counter
 from pathlib import Path
 
-import analysis
-import collect as collect_backend
+from entra_surface import analysis
+from entra_surface import collect as collect_backend
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = SCRIPT_DIR / "privileged_roles.json"
