@@ -32,11 +32,14 @@ def _decode_jwt(token: str) -> dict:
 
 
 class TokenProvider:
-    def __init__(self, refresh_token: str, client_id: str | None = None):
+    def __init__(self, refresh_token: str, client_id: str | None = None,
+                 proxies: dict | None = None):
         self._rt = refresh_token
         self._client_id = client_id or BROKER_CLIENT_ID
-        self._app = msal.PublicClientApplication(
-            self._client_id, authority="https://login.microsoftonline.com/common")
+        app_kwargs = {"authority": "https://login.microsoftonline.com/common"}
+        if proxies:
+            app_kwargs["proxies"] = proxies
+        self._app = msal.PublicClientApplication(self._client_id, **app_kwargs)
         self._tokens: dict[str, tuple[str, float]] = {}
         self._claims: dict | None = None
         self._lock = threading.Lock()

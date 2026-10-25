@@ -72,6 +72,7 @@ from pathlib import Path
 
 from entra_surface import analysis
 from entra_surface import collect as collect_backend
+from entra_surface import settings as surface_settings
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = SCRIPT_DIR / "privileged_roles.json"
@@ -7528,10 +7529,37 @@ def render_report(results, tenant_name, db_path, config_path,
   .settings-note {{
     margin: 0; color: var(--text-secondary); font-size: 12.5px; line-height: 1.5;
   }}
-  .settings-placeholder {{
-    padding: 14px 16px; border: 1px dashed var(--border); border-radius: 8px;
-    background: var(--page-plane); color: var(--text-muted);
-    font-size: 12.5px; line-height: 1.5;
+  .settings-field {{
+    display: flex; flex-direction: column; gap: 4px;
+    color: var(--text-secondary); font-size: 12px;
+  }}
+  .settings-field input {{
+    background: var(--page-plane); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 7px 9px; font-size: 12.5px; font-family: inherit;
+  }}
+  .settings-field input:focus {{
+    outline: none;
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  }}
+  .settings-grid {{
+    display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px;
+    margin-top: 12px;
+  }}
+  .settings-grid .wide {{ grid-column: 1 / -1; }}
+  .settings-actions {{ margin-top: 12px; }}
+  .settings-check {{
+    display: flex; align-items: center; gap: 8px; margin-top: 10px;
+    color: var(--text-secondary); font-size: 12.5px; cursor: pointer;
+  }}
+  .settings-check input {{ margin: 0; }}
+  .settings-status {{
+    margin-top: 10px; font-size: 12px; color: var(--text-secondary);
+  }}
+  .settings-status.error {{ color: var(--status-critical); }}
+  .settings-status.hidden {{ display: none; }}
+  @media (max-width: 520px) {{
+    .settings-grid {{ grid-template-columns: 1fr; }}
   }}
   .settings-foot {{
     display: flex; justify-content: flex-end; gap: 8px;
@@ -8006,12 +8034,48 @@ def render_report(results, tenant_name, db_path, config_path,
                role="tabpanel" aria-labelledby="settings-tab-proxy">
         <div class="settings-section">
           <h4>Proxy</h4>
-          <div class="settings-placeholder">Proxy configuration will be added
-            here. No proxy is currently used for collection or analysis.</div>
+          <p class="settings-note">Route collector and token-refresh traffic
+            through an HTTP, HTTPS, SOCKS4, or SOCKS5 proxy.</p>
+          <label class="settings-check">
+            <input type="checkbox" id="settings-proxy-enabled">
+            <span>Use a proxy for collection and token refresh</span>
+          </label>
+          <div class="settings-grid">
+            <label class="settings-field wide">
+              <span>Proxy URL</span>
+              <input id="settings-proxy-url" type="text" autocomplete="off"
+                     spellcheck="false"
+                     placeholder="http://127.0.0.1:8080 or socks5h://127.0.0.1:1080">
+            </label>
+            <label class="settings-field">
+              <span>Username (optional)</span>
+              <input id="settings-proxy-user" type="text" autocomplete="off"
+                     spellcheck="false">
+            </label>
+            <label class="settings-field">
+              <span>Password (optional)</span>
+              <input id="settings-proxy-pass" type="password"
+                     autocomplete="new-password">
+            </label>
+            <label class="settings-field wide">
+              <span>No-proxy hosts (optional)</span>
+              <input id="settings-proxy-no-proxy" type="text" autocomplete="off"
+                     spellcheck="false" placeholder="localhost,127.0.0.1">
+            </label>
+          </div>
+          <p class="settings-note">SOCKS support requires PySocks in the
+            collector virtualenv. Proxy credentials are stored in
+            <span class="mono">.entra-surface-settings.json</span>.</p>
+          <div class="settings-actions">
+            <button type="button" class="mode-btn" id="settings-test">Test proxy</button>
+          </div>
+          <div class="settings-status hidden" id="settings-proxy-status"
+               role="status" aria-live="polite"></div>
         </div>
       </section>
     </div>
     <div class="settings-foot">
+      <button type="button" class="mode-btn" id="settings-save">Save</button>
       <button type="button" class="mode-btn" id="settings-done">Done</button>
     </div>
   </div>
@@ -8088,9 +8152,125 @@ def render_report(results, tenant_name, db_path, config_path,
   var overlay = document.getElementById('settings-overlay');
   var closeBtn = document.getElementById('settings-close');
   var doneBtn = document.getElementById('settings-done');
+  var saveBtn = document.getElementById('settings-save');
+  var testBtn = document.getElementById('settings-test');
+  var proxyEnabled = document.getElementById('settings-proxy-enabled');
+  var proxyUrl = document.getElementById('settings-proxy-url');
+  var proxyUser = document.getElementById('settings-proxy-user');
+  var proxyPass = document.getElementById('settings-proxy-pass');
+  var proxyNoProxy = document.getElementById('settings-proxy-no-proxy');
+  var proxyStatus = document.getElementById('settings-proxy-status');
   var tabs = Array.prototype.slice.call(
     document.querySelectorAll('#settings-overlay button[data-settings-tab]'));
   if (!gear || !overlay) return;
+
+  function setProxyStatus(text, failed) {{
+    if (!proxyStatus) return;
+    proxyStatus.textContent = text || '';
+    proxyStatus.classList.toggle('hidden', !text);
+    proxyStatus.classList.toggle('error', !!failed);
+  }}
+
+  function fillProxy(proxy) {{
+    proxy = proxy || {{}};
+    if (proxyEnabled) proxyEnabled.checked = !!proxy.enabled;
+    if (proxyUrl) proxyUrl.value = proxy.url || '';
+    if (proxyUser) proxyUser.value = proxy.username || '';
+    if (proxyPass) proxyPass.value = proxy.password || '';
+    if (proxyNoProxy) proxyNoProxy.value = proxy.no_proxy || '';
+  }}
+
+  function proxyPayload() {{
+    return {{
+      enabled: !!(proxyEnabled && proxyEnabled.checked),
+      url: proxyUrl ? proxyUrl.value.trim() : '',
+      username: proxyUser ? proxyUser.value.trim() : '',
+      password: proxyPass ? proxyPass.value : '',
+      no_proxy: proxyNoProxy ? proxyNoProxy.value.trim() : ''
+    }};
+  }}
+
+  function loadSettings() {{
+    return fetch('/api/settings')
+      .then(function(r) {{
+        return r.json().then(function(data) {{
+          if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+          return data;
+        }});
+      }})
+      .then(function(data) {{
+        fillProxy(data.proxy);
+        setProxyStatus('', false);
+      }})
+      .catch(function(err) {{
+        setProxyStatus(err.message || 'Could not load settings.', true);
+      }});
+  }}
+
+  function saveSettings() {{
+    var proxy = proxyPayload();
+    if (proxy.enabled && !proxy.url) {{
+      setProxyStatus('Enter a proxy URL.', true);
+      selectTab('proxy');
+      if (proxyUrl) proxyUrl.focus();
+      return;
+    }}
+    if (saveBtn) saveBtn.disabled = true;
+    setProxyStatus('Saving...', false);
+    fetch('/api/settings', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ proxy: proxy }})
+    }}).then(function(r) {{
+      return r.json().then(function(data) {{
+        if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+        return data;
+      }});
+    }}).then(function(data) {{
+      fillProxy(data.proxy);
+      setProxyStatus('Proxy settings saved.', false);
+    }}).catch(function(err) {{
+      setProxyStatus(err.message || 'Could not save settings.', true);
+    }}).then(function() {{
+      if (saveBtn) saveBtn.disabled = false;
+    }});
+  }}
+
+  function testProxy() {{
+    var proxy = proxyPayload();
+    if (!proxy.enabled) {{
+      setProxyStatus('Enable the proxy before testing it.', true);
+      selectTab('proxy');
+      return;
+    }}
+    if (!proxy.url) {{
+      setProxyStatus('Enter a proxy URL.', true);
+      selectTab('proxy');
+      if (proxyUrl) proxyUrl.focus();
+      return;
+    }}
+    if (testBtn) testBtn.disabled = true;
+    setProxyStatus('Testing proxy...', false);
+    fetch('/api/settings/test', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ proxy: proxy }})
+    }}).then(function(r) {{
+      return r.json().then(function(data) {{
+        if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+        return data;
+      }});
+    }}).then(function(data) {{
+      var bits = ['Proxy connection OK'];
+      if (data.status) bits.push('HTTP ' + data.status);
+      if (typeof data.elapsed_ms === 'number') bits.push(data.elapsed_ms + ' ms');
+      setProxyStatus(bits.join(' \u00b7 ') + '.', false);
+    }}).catch(function(err) {{
+      setProxyStatus(err.message || 'Could not reach the proxy.', true);
+    }}).then(function() {{
+      if (testBtn) testBtn.disabled = false;
+    }});
+  }}
 
   function selectTab(name) {{
     tabs.forEach(function(tab) {{
@@ -8110,6 +8290,7 @@ def render_report(results, tenant_name, db_path, config_path,
       document.body.classList.add('settings-open');
       gear.setAttribute('aria-expanded', 'true');
       if (closeBtn) closeBtn.focus();
+      loadSettings();
     }} else {{
       overlay.classList.add('hidden');
       document.body.classList.remove('settings-open');
@@ -8124,6 +8305,8 @@ def render_report(results, tenant_name, db_path, config_path,
   }});
   if (closeBtn) closeBtn.addEventListener('click', function() {{ setOpen(false); }});
   if (doneBtn) doneBtn.addEventListener('click', function() {{ setOpen(false); }});
+  if (saveBtn) saveBtn.addEventListener('click', saveSettings);
+  if (testBtn) testBtn.addEventListener('click', testProxy);
   overlay.addEventListener('click', function(event) {{
     if (event.target === overlay) setOpen(false);
   }});
@@ -12621,6 +12804,10 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                 self._send(json.dumps(collect_backend.get_status(),
                                       default=str).encode("utf-8"),
                            "application/json; charset=utf-8")
+            elif path == "/api/settings":
+                self._send(json.dumps(surface_settings.load_settings()).encode("utf-8"),
+                           "application/json; charset=utf-8",
+                           headers={"Cache-Control": "no-store"})
             elif path == "/api/tokens":
                 self._send(json.dumps(collect_backend.get_auth_status()).encode("utf-8"),
                            "application/json; charset=utf-8")
@@ -12834,6 +13021,53 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                     return
                 self._send(json.dumps(state).encode("utf-8"),
                            "application/json; charset=utf-8")
+                return
+            if parsed.path == "/api/settings/test":
+                payload = {}
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length:
+                        payload = json.loads(
+                            self.rfile.read(length) or b"{}") or {}
+                except (ValueError, json.JSONDecodeError):
+                    payload = {}
+                proxy = payload.get("proxy") if isinstance(payload, dict) else {}
+                try:
+                    result = collect_backend.test_proxy(proxy or {})
+                except ValueError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 400)
+                    return
+                except RuntimeError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 502)
+                    return
+                except OSError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 502)
+                    return
+                self._send(json.dumps(result).encode("utf-8"),
+                           "application/json; charset=utf-8",
+                           headers={"Cache-Control": "no-store"})
+                return
+            if parsed.path == "/api/settings":
+                payload = {}
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length:
+                        payload = json.loads(
+                            self.rfile.read(length) or b"{}") or {}
+                except (ValueError, json.JSONDecodeError):
+                    payload = {}
+                try:
+                    state = surface_settings.save_settings(payload)
+                except (ValueError, OSError) as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 400)
+                    return
+                self._send(json.dumps(state).encode("utf-8"),
+                           "application/json; charset=utf-8",
+                           headers={"Cache-Control": "no-store"})
                 return
             if parsed.path == "/api/collect":
                 payload = {}

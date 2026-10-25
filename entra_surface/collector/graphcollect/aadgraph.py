@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
 import requests
+from requests.utils import should_bypass_proxies
 
 from .client import Degraded
 from .collectors import Runner
@@ -54,12 +55,15 @@ class AadGraphClient:
     """Paged AAD Graph HTTP client with optional batch/evade transport."""
 
     def __init__(self, token_getter, tenant_id: str, user_agent: str = "",
-                 evade: bool = False, verbose: int = 0):
+                 evade: bool = False, verbose: int = 0,
+                 proxies: dict | None = None, no_proxy: str = ""):
         self._token_getter = token_getter
         self.tenant_id = (tenant_id or "myorganization").strip() or "myorganization"
         self.user_agent = (user_agent or "").strip()
         self.evade = bool(evade)
         self.verbose = int(verbose)
+        self.proxies = proxies or None
+        self.no_proxy = (no_proxy or "").strip()
         self._local = threading.local()
         self._count_lock = threading.Lock()
         self.requests_made = 0
@@ -73,8 +77,17 @@ class AadGraphClient:
             adapter = requests.adapters.HTTPAdapter(
                 pool_connections=16, pool_maxsize=32, max_retries=0)
             session.mount("https://", adapter)
+            if self.proxies:
+                session.trust_env = False
             self._local.session = session
         return session
+
+    def _proxy_for(self, url: str):
+        if not self.proxies:
+            return None
+        if self.no_proxy and should_bypass_proxies(url, self.no_proxy):
+            return {}
+        return self.proxies
 
     def _headers(self) -> dict:
         headers = {"Authorization": f"Bearer {self._token_getter()}"}
@@ -117,7 +130,8 @@ class AadGraphClient:
         for attempt in range(retries):
             try:
                 response = self._session().get(
-                    url, headers=self._headers(), timeout=90)
+                    url, headers=self._headers(), timeout=90,
+                    proxies=self._proxy_for(url))
             except requests.RequestException:
                 if attempt == retries - 1:
                     raise Degraded(0, url, "request failed")
@@ -158,7 +172,8 @@ class AadGraphClient:
             try:
                 response = self._session().post(
                     batch_url, data=body.encode("utf-8"),
-                    headers=headers, timeout=90)
+                    headers=headers, timeout=90,
+                    proxies=self._proxy_for(batch_url))
             except requests.RequestException:
                 if attempt == retries - 1:
                     raise Degraded(0, url, "batch request failed")

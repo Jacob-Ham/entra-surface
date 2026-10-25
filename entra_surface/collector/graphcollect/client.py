@@ -14,6 +14,7 @@ from typing import Callable, Iterator, Optional
 from urllib.parse import urljoin
 
 import requests
+from requests.utils import should_bypass_proxies
 
 GRAPH_BASE = "https://graph.microsoft.com"
 GRAPH_BATCH_LIMIT = 20
@@ -43,13 +44,17 @@ class BatchPagedResult:
 class GraphClient:
     def __init__(self, token_getter: Callable[[], str], verbose: int = 0,
                  user_agent: Optional[str] = None, batch: bool = False,
-                 batch_size: int = GRAPH_BATCH_LIMIT):
+                 batch_size: int = GRAPH_BATCH_LIMIT,
+                 proxies: Optional[dict] = None,
+                 no_proxy: str = ""):
         self._token_getter = token_getter
         self.verbose = verbose
         self.user_agent = user_agent
         self.batch = bool(batch)
         self.batch_size = max(1, min(int(batch_size or GRAPH_BATCH_LIMIT),
                                      GRAPH_BATCH_LIMIT))
+        self.proxies = proxies or None
+        self.no_proxy = (no_proxy or "").strip()
         self._local = threading.local()
         self._count_lock = threading.Lock()
         self.requests_made = 0
@@ -63,8 +68,17 @@ class GraphClient:
             adapter = requests.adapters.HTTPAdapter(
                 pool_connections=16, pool_maxsize=32, max_retries=0)
             s.mount("https://", adapter)
+            if self.proxies:
+                s.trust_env = False
             self._local.session = s
         return s
+
+    def _proxy_for(self, url: str):
+        if not self.proxies:
+            return None
+        if self.no_proxy and should_bypass_proxies(url, self.no_proxy):
+            return {}
+        return self.proxies
 
     def _headers(self) -> dict:
         headers = {"Authorization": f"Bearer {self._token_getter()}"}
@@ -87,7 +101,8 @@ class GraphClient:
         for attempt in range(retries):
             try:
                 r = self._session().request(
-                    method, url, headers=self._headers(), timeout=timeout)
+                    method, url, headers=self._headers(), timeout=timeout,
+                    proxies=self._proxy_for(url))
             except requests.RequestException:
                 if attempt == retries - 1:
                     raise
@@ -153,7 +168,8 @@ class GraphClient:
             headers["Accept"] = "application/json"
             try:
                 response = self._session().post(
-                    url, json=payload, headers=headers, timeout=120)
+                    url, json=payload, headers=headers, timeout=120,
+                    proxies=self._proxy_for(url))
             except requests.RequestException:
                 if attempt == 4:
                     raise Degraded(0, url, "batch request failed")
@@ -308,10 +324,14 @@ class GraphClient:
 
 class ArmClient:
     def __init__(self, token_getter: Callable[[], str], verbose: int = 0,
-                 user_agent: Optional[str] = None):
+                 user_agent: Optional[str] = None,
+                 proxies: Optional[dict] = None,
+                 no_proxy: str = ""):
         self._token_getter = token_getter
         self.verbose = verbose
         self.user_agent = user_agent
+        self.proxies = proxies or None
+        self.no_proxy = (no_proxy or "").strip()
         self._local = threading.local()
         self._count_lock = threading.Lock()
         self.requests_made = 0
@@ -323,8 +343,17 @@ class ArmClient:
             adapter = requests.adapters.HTTPAdapter(
                 pool_connections=8, pool_maxsize=16, max_retries=0)
             s.mount("https://", adapter)
+            if self.proxies:
+                s.trust_env = False
             self._local.session = s
         return s
+
+    def _proxy_for(self, url: str):
+        if not self.proxies:
+            return None
+        if self.no_proxy and should_bypass_proxies(url, self.no_proxy):
+            return {}
+        return self.proxies
 
     def get(self, url: str, retries: int = 4) -> requests.Response:
         for attempt in range(retries):
@@ -332,7 +361,9 @@ class ArmClient:
             if self.user_agent:
                 headers["User-Agent"] = self.user_agent
             try:
-                r = self._session().get(url, headers=headers, timeout=90)
+                r = self._session().get(
+                    url, headers=headers, timeout=90,
+                    proxies=self._proxy_for(url))
             except requests.RequestException:
                 if attempt == retries - 1:
                     raise

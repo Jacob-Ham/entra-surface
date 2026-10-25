@@ -30,6 +30,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import settings as surface_settings
 from . import token_resources
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -82,6 +83,7 @@ def _timestamp() -> str:
 def _worker_env() -> dict:
     env = os.environ.copy()
     env["ENTRA_COLLECTOR_DIR"] = str(collector_dir())
+    env["ENTRA_SURFACE_SETTINGS"] = str(surface_settings.SETTINGS_FILE)
     return env
 
 
@@ -365,6 +367,60 @@ def _read_token_out(path: Path) -> str:
         return path.read_text(encoding="utf-8").strip()
     except OSError:
         return ""
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def test_proxy(proxy: dict, url: str = "") -> dict:
+    """Run the collector's proxy connectivity check with an unsaved config."""
+    proxy = surface_settings.validate_proxy(proxy or {})
+    if not proxy.get("enabled"):
+        raise ValueError("enable the proxy before testing it")
+    directory = collector_dir()
+    if not (directory / "graphcollect").is_dir():
+        raise RuntimeError(
+            f"collector backend not found: {directory} "
+            "(expected graphcollect/; set ENTRA_COLLECTOR_DIR for an "
+            "external checkout)")
+    if not WORKER.is_file():
+        raise RuntimeError(f"collector worker not found: {WORKER}")
+    parent = surface_settings.SETTINGS_FILE.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(
+        prefix=".entra-proxy-test-", suffix=".json", dir=str(parent))
+    path = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"proxy": proxy}, handle)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        env = _worker_env()
+        env["ENTRA_SURFACE_SETTINGS"] = str(path)
+        cmd = [_collector_python(), "-u", str(WORKER), "proxy-test"]
+        if url:
+            cmd += ["--url", url]
+        try:
+            proc = subprocess.run(
+                cmd, cwd=str(BASE_DIR), env=env,
+                capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("proxy test timed out") from exc
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            raise RuntimeError(detail[-1] if detail else "proxy test failed")
+        try:
+            result = json.loads(proc.stdout.strip() or "{}")
+        except ValueError as exc:
+            raise RuntimeError(
+                "collector returned an invalid proxy test result") from exc
+        if not isinstance(result, dict):
+            raise RuntimeError("collector returned an invalid proxy test result")
+        return result
     finally:
         try:
             path.unlink()

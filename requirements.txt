@@ -2,3 +2,4 @@
 # graphcollect is bundled under entra_surface/collector.
 msal>=1.39.0
 requests>=2.34.2
+PySocks>=1.7.1

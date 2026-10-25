@@ -11,6 +11,7 @@ Graph collection supports ``--evade`` JSON batching for relationship requests.
 either a refresh token or an AAD Graph access token.
 The newest rotated refresh token is written to --token-out so the parent can
 persist it back into .entra-surface-auth.json.
+The ``proxy-test`` mode checks the configured collection proxy end to end.
 """
 from __future__ import annotations
 
@@ -25,8 +26,11 @@ from pathlib import Path
 COLLECTOR_DIR = Path(os.environ.get(
     "ENTRA_COLLECTOR_DIR",
     Path(__file__).resolve().parent / "collector")).expanduser().resolve()
+REPO_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(COLLECTOR_DIR))
+sys.path.insert(0, str(REPO_DIR))
 
+from entra_surface import settings as surface_settings  # noqa: E402
 from graphcollect.auth import (  # noqa: E402
     ARM_RES, GRAPH_RES, AuthError, TokenProvider, _decode_jwt)
 from graphcollect.aadgraph import (  # noqa: E402
@@ -41,8 +45,8 @@ class SavingProvider(TokenProvider):
     """TokenProvider that persists the newest rotated refresh token."""
 
     def __init__(self, refresh_token: str, client_id: str, token_out: str,
-                 access_out: str = ""):
-        super().__init__(refresh_token, client_id=client_id)
+                 access_out: str = "", proxies: dict | None = None):
+        super().__init__(refresh_token, client_id=client_id, proxies=proxies)
         self._token_out = token_out
         self._access_out = access_out
         self._save()
@@ -89,10 +93,39 @@ def _is_graph_access_token(claims: dict) -> bool:
     return any(str(a).rstrip("/").lower() in GRAPH_AUDIENCES for a in values)
 
 
-def _graph_get(token: str, url: str) -> dict:
+def _load_proxy_config() -> tuple[dict | None, str]:
+    try:
+        settings = surface_settings.load_settings()
+    except Exception as exc:
+        raise RuntimeError(f"could not load settings: {exc}") from exc
+    proxy = settings.get("proxy") or {}
+    if not proxy.get("enabled"):
+        return None, ""
+    if surface_settings.is_socks(proxy):
+        try:
+            import socks  # noqa: F401 - requests imports it for SOCKS support
+        except ImportError as exc:
+            raise RuntimeError(
+                "SOCKS proxies require PySocks; install requirements.txt "
+                "in the collector virtualenv") from exc
+    proxies = surface_settings.proxy_dict(proxy)
+    if not proxies:
+        raise RuntimeError("proxy is enabled but no proxy URL is configured")
+    return proxies, str(proxy.get("no_proxy") or "").strip()
+
+
+def _graph_get(token: str, url: str, proxies: dict | None = None,
+               no_proxy: str = "") -> dict:
     try:
         import requests
-        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
+        if proxies and no_proxy:
+            from requests.utils import should_bypass_proxies
+            if should_bypass_proxies(url, no_proxy):
+                proxies = {}
+        session = requests.Session()
+        session.trust_env = proxies is None
+        r = session.get(url, headers={"Authorization": f"Bearer {token}"},
+                        timeout=20, proxies=proxies)
         if r.ok:
             data = r.json()
             return data if isinstance(data, dict) else {}
@@ -102,16 +135,20 @@ def _graph_get(token: str, url: str) -> dict:
 
 
 def _principal(provider: SavingProvider,
-               resource: str = GRAPH_RES) -> tuple[dict, str]:
+               resource: str = GRAPH_RES,
+               proxies: dict | None = None,
+               no_proxy: str = "") -> tuple[dict, str]:
     token = provider.get_token(resource)
     claims = _claims(token)
     me = {}
     org = {}
     if resource.rstrip("/") == GRAPH_RES:
         me = _graph_get(token, "https://graph.microsoft.com/v1.0/me"
-                               "?$select=displayName,userPrincipalName,id,mail")
+                               "?$select=displayName,userPrincipalName,id,mail",
+                        proxies=proxies, no_proxy=no_proxy)
         orgs = _graph_get(token, "https://graph.microsoft.com/v1.0/organization"
-                                 "?$select=displayName,id").get("value") or []
+                                 "?$select=displayName,id",
+                          proxies=proxies, no_proxy=no_proxy).get("value") or []
         org = orgs[0] if orgs else {}
     scopes = (claims.get("scp") or "").split()
     roles = claims.get("roles") or []
@@ -140,15 +177,63 @@ def _principal(provider: SavingProvider,
     }, token
 
 
+def proxy_test(args) -> int:
+    """Check that the configured proxy can reach Microsoft Graph."""
+    try:
+        proxies, no_proxy = _load_proxy_config()
+    except RuntimeError as exc:
+        print(f"[proxy] {exc}", file=sys.stderr)
+        return 1
+    if not proxies:
+        print("[proxy] no proxy is enabled", file=sys.stderr)
+        return 1
+    url = (args.url or "https://graph.microsoft.com/v1.0/$metadata").strip()
+    if no_proxy:
+        from requests.utils import should_bypass_proxies
+        if should_bypass_proxies(url, no_proxy):
+            print(f"[proxy] {url} matches the no-proxy list; the connection "
+                  "would bypass the proxy", file=sys.stderr)
+            return 1
+    import requests
+    session = requests.Session()
+    session.trust_env = False
+    started = time.monotonic()
+    try:
+        response = session.get(url, proxies=proxies, timeout=args.timeout)
+    except Exception as exc:
+        print(f"[proxy] failed: {exc}", file=sys.stderr)
+        return 1
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    ok = response.status_code < 500 and response.status_code != 407
+    print(json.dumps({
+        "ok": ok,
+        "status": response.status_code,
+        "url": url,
+        "elapsed_ms": elapsed_ms,
+    }))
+    if not ok:
+        print(f"[proxy] proxy returned HTTP {response.status_code}",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
 def probe(args) -> int:
     try:
-        provider = SavingProvider(args.refresh_token, args.client_id, args.token_out)
+        proxies, no_proxy = _load_proxy_config()
+        provider = SavingProvider(args.refresh_token, args.client_id,
+                                  args.token_out, proxies=proxies)
         resource = (getattr(args, "resource_uri", "") or "").strip()
         if not resource:
             resource = PROBE_RESOURCES.get(args.resource, GRAPH_RES)
-        principal, access_token = _principal(provider, resource)
+        principal, access_token = _principal(provider, resource,
+                                             proxies=proxies,
+                                             no_proxy=no_proxy)
     except AuthError as exc:
         print(f"[auth] failed: {exc}", file=sys.stderr)
+        return 1
+    except RuntimeError as exc:
+        print(f"[proxy] {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
         print(f"[auth] failed: {exc}", file=sys.stderr)
@@ -159,11 +244,16 @@ def probe(args) -> int:
 
 def run(args) -> int:
     try:
+        proxies, no_proxy = _load_proxy_config()
         provider = SavingProvider(args.refresh_token, args.client_id,
-                                  args.token_out, args.access_out)
+                                  args.token_out, args.access_out,
+                                  proxies=proxies)
         claims = provider.claims
     except AuthError as exc:
         print(f"[auth] failed: {exc}")
+        return 1
+    except RuntimeError as exc:
+        print(f"[proxy] {exc}")
         return 1
     print(f"[auth] {provider.identity} (tid: {claims.get('tid')})")
 
@@ -172,12 +262,14 @@ def run(args) -> int:
     if evade and not user_agent:
         user_agent = "Microsoft ADO.NET Data Services"
     graph = GraphClient(lambda: provider.get_token(GRAPH_RES), verbose=args.verbose,
-                        user_agent=user_agent, batch=evade)
+                        user_agent=user_agent, batch=evade,
+                        proxies=proxies, no_proxy=no_proxy)
     arm = None
     try:
         provider.get_token(ARM_RES)
         arm = ArmClient(lambda: provider.get_token(ARM_RES), verbose=args.verbose,
-                        user_agent=user_agent)
+                        user_agent=user_agent, proxies=proxies,
+                        no_proxy=no_proxy)
     except AuthError as exc:
         print(f"[arm] no Azure Resource Manager token ({exc}); "
               f"Azure tables will be skipped")
@@ -234,12 +326,18 @@ def run_access(args) -> int:
 
     identity = claims.get("upn") or claims.get("unique_name") or claims.get("oid") or "?"
     print(f"[auth] {identity} (tid: {claims.get('tid')})")
+    try:
+        proxies, no_proxy = _load_proxy_config()
+    except RuntimeError as exc:
+        print(f"[proxy] {exc}", file=sys.stderr)
+        return 1
     user_agent = (args.user_agent or "").strip()
     evade = bool(getattr(args, "evade", False))
     if evade and not user_agent:
         user_agent = "Microsoft ADO.NET Data Services"
     graph = GraphClient(lambda: token, verbose=args.verbose,
-                        user_agent=user_agent, batch=evade)
+                        user_agent=user_agent, batch=evade,
+                        proxies=proxies, no_proxy=no_proxy)
     return _run_collection(graph, None, args, identity, claims.get("tid") or "")
 
 
@@ -253,13 +351,19 @@ def run_aadgraph(args) -> int:
     refresh = (args.refresh_token or "").strip()
     access = (args.access_token or "").strip()
     client_id = (args.client_id or "").strip()
+    try:
+        proxies, no_proxy = _load_proxy_config()
+    except RuntimeError as exc:
+        print(f"[proxy] {exc}", file=sys.stderr)
+        return 1
     provider = None
     if refresh:
         if not client_id:
             print("[auth] failed: client id is required when a refresh token "
                   "is provided", file=sys.stderr)
             return 1
-        provider = SavingProvider(refresh, client_id, args.token_out)
+        provider = SavingProvider(refresh, client_id, args.token_out,
+                                  proxies=proxies)
 
     use_autotoken = bool((args.autotoken and provider is not None)
                          or (refresh and not access))
@@ -315,7 +419,8 @@ def run_aadgraph(args) -> int:
 
     client = AadGraphClient(
         token_getter, tenant_id, user_agent=user_agent,
-        evade=args.evade, verbose=args.verbose)
+        evade=args.evade, verbose=args.verbose, proxies=proxies,
+        no_proxy=no_proxy)
     runner = Runner(client, store, verbose=args.verbose)
     info = collect_aadgraph(runner, mfa=args.mfa)
 
@@ -327,13 +432,15 @@ def run_aadgraph(args) -> int:
         else:
             graph = GraphClient(
                 lambda: provider.get_token(GRAPH_RES),
-                verbose=args.verbose, user_agent=user_agent)
+                verbose=args.verbose, user_agent=user_agent,
+                proxies=proxies, no_proxy=no_proxy)
             arm = None
             try:
                 provider.get_token(ARM_RES)
                 arm = ArmClient(
                     lambda: provider.get_token(ARM_RES),
-                    verbose=args.verbose, user_agent=user_agent)
+                    verbose=args.verbose, user_agent=user_agent,
+                    proxies=proxies, no_proxy=no_proxy)
             except AuthError as exc:
                 print(f"[arm] no Azure Resource Manager token ({exc}); "
                       "Azure tables will be skipped")
@@ -385,6 +492,12 @@ def main(argv=None) -> int:
     p.add_argument("--resource-uri", default="",
                    help="arbitrary resource URI or application ID")
     p.set_defaults(func=probe)
+
+    t = sub.add_parser("proxy-test")
+    t.add_argument("--url",
+                   default="https://graph.microsoft.com/v1.0/$metadata")
+    t.add_argument("--timeout", type=float, default=20.0)
+    t.set_defaults(func=proxy_test)
 
     r = sub.add_parser("run")
     r.add_argument("-rt", "--refresh-token", required=True)
