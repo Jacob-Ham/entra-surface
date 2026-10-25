@@ -1,5 +1,4 @@
-# Optional collector-worker dependencies.
-# The report app itself uses only the Python standard library.
-# graphcollect is imported from ENTRA_COLLECTOR_DIR (default: sibling ../collector).
+# Collector-worker dependencies (not needed for the report app).
+# graphcollect is bundled under entra_surface/collector.
 msal>=1.39.0
 requests>=2.34.2

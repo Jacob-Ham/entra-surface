@@ -2,10 +2,10 @@
 """Runs inside the collector virtualenv.
 
 The GUI's ``entra_surface/collect.py`` wrapper is stdlib-only.  This worker
-imports graphcollect from the sibling collector checkout, redeems a broker
-refresh token, and either prints principal claims for a requested resource
-(``probe``) or runs a full collection (``run``).  ``run-access`` collects with a
-Microsoft Graph access token and skips ARM.
+imports graphcollect from the bundled ``entra_surface/collector`` checkout,
+redeems a broker refresh token, and either prints principal claims for a
+requested resource (``probe``) or runs a full collection (``run``).
+``run-access`` collects with a Microsoft Graph access token and skips ARM.
 The newest rotated refresh token is written to --token-out so the parent can
 persist it back into .entra-surface-auth.json.
 """
@@ -21,8 +21,7 @@ from pathlib import Path
 
 COLLECTOR_DIR = Path(os.environ.get(
     "ENTRA_COLLECTOR_DIR",
-    Path(__file__).resolve().parent.parent.parent
-    / "collector")).expanduser().resolve()
+    Path(__file__).resolve().parent / "collector")).expanduser().resolve()
 sys.path.insert(0, str(COLLECTOR_DIR))
 
 from graphcollect.auth import (  # noqa: E402

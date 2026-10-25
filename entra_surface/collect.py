@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Collection backend and Collect/Tokens tab UI for entra-surface.
 
-The actual Graph collector lives in the sibling ``collector`` checkout.  This
+The actual Graph collector is bundled under ``entra_surface/collector``.  This
 module schedules its worker, streams output, persists redeemed refresh tokens
 in ``.entra-surface-auth.json``, and exposes the status to the report server.
 
@@ -10,7 +10,7 @@ CLI usage (auth arguments are both required):
     python3 -m entra_surface.collect -rt <refresh-token> -c <client-id> \
         -o data/databases/collected.db
 
-Set ENTRA_COLLECTOR_DIR to point at a different collector checkout.
+Set ENTRA_COLLECTOR_DIR to override with an external collector checkout.
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from . import token_resources
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 BASE_DIR = PACKAGE_DIR.parent
-DEFAULT_COLLECTOR_DIR = BASE_DIR.parent / "collector"
+DEFAULT_COLLECTOR_DIR = PACKAGE_DIR / "collector"
 DEFAULT_DATA_DIR = BASE_DIR / "data" / "databases"
 DEFAULT_OUTPUT = DEFAULT_DATA_DIR / "collected.db"
 WORKER = PACKAGE_DIR / "collect_worker.py"
@@ -271,8 +271,12 @@ def _mark_token_used(token_id: str, output: str, mode: str) -> None:
 # collector worker integration
 
 def _collector_python() -> str:
-    venv_python = collector_dir() / ".venv" / "bin" / "python"
-    return str(venv_python) if venv_python.is_file() else sys.executable
+    for candidate in (
+            collector_dir() / ".venv" / "bin" / "python",
+            BASE_DIR / ".venv" / "bin" / "python"):
+        if candidate.is_file():
+            return str(candidate)
+    return sys.executable
 
 
 def _worker_command(mode: str, refresh_token: str, client_id: str,
@@ -280,7 +284,10 @@ def _worker_command(mode: str, refresh_token: str, client_id: str,
                     user_agent: str = "", access_out: str = "") -> list[str]:
     directory = collector_dir()
     if not (directory / "graphcollect").is_dir():
-        raise RuntimeError(f"collector backend not found: {directory}")
+        raise RuntimeError(
+            f"collector backend not found: {directory} "
+            "(expected graphcollect/; set ENTRA_COLLECTOR_DIR for an "
+            "external checkout)")
     if not WORKER.is_file():
         raise RuntimeError(f"collector worker not found: {WORKER}")
     if mode == "run-access":
@@ -2795,7 +2802,7 @@ def main(argv=None) -> int:
     ap.add_argument("-ua", "--user-agent", default="",
                     help="custom User-Agent for Graph/ARM requests")
     ap.add_argument("--collector-dir", default=None,
-                    help="collector checkout (default: ../collector)")
+                    help="collector checkout (default: bundled entra_surface/collector)")
     args = ap.parse_args(argv)
 
     if args.collector_dir:
