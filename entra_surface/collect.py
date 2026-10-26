@@ -130,10 +130,39 @@ def _save_store() -> None:
         raise RuntimeError(f"could not write auth file: {exc}")
 
 
+def _amr_values(raw) -> list[str]:
+    """Normalize an ``amr`` claim to a deduplicated list of strings."""
+    if isinstance(raw, str):
+        raw = raw.replace(",", " ").split()
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    values = []
+    seen = set()
+    for item in raw:
+        value = str(item or "").strip()
+        key = value.lower()
+        if value and key not in seen:
+            values.append(value)
+            seen.add(key)
+    return values
+
+
 def _token_summary(rec: dict, active_id: str) -> dict:
     principal = dict(rec.get("principal") or {})
     if principal.get("audience"):
         principal["audience"] = str(principal["audience"]).rstrip("/")
+    amr = []
+    decoded = False
+    if rec.get("access_token"):
+        try:
+            claims = _decode_access_claims(rec["access_token"])
+            decoded = True
+        except ValueError:
+            claims = {}
+        amr = _amr_values(claims.get("amr"))
+    if not decoded:
+        amr = _amr_values(principal.get("amr"))
+    principal["amr"] = amr
     return {
         "id": rec.get("id") or "",
         "client_id": rec.get("client_id") or "",
@@ -149,6 +178,7 @@ def _token_summary(rec: dict, active_id: str) -> dict:
         "active": bool(rec.get("id") and rec.get("id") == active_id),
         "has_refresh_token": bool(rec.get("refresh_token")),
         "has_access_token": bool(rec.get("access_token")),
+        "amr": amr,
         "principal": principal,
     }
 
@@ -538,6 +568,8 @@ def _store_access_token(store: dict, access_token: str, principal: dict,
     else:
         merged = dict(match.get("principal") or {})
         merged.update({k: v for k, v in principal.items() if v})
+        if "amr" in principal:
+            merged["amr"] = _amr_values(principal.get("amr"))
         match["principal"] = merged
         if not match.get("client_id"):
             match["client_id"] = client_id or principal.get("client_id") or ""
@@ -586,6 +618,7 @@ def _principal_from_claims(claims: dict) -> dict:
         "audience": str(audience),
         "scopes": (claims.get("scp") or "").split(),
         "roles": claims.get("roles") or [],
+        "amr": _amr_values(claims.get("amr")),
         "access_expires_at": expires_at,
         "identity": identity,
     }
@@ -646,6 +679,8 @@ def set_access_token(access_token: str) -> dict:
         else:
             merged = dict(match.get("principal") or {})
             merged.update({k: v for k, v in principal.items() if v})
+            if "amr" in principal:
+                merged["amr"] = _amr_values(principal.get("amr"))
             match["principal"] = merged
             if not match.get("client_id"):
                 match["client_id"] = principal.get("client_id") or ""
@@ -840,6 +875,11 @@ def redeem_saved_token(token_id: str, target: str = "graph",
             principal.get("access_expires_at") or "")
         access_principal["scopes"] = principal.get("scopes") or []
         access_principal["roles"] = principal.get("roles") or []
+        try:
+            access_principal["amr"] = _amr_values(
+                _decode_access_claims(access_token).get("amr"))
+        except ValueError:
+            access_principal.pop("amr", None)
         _store_access_token(store, access_token, access_principal, now,
                             client_id=target_client,
                             exclude_id=refresh_parent_id,
@@ -1197,6 +1237,26 @@ def styles_html() -> str:
     color: var(--accent);
     border-color: color-mix(in srgb, var(--accent) 45%, transparent);
     letter-spacing: 0.04em;
+  }
+  .token-amr-group {
+    display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  }
+  .token-amr {
+    font-size: 10px; font-weight: 600; white-space: nowrap;
+    padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border);
+    color: var(--text-muted);
+  }
+  .token-amr.strong {
+    color: var(--status-good);
+    border-color: color-mix(in srgb, var(--status-good) 40%, transparent);
+  }
+  .token-amr.pwd {
+    color: var(--status-medium);
+    border-color: color-mix(in srgb, var(--status-medium) 40%, transparent);
+  }
+  .token-amr.other {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
   }
   .principal-count { color: var(--text-muted); font-size: 11.5px; white-space: nowrap; }
   .principal-chevron { color: var(--text-muted); font-size: 15px; transition: transform 0.15s; }
@@ -2044,6 +2104,51 @@ def tokens_view_html() -> str:
     return healthFromExpiry((t.principal || {}).access_expires_at || '');
   }
 
+  function amrLabel(value) {
+    var key = String(value || '').toLowerCase();
+    var labels = {
+      pwd: 'PWD',
+      mfa: 'MFA',
+      rsa: 'RSA',
+      otp: 'OTP',
+      wia: 'WIA',
+      ngcmfa: 'NGC MFA',
+      smfa: 'SMFA',
+      fido: 'FIDO',
+      pop: 'POP',
+      sso: 'SSO',
+      hwk: 'HWK',
+      swk: 'SWK',
+      pwdless: 'PASSWORDLESS',
+      wiaormfa: 'WIA/MFA',
+      x509: 'X509',
+      dpop: 'DPOP'
+    };
+    return labels[key] || String(value || '').toUpperCase();
+  }
+
+  function amrClass(value) {
+    var key = String(value || '').toLowerCase();
+    if (key === 'mfa' || key === 'ngcmfa' || key === 'smfa'
+        || key === 'fido' || key === 'pwdless' || key === 'wiaormfa') {
+      return 'strong';
+    }
+    return key === 'pwd' ? 'pwd' : 'other';
+  }
+
+  function amrTagsHtml(t) {
+    if (!t.has_access_token) return '';
+    var values = Array.isArray(t.amr) ? t.amr : [];
+    if (!values.length) return '';
+    return '<span class="token-amr-group" title="AMR: '
+      + esc(values.join(', ')) + '">'
+      + values.map(function(value) {
+          return '<span class="token-amr ' + amrClass(value) + '">'
+            + esc(amrLabel(value)) + '</span>';
+        }).join('')
+      + '</span>';
+  }
+
   function tokenType(t) {
     if (t.has_refresh_token && t.has_access_token) return 'both';
     return t.has_refresh_token ? 'refresh' : 'access';
@@ -2066,6 +2171,7 @@ def tokens_view_html() -> str:
     var text = [p.name, p.upn, p.identity, t.client_id, t.client_name,
                 p.audience, t.audience_name,
                 (t.client_foci && t.has_refresh_token) ? 'foci' : '',
+                (Array.isArray(t.amr) ? t.amr : []).join(' '),
                 tokenHealth(t).label].join(' ').toLowerCase();
     return text.indexOf(query) >= 0;
   }
@@ -2493,6 +2599,7 @@ def tokens_view_html() -> str:
     var fociHtml = t.client_foci && t.has_refresh_token
       ? '<span class="token-type foci" title="Member of a Family of Client IDs (FOCI)">FOCI</span>'
       : '';
+    var amrHtml = amrTagsHtml(t);
     var headHtml = nestedAccess
       ? '<span class="token-row-client"' + audienceTitle + '>'
         + '<span class="token-row-label">Audience:</span> '
@@ -2519,6 +2626,7 @@ def tokens_view_html() -> str:
       + headHtml
       + '<span class="token-type ' + typeClass + '">' + typeLabel + '</span>'
       + fociHtml
+      + amrHtml
       + healthHtml + '</div>'
       + (nestedAccess ? ''
         : '<div class="token-row-meta"' + audienceTitle + '>'
