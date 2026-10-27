@@ -67,6 +67,7 @@ _JOB = {
     "finished_at": "",
     "returncode": None,
     "error": "",
+    "stop_requested": False,
 }
 _STORE = None
 
@@ -962,6 +963,7 @@ def get_status() -> dict:
             "finished_at": _JOB["finished_at"],
             "returncode": _JOB["returncode"],
             "error": _JOB["error"],
+            "stop_requested": bool(_JOB.get("stop_requested")),
             "backend": str(collector_dir()),
         }
 
@@ -1022,6 +1024,7 @@ def start_collection(refresh_token: str = "", out: str = "",
             "finished_at": "",
             "returncode": None,
             "error": "",
+            "stop_requested": False,
         })
 
     _mark_token_used(creds["token_id"], out_path,
@@ -1031,6 +1034,40 @@ def start_collection(refresh_token: str = "", out: str = "",
                                     creds["token_id"]),
                               daemon=True)
     thread.start()
+    return get_status()
+
+
+def _kill_process(proc) -> None:
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def stop_collection() -> dict:
+    """Ask the running collector to stop; returns the current job state."""
+    already = False
+    with _LOCK:
+        if _JOB["status"] != "running":
+            raise ValueError("no collection is running")
+        if _JOB.get("stop_requested"):
+            already = True
+            proc = None
+        else:
+            _JOB["stop_requested"] = True
+            _JOB["log"].append("Stopping collector...")
+            proc = _PROCESS
+    if already:
+        return get_status()
+    if proc is not None:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        timer = threading.Timer(5.0, _kill_process, args=(proc,))
+        timer.daemon = True
+        timer.start()
     return get_status()
 
 
@@ -1045,16 +1082,29 @@ def _run_job(cmd: list[str], token_out: Path | None,
             text=True, bufsize=1)
         with _LOCK:
             _PROCESS = proc
+            stop_now = bool(_JOB.get("stop_requested"))
+        if stop_now:
+            proc.terminate()
+            timer = threading.Timer(5.0, _kill_process, args=(proc,))
+            timer.daemon = True
+            timer.start()
         assert proc.stdout is not None
         for line in proc.stdout:
             _append_log(line)
         returncode = proc.wait()
         with _LOCK:
+            stopped = bool(_JOB.get("stop_requested"))
             _JOB["returncode"] = returncode
-            _JOB["status"] = "done" if returncode == 0 else "error"
-            _JOB["finished_at"] = _timestamp()
-            if returncode != 0:
+            if stopped:
+                _JOB["status"] = "stopped"
+                _JOB["error"] = ""
+                _JOB["log"].append("Collection stopped.")
+            elif returncode == 0:
+                _JOB["status"] = "done"
+            else:
+                _JOB["status"] = "error"
                 _JOB["error"] = f"collector exited with status {returncode}"
+            _JOB["finished_at"] = _timestamp()
     except Exception as exc:  # surfaced in the Collect tab
         with _LOCK:
             _JOB["status"] = "error"
@@ -1152,6 +1202,13 @@ def styles_html() -> str:
   .collect-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .collect-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .collect-actions .muted { flex: 1; min-width: 220px; }
+  .collect-actions .stop-btn {
+    color: var(--status-critical);
+    border-color: color-mix(in srgb, var(--status-critical) 45%, var(--border));
+  }
+  .collect-actions .stop-btn:disabled {
+    color: var(--text-muted); border-color: var(--border);
+  }
   .collect-status {
     margin-top: 18px; background: var(--surface-1);
     border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px;
@@ -1507,6 +1564,7 @@ def view_html() -> str:
       </div>
       <div class="collect-actions">
         <button type="button" class="mode-btn" id="collect-start">Start collection</button>
+        <button type="button" class="mode-btn stop-btn" id="collect-stop" disabled>Stop collection</button>
         <button type="button" class="mode-btn" id="collect-go-analysis">Go to analysis</button>
         <span class="muted" id="collect-note"></span>
       </div>
@@ -1547,6 +1605,7 @@ def view_html() -> str:
       </label>
       <div class="collect-actions">
         <button type="button" class="mode-btn" id="collect-aad-start">Start collection</button>
+        <button type="button" class="mode-btn stop-btn" id="collect-aad-stop" disabled>Stop collection</button>
         <button type="button" class="mode-btn" id="collect-aad-go-analysis">Go to analysis</button>
         <span class="muted" id="collect-aad-note"></span>
       </div>
@@ -1567,10 +1626,12 @@ def view_html() -> str:
   var uaEl = document.getElementById('collect-ua');
   var graphEvadeEl = document.getElementById('collect-evade');
   var startBtn = document.getElementById('collect-start');
+  var stopBtn = document.getElementById('collect-stop');
   var noteEl = document.getElementById('collect-note');
   var aadOutEl = document.getElementById('collect-aad-out');
   var aadUaEl = document.getElementById('collect-aad-ua');
   var aadStartBtn = document.getElementById('collect-aad-start');
+  var aadStopBtn = document.getElementById('collect-aad-stop');
   var aadNoteEl = document.getElementById('collect-aad-note');
   var aadAutoEl = document.getElementById('collect-aad-autotoken');
   var aadEvadeEl = document.getElementById('collect-aad-evade');
@@ -1656,10 +1717,12 @@ def view_html() -> str:
     lastStatus = data.status;
     startBtn.disabled = running;
     aadStartBtn.disabled = running;
+    if (stopBtn) stopBtn.disabled = !running || !!data.stop_requested;
+    if (aadStopBtn) aadStopBtn.disabled = !running || !!data.stop_requested;
     statusEl.classList.toggle('hidden', data.status === 'idle' && !(data.log || []).length);
     stateEl.textContent = {
       idle: 'Idle', running: 'Collecting...', done: 'Collection complete',
-      error: 'Collection failed'
+      stopped: 'Collection stopped', error: 'Collection failed'
     }[data.status] || data.status;
     kindEl.textContent = data.status === 'idle' ? '' : kindLabel(kind);
     outputEl.textContent = data.output ? data.output : '';
@@ -1667,6 +1730,9 @@ def view_html() -> str:
     logEl.scrollTop = logEl.scrollHeight;
     if (data.status === 'done') {
       setKindNote(kind, 'Done. Use Go to analysis to load it.');
+      if (kind === 'aadgraph') idleNote(); else aadIdleNote();
+    } else if (data.status === 'stopped') {
+      setKindNote(kind, 'Stopped. The output database may be incomplete.');
       if (kind === 'aadgraph') idleNote(); else aadIdleNote();
     } else if (data.status === 'error') {
       setKindNote(kind, data.error || 'Collection failed.');
@@ -1751,7 +1817,8 @@ def view_html() -> str:
           if (data.status === 'running') {
             render(data);
             poll();
-          } else if (data.status === 'done' || data.status === 'error') {
+          } else if (data.status === 'done' || data.status === 'error'
+                     || data.status === 'stopped') {
             render(data);
           } else {
             btn.disabled = false;
@@ -1793,8 +1860,35 @@ def view_html() -> str:
     });
   }
 
+  function stopBackend(btn, noteFn) {
+    if (!confirm('Stop the running collection?')) return;
+    btn.disabled = true;
+    noteFn('Stopping collector...');
+    fetch('/api/collect/stop', { method: 'POST' })
+      .then(function(r) {
+        return r.json().then(function(data) {
+          if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+          return data;
+        });
+      })
+      .then(function(data) {
+        render(data);
+        poll();
+      })
+      .catch(function(err) {
+        noteFn(err.message || 'Could not stop collection.');
+        poll();
+      });
+  }
+
   if (goAnalysisBtn) goAnalysisBtn.addEventListener('click', goToAnalysis);
   if (aadGoAnalysisBtn) aadGoAnalysisBtn.addEventListener('click', goToAnalysis);
+  if (stopBtn) stopBtn.addEventListener('click', function() {
+    stopBackend(stopBtn, setGraphNote);
+  });
+  if (aadStopBtn) aadStopBtn.addEventListener('click', function() {
+    stopBackend(aadStopBtn, setAadNote);
+  });
 
   startBtn.addEventListener('click', function() {
     if (!graphConfigured) {

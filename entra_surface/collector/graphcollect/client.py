@@ -16,6 +16,8 @@ from urllib.parse import urljoin
 import requests
 from requests.utils import should_bypass_proxies
 
+from .tls import InsecureTLSAdapter
+
 GRAPH_BASE = "https://graph.microsoft.com"
 GRAPH_BATCH_LIMIT = 20
 GRAPH_BATCH_WORKERS = 2
@@ -29,6 +31,13 @@ class Degraded(Exception):
         self.url = url
         self.body = body
         super().__init__(f"{status} {url} {body[:200]}")
+
+
+def log_throttle(source: str, pause: float, detail: str = "") -> None:
+    """Emit a visible collector-log callout when a 429 backoff starts."""
+    suffix = f" ({detail})" if detail else ""
+    print(f"[{source}] throttled: waiting {pause:g}s after 429{suffix}",
+          flush=True)
 
 
 class BatchPagedResult:
@@ -46,7 +55,8 @@ class GraphClient:
                  user_agent: Optional[str] = None, batch: bool = False,
                  batch_size: int = GRAPH_BATCH_LIMIT,
                  proxies: Optional[dict] = None,
-                 no_proxy: str = ""):
+                 no_proxy: str = "",
+                 verify: bool = True):
         self._token_getter = token_getter
         self.verbose = verbose
         self.user_agent = user_agent
@@ -55,6 +65,7 @@ class GraphClient:
                                      GRAPH_BATCH_LIMIT))
         self.proxies = proxies or None
         self.no_proxy = (no_proxy or "").strip()
+        self.verify = bool(verify)
         self._local = threading.local()
         self._count_lock = threading.Lock()
         self.requests_made = 0
@@ -65,9 +76,13 @@ class GraphClient:
         s = getattr(self._local, "session", None)
         if s is None:
             s = requests.Session()
-            adapter = requests.adapters.HTTPAdapter(
+            adapter_cls = (requests.adapters.HTTPAdapter if self.verify
+                           else InsecureTLSAdapter)
+            adapter = adapter_cls(
                 pool_connections=16, pool_maxsize=32, max_retries=0)
             s.mount("https://", adapter)
+            if not self.verify:
+                s.mount("http://", adapter)
             if self.proxies:
                 s.trust_env = False
             self._local.session = s
@@ -102,7 +117,7 @@ class GraphClient:
             try:
                 r = self._session().request(
                     method, url, headers=self._headers(), timeout=timeout,
-                    proxies=self._proxy_for(url))
+                    proxies=self._proxy_for(url), verify=self.verify)
             except requests.RequestException:
                 if attempt == retries - 1:
                     raise
@@ -113,8 +128,11 @@ class GraphClient:
             if r.status_code == 429:
                 with self._count_lock:
                     self.throttled += 1
+                    total = self.throttled
                 wait = self._retry_after(r.headers)
-                time.sleep(min(wait, 60) + 1)
+                pause = min(wait, 60) + 1
+                log_throttle("graph", pause, f"total {total}")
+                time.sleep(pause)
                 continue
             if r.status_code in (500, 502, 503, 504) and attempt < retries - 1:
                 time.sleep(1 + attempt)
@@ -169,7 +187,7 @@ class GraphClient:
             try:
                 response = self._session().post(
                     url, json=payload, headers=headers, timeout=120,
-                    proxies=self._proxy_for(url))
+                    proxies=self._proxy_for(url), verify=self.verify)
             except requests.RequestException:
                 if attempt == 4:
                     raise Degraded(0, url, "batch request failed")
@@ -181,8 +199,11 @@ class GraphClient:
             if response.status_code == 429:
                 with self._count_lock:
                     self.throttled += 1
+                    total = self.throttled
                 wait = self._retry_after(response.headers)
-                time.sleep(min(wait, 60) + 1)
+                pause = min(wait, 60) + 1
+                log_throttle("graph", pause, f"batch, total {total}")
+                time.sleep(pause)
                 continue
             if response.status_code in (500, 502, 503, 504) and attempt < 4:
                 time.sleep(1 + attempt)
@@ -241,6 +262,8 @@ class GraphClient:
                 break
 
             wait = 0
+            round_throttled = 0
+            total_throttled = self.throttled
             chunks = []
             for api, entries in groups.items():
                 for offset in range(0, len(entries), self.batch_size):
@@ -292,6 +315,8 @@ class GraphClient:
                         elif status == 429:
                             with self._count_lock:
                                 self.throttled += 1
+                                total_throttled = self.throttled
+                            round_throttled += 1
                             retry = self._retry_after(headers)
                             wait = max(wait, min(retry, 60))
                             state["attempts"] += 1
@@ -315,6 +340,11 @@ class GraphClient:
                             result.error = f"{status} {entry['url']}"
                             result.body = str(body)[:500] if body else ""
             if wait:
+                if round_throttled:
+                    noun = "subrequest" if round_throttled == 1 else "subrequests"
+                    log_throttle(
+                        "graph", wait + 1,
+                        f"{round_throttled} {noun}, total {total_throttled}")
                 time.sleep(wait + 1)
             pending = {key: state for key, state in pending.items()
                        if state["urls"]}
@@ -326,23 +356,30 @@ class ArmClient:
     def __init__(self, token_getter: Callable[[], str], verbose: int = 0,
                  user_agent: Optional[str] = None,
                  proxies: Optional[dict] = None,
-                 no_proxy: str = ""):
+                 no_proxy: str = "",
+                 verify: bool = True):
         self._token_getter = token_getter
         self.verbose = verbose
         self.user_agent = user_agent
         self.proxies = proxies or None
         self.no_proxy = (no_proxy or "").strip()
+        self.verify = bool(verify)
         self._local = threading.local()
         self._count_lock = threading.Lock()
         self.requests_made = 0
+        self.throttled = 0
 
     def _session(self) -> requests.Session:
         s = getattr(self._local, "session", None)
         if s is None:
             s = requests.Session()
-            adapter = requests.adapters.HTTPAdapter(
+            adapter_cls = (requests.adapters.HTTPAdapter if self.verify
+                           else InsecureTLSAdapter)
+            adapter = adapter_cls(
                 pool_connections=8, pool_maxsize=16, max_retries=0)
             s.mount("https://", adapter)
+            if not self.verify:
+                s.mount("http://", adapter)
             if self.proxies:
                 s.trust_env = False
             self._local.session = s
@@ -363,7 +400,7 @@ class ArmClient:
             try:
                 r = self._session().get(
                     url, headers=headers, timeout=90,
-                    proxies=self._proxy_for(url))
+                    proxies=self._proxy_for(url), verify=self.verify)
             except requests.RequestException:
                 if attempt == retries - 1:
                     raise
@@ -372,8 +409,13 @@ class ArmClient:
             with self._count_lock:
                 self.requests_made += 1
             if r.status_code == 429:
+                with self._count_lock:
+                    self.throttled += 1
+                    total = self.throttled
                 wait = int(r.headers.get("Retry-After", "5") or 5)
-                time.sleep(min(wait, 60) + 1)
+                pause = min(wait, 60) + 1
+                log_throttle("arm", pause, f"total {total}")
+                time.sleep(pause)
                 continue
             if r.status_code in (500, 502, 503, 504) and attempt < retries - 1:
                 time.sleep(1 + attempt)

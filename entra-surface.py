@@ -8063,9 +8063,10 @@ def render_report(results, tenant_name, db_path, config_path,
                      spellcheck="false" placeholder="localhost,127.0.0.1">
             </label>
           </div>
-          <p class="settings-note">SOCKS support requires PySocks in the
-            collector virtualenv. Proxy credentials are stored in
-            <span class="mono">.entra-surface-settings.json</span>.</p>
+          <label class="settings-check">
+            <input type="checkbox" id="settings-proxy-insecure">
+            <span>Accept any TLS certificate through the proxy (self-signed/untrusted)</span>
+          </label>
           <div class="settings-actions">
             <button type="button" class="mode-btn" id="settings-test">Test proxy</button>
           </div>
@@ -8159,6 +8160,7 @@ def render_report(results, tenant_name, db_path, config_path,
   var proxyUser = document.getElementById('settings-proxy-user');
   var proxyPass = document.getElementById('settings-proxy-pass');
   var proxyNoProxy = document.getElementById('settings-proxy-no-proxy');
+  var proxyInsecure = document.getElementById('settings-proxy-insecure');
   var proxyStatus = document.getElementById('settings-proxy-status');
   var tabs = Array.prototype.slice.call(
     document.querySelectorAll('#settings-overlay button[data-settings-tab]'));
@@ -8178,6 +8180,7 @@ def render_report(results, tenant_name, db_path, config_path,
     if (proxyUser) proxyUser.value = proxy.username || '';
     if (proxyPass) proxyPass.value = proxy.password || '';
     if (proxyNoProxy) proxyNoProxy.value = proxy.no_proxy || '';
+    if (proxyInsecure) proxyInsecure.checked = !!proxy.insecure_tls;
   }}
 
   function proxyPayload() {{
@@ -8186,7 +8189,8 @@ def render_report(results, tenant_name, db_path, config_path,
       url: proxyUrl ? proxyUrl.value.trim() : '',
       username: proxyUser ? proxyUser.value.trim() : '',
       password: proxyPass ? proxyPass.value : '',
-      no_proxy: proxyNoProxy ? proxyNoProxy.value.trim() : ''
+      no_proxy: proxyNoProxy ? proxyNoProxy.value.trim() : '',
+      insecure_tls: !!(proxyInsecure && proxyInsecure.checked)
     }};
   }}
 
@@ -8264,6 +8268,7 @@ def render_report(results, tenant_name, db_path, config_path,
       var bits = ['Proxy connection OK'];
       if (data.status) bits.push('HTTP ' + data.status);
       if (typeof data.elapsed_ms === 'number') bits.push(data.elapsed_ms + ' ms');
+      if (data.tls_verify === false) bits.push('TLS verification off');
       setProxyStatus(bits.join(' \u00b7 ') + '.', false);
     }}).catch(function(err) {{
       setProxyStatus(err.message || 'Could not reach the proxy.', true);
@@ -13068,6 +13073,20 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                 self._send(json.dumps(state).encode("utf-8"),
                            "application/json; charset=utf-8",
                            headers={"Cache-Control": "no-store"})
+                return
+            if parsed.path == "/api/collect/stop":
+                try:
+                    state = collect_backend.stop_collection()
+                except ValueError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 400)
+                    return
+                except RuntimeError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 500)
+                    return
+                self._send(json.dumps(state).encode("utf-8"),
+                           "application/json; charset=utf-8")
                 return
             if parsed.path == "/api/collect":
                 payload = {}

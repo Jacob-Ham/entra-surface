@@ -16,6 +16,8 @@ import time
 
 import msal
 
+from .tls import InsecureTLSAdapter
+
 GRAPH_RES = "https://graph.microsoft.com"
 ARM_RES = "https://management.azure.com"
 BROKER_CLIENT_ID = "29d9ed98-a469-4536-ade2-f981bc1d605e"
@@ -33,13 +35,23 @@ def _decode_jwt(token: str) -> dict:
 
 class TokenProvider:
     def __init__(self, refresh_token: str, client_id: str | None = None,
-                 proxies: dict | None = None):
+                 proxies: dict | None = None, verify: bool = True):
         self._rt = refresh_token
         self._client_id = client_id or BROKER_CLIENT_ID
         app_kwargs = {"authority": "https://login.microsoftonline.com/common"}
         if proxies:
             app_kwargs["proxies"] = proxies
+        if not verify:
+            app_kwargs["verify"] = False
         self._app = msal.PublicClientApplication(self._client_id, **app_kwargs)
+        if not verify and proxies:
+            try:
+                adapter = InsecureTLSAdapter(
+                    pool_connections=4, pool_maxsize=8, max_retries=0)
+                self._app.http_client.mount("https://", adapter)
+                self._app.http_client.mount("http://", adapter)
+            except (AttributeError, TypeError):
+                pass
         self._tokens: dict[str, tuple[str, float]] = {}
         self._claims: dict | None = None
         self._lock = threading.Lock()

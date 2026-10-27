@@ -23,7 +23,14 @@ DEFAULT_PROXY = {
     "username": "",
     "password": "",
     "no_proxy": "",
+    "insecure_tls": False,
 }
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def _proxy_from(data) -> dict:
@@ -32,7 +39,8 @@ def _proxy_from(data) -> dict:
         for key in DEFAULT_PROXY:
             if key in data and data[key] is not None:
                 proxy[key] = data[key]
-    proxy["enabled"] = bool(proxy["enabled"])
+    proxy["enabled"] = _as_bool(proxy["enabled"])
+    proxy["insecure_tls"] = _as_bool(proxy["insecure_tls"])
     for key in ("url", "username", "password", "no_proxy"):
         proxy[key] = str(proxy.get(key) or "")
     return proxy

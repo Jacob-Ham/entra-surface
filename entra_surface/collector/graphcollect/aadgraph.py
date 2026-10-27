@@ -20,8 +20,9 @@ from urllib.parse import urlsplit
 import requests
 from requests.utils import should_bypass_proxies
 
-from .client import Degraded
+from .client import Degraded, log_throttle
 from .collectors import Runner
+from .tls import InsecureTLSAdapter
 
 AAD_GRAPH_BASE = "https://graph.windows.net"
 AAD_GRAPH_RES = "https://graph.windows.net"
@@ -56,7 +57,8 @@ class AadGraphClient:
 
     def __init__(self, token_getter, tenant_id: str, user_agent: str = "",
                  evade: bool = False, verbose: int = 0,
-                 proxies: dict | None = None, no_proxy: str = ""):
+                 proxies: dict | None = None, no_proxy: str = "",
+                 verify: bool = True):
         self._token_getter = token_getter
         self.tenant_id = (tenant_id or "myorganization").strip() or "myorganization"
         self.user_agent = (user_agent or "").strip()
@@ -64,6 +66,7 @@ class AadGraphClient:
         self.verbose = int(verbose)
         self.proxies = proxies or None
         self.no_proxy = (no_proxy or "").strip()
+        self.verify = bool(verify)
         self._local = threading.local()
         self._count_lock = threading.Lock()
         self.requests_made = 0
@@ -74,9 +77,13 @@ class AadGraphClient:
         session = getattr(self._local, "session", None)
         if session is None:
             session = requests.Session()
-            adapter = requests.adapters.HTTPAdapter(
+            adapter_cls = (requests.adapters.HTTPAdapter if self.verify
+                           else InsecureTLSAdapter)
+            adapter = adapter_cls(
                 pool_connections=16, pool_maxsize=32, max_retries=0)
             session.mount("https://", adapter)
+            if not self.verify:
+                session.mount("http://", adapter)
             if self.proxies:
                 session.trust_env = False
             self._local.session = session
@@ -131,7 +138,7 @@ class AadGraphClient:
             try:
                 response = self._session().get(
                     url, headers=self._headers(), timeout=90,
-                    proxies=self._proxy_for(url))
+                    proxies=self._proxy_for(url), verify=self.verify)
             except requests.RequestException:
                 if attempt == retries - 1:
                     raise Degraded(0, url, "request failed")
@@ -142,8 +149,11 @@ class AadGraphClient:
             if response.status_code == 429:
                 with self._count_lock:
                     self.throttled += 1
+                    total = self.throttled
                 wait = int(response.headers.get("Retry-After", "5") or 5)
-                time.sleep(min(wait, 60) + 1)
+                pause = min(wait, 60) + 1
+                log_throttle("aadgraph", pause, f"total {total}")
+                time.sleep(pause)
                 continue
             if response.status_code in (500, 502, 503, 504) and attempt < retries - 1:
                 time.sleep(1 + attempt)
@@ -173,7 +183,7 @@ class AadGraphClient:
                 response = self._session().post(
                     batch_url, data=body.encode("utf-8"),
                     headers=headers, timeout=90,
-                    proxies=self._proxy_for(batch_url))
+                    proxies=self._proxy_for(batch_url), verify=self.verify)
             except requests.RequestException:
                 if attempt == retries - 1:
                     raise Degraded(0, url, "batch request failed")
@@ -184,8 +194,11 @@ class AadGraphClient:
             if response.status_code == 429:
                 with self._count_lock:
                     self.throttled += 1
+                    total = self.throttled
                 wait = int(response.headers.get("Retry-After", "5") or 5)
-                time.sleep(min(wait, 60) + 1)
+                pause = min(wait, 60) + 1
+                log_throttle("aadgraph", pause, f"batch, total {total}")
+                time.sleep(pause)
                 continue
             if response.status_code in (500, 502, 503, 504) and attempt < retries - 1:
                 time.sleep(1 + attempt)
