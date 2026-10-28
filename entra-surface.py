@@ -7251,27 +7251,15 @@ def render_report(results, tenant_name, db_path, config_path,
         sid_title = ts.get("sid_prefix", "").rstrip("-") + "-x" if ts.get("sid_prefix") else ""
         bar.append(item("Realm", f'<span class="mono">{esc(ts["realm"])}</span>', sid_title))
     if ts.get("engine"):
-        bar.append(item("Sync", f'<span class="mono">{esc(ts["engine"])}</span>'))
+        engine = str(ts["engine"]).split(" · ", 1)[0]
+        if engine == "Microsoft Entra Connect (on-prem)":
+            engine = "Entra Connect"
+        bar.append(item("Sync", f'<span class="mono">{esc(engine)}</span>'))
     if ts.get("writeback") is True:
         bar.append('<span class="sum-item tag"><span class="sum-label">Writeback</span><span class="tag-chip tag-privileged">ON</span></span>')
     if ts.get("auth_mode"):
         bar.append(item("Auth", f'<span class="tag-chip tag-divergence">{esc(ts["auth_mode"])}</span>',
                         "Authentication mode (PHS / PTA / federated), see the sync summary"))
-    if ts.get("pim"):
-        pim = ts["pim"]
-        pim_labels = {"aadroles": "AAD roles", "aadgroups": "groups",
-                      "azureResources": "Azure resources"}
-        providers = [p for p in ("aadroles", "aadgroups", "azureResources")
-                     if p in (pim.get("providers") or [])]
-        if providers:
-            pim_title = "PIM registered for " + ", ".join(pim_labels[p] for p in providers)
-            if not pim.get("governance"):
-                pim_title += " — assignment schedules not collected (run roadrecon pimgather)"
-            bar.append(item("PIM", f'<span class="mono">{esc(" \u00b7 ".join(pim_labels[p] for p in providers))}</span>',
-                            pim_title))
-        elif not pim.get("governance"):
-            bar.append(item("PIM", "<b>not observed</b>",
-                            "No privileged-access providers registered (PIM may not be licensed/enabled)"))
     if "users" in ts:
         synced_note = f'<span class="muted">({ts.get("synced", "?")} synced)</span>' if "synced" in ts else ""
         bar.append(item("Users", f'{ts.get("users", 0)} {synced_note}'))
@@ -7287,20 +7275,6 @@ def render_report(results, tenant_name, db_path, config_path,
         arc_principals = next((r for r in results if r["id"] == "azure_arc_sps"), None)
         arc_note = f'{len(arc_machines["findings"])} machines, {len(arc_principals["findings"]) if arc_principals else 0} Arc principals'
         bar.append(item("Arc", f"<b>{len(arc_machines['findings'])}</b>", arc_note))
-    # ---- cache / diff chips ------------------------------------------------
-    if cache_meta:
-        at = cache_meta.get("generated_at") or ""
-        if cache_meta.get("off"):
-            bar.append(item("Cache", "<b>off</b>", "caching disabled (--no-cache)"))
-        elif cache_meta.get("hit"):
-            bar.append(item("Cache", "<b>hit</b>", f"last analyzed {at}"))
-        else:
-            label = "created" if cache_meta.get("fresh") else "updated"
-            html = f"<b>{label}</b>"
-            title = f"analyzed {at}"
-            if diff_entries:
-                html += f" \u00b7 <b>{len(diff_entries)}</b> changes"
-            bar.append(item("Cache", html, title))
     summary_bar_html = "\n    ".join(bar)
 
     catalog_data = {}
@@ -7409,6 +7383,10 @@ def render_report(results, tenant_name, db_path, config_path,
   .sidebar-title {{
     margin: 0; color: var(--text-muted); font-size: 10px; font-weight: 600;
     letter-spacing: 0.08em; text-transform: uppercase;
+  }}
+  .sidebar-brand {{
+    color: var(--text-primary); font-size: 16px; font-weight: 700;
+    letter-spacing: 0; text-transform: none;
   }}
   .sidebar-head {{
     display: flex; align-items: center; justify-content: space-between;
@@ -7859,6 +7837,12 @@ def render_report(results, tenant_name, db_path, config_path,
     color: var(--text-muted); font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.02em;
   }}
   .minor-table td {{ padding: 6px 10px; border-bottom: 1px solid var(--gridline); overflow-wrap: anywhere; vertical-align: top; }}
+  .user-owned-table th:first-child, .user-owned-table td:first-child {{ width: 140px; white-space: nowrap; }}
+  .user-owned-table th:nth-child(2), .user-owned-table td:nth-child(2) {{ min-width: 220px; }}
+  .user-owned-table th {{ padding: 8px 10px; }}
+  .user-owned-table td {{ padding: 8px 10px; line-height: 1.45; }}
+  .user-owned-table .owned-grant {{ display: block; }}
+  .user-owned-table .owned-grant + .owned-grant {{ margin-top: 2px; }}
   .dtab-sp-link, .app-link {{
     background: none; border: none; padding: 0; margin: 0;
     color: var(--accent); text-decoration: underline; cursor: pointer;
@@ -7890,7 +7874,7 @@ def render_report(results, tenant_name, db_path, config_path,
 {analysis.client_js()}
 <aside class="sidebar" id="sidebar" aria-label="Sidebar" aria-hidden="false">
   <div class="sidebar-head">
-    <h2 class="sidebar-title">Workspace</h2>
+    <h2 class="sidebar-title sidebar-brand">entra-surface</h2>
     <button type="button" class="sidebar-settings-btn" id="sidebar-settings-btn"
             aria-label="Settings" aria-haspopup="dialog" aria-expanded="false"
             aria-controls="settings-overlay" title="Settings">
@@ -7925,7 +7909,7 @@ def render_report(results, tenant_name, db_path, config_path,
   <div class="app-view" data-view="analysis">
   <header>
     <div>
-      <h1>Entra ID Attack Surface</h1>
+      <h1>Analysis</h1>
     </div>
   </header>
 
@@ -8943,7 +8927,7 @@ def render_report(results, tenant_name, db_path, config_path,
     return '<table class="kv-table">' + rows + '</table>';
   }}
 
-  function renderSpAppTabs(prof, rec, container) {{
+  function renderSpAppTabs(prof, rec, container, activeTab) {{
     var isSp = (prof.kind || 'sp') === 'sp';
     var kvRows = [];
     if (rec) {{
@@ -9040,11 +9024,12 @@ def render_report(results, tenant_name, db_path, config_path,
         ['raw', 'Raw', rawPane]
       ];
     }}
+    var initialTab = activeTab || 'overview';
     var tabsHtml = '<div class="drawer-tabs">' + panes.map(function(pt) {{
-      return '<button type="button" class="drawer-tab' + (pt[0] === 'overview' ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pEsc(pt[1]) + '</button>';
+      return '<button type="button" class="drawer-tab' + (pt[0] === initialTab ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pEsc(pt[1]) + '</button>';
     }}).join('') + '</div>';
     var panesHtml = panes.map(function(pt) {{
-      return '<div class="dtab-pane' + (pt[0] === 'overview' ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pt[2] + '</div>';
+      return '<div class="dtab-pane' + (pt[0] === initialTab ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pt[2] + '</div>';
     }}).join('');
 
     var wrap = document.createElement('div');
@@ -9066,16 +9051,27 @@ def render_report(results, tenant_name, db_path, config_path,
       b.addEventListener('click', function() {{
         var spOid = b.getAttribute('data-sp-id');
         var spProf = PROFILES2.sp[spOid];
-        if (!spProf) return;
+        // Keep outer back rows (for example, the user drawer's "Back to user")
+        // so nested navigation does not lose its way home.
+        var outerBacks = Array.prototype.filter.call(
+          container.children, function(el) {{
+            return el.classList && el.classList.contains('drawer-back-row');
+          }});
         container.innerHTML = '';
+        outerBacks.forEach(function(row) {{ container.appendChild(row); }});
         var backRow = document.createElement('div');
         backRow.className = 'drawer-back-row';
         backRow.innerHTML = '<button type="button" class="drawer-tab drawer-back">&larr; Back to ' + pEsc(prof.application || 'application') + '</button>';
         container.appendChild(backRow);
         Array.prototype.forEach.call(backRow.querySelectorAll('.drawer-back'), function(x) {{
           x.addEventListener('click', function() {{
-            container.innerHTML = '';
-            renderSpAppTabs(prof, rec, container);
+            backRow.remove();
+            Array.prototype.forEach.call(
+              Array.prototype.slice.call(container.children),
+              function(el) {{
+                if (outerBacks.indexOf(el) < 0) el.remove();
+              }});
+            renderSpAppTabs(prof, rec, container, 'sps');
           }});
         }});
         if (spProf) {{
@@ -9334,37 +9330,52 @@ def render_report(results, tenant_name, db_path, config_path,
     }}
   }}
 
-  function renderProfileTabs(p, container) {{
+  function renderProfileTabs(p, container, activeTab) {{
     var overview = privilegeAnalysisHtml(p) + '<div class="user-desc"></div>' + openProfileHtml(p);
     var ownedLinks = (p.owned_objects || []).map(function(o) {{
-      var isGroup = o.type === 'Group';
-      var grants = (o.grants && o.grants.length)
-          ? o.grants.map(function(g) {{ return g.permission + ' @ ' + g.resource; }}).join('; ')
+      var grantsHtml = (o.grants && o.grants.length)
+          ? o.grants.map(function(g) {{
+              return '<span class="owned-grant">' + pEsc(g.permission)
+                  + ' @ ' + pEsc(g.resource) + '</span>';
+            }}).join('')
           : '—';
-      var creds = (o.pw || o.key) ? (o.pw + ' password, ' + o.key + ' key credential(s)') : '—';
+      var credParts = [];
+      if (o.pw) credParts.push(o.pw + (o.pw === 1 ? ' password' : ' passwords'));
+      if (o.key) credParts.push(o.key + (o.key === 1 ? ' key' : ' keys'));
+      var creds = credParts.length ? credParts.join(', ') : '—';
       var status = (typeof o.status === 'boolean') ? (o.status ? 'Enabled' : 'Disabled') : '—';
       var kind = o.type === 'Application' ? 'app' : 'sp';
       var nameCell = '<button type="button" class="dtab-sp-link obj-link" data-obj-id="' + o.object_id + '" data-obj-kind="' + (o.type === 'Group' ? 'group' : kind) + '">' + pEsc(o.name) + '</button>';
       return {{
         type: o.type,
         name: nameCell,
-        object_id: o.object_id, app_id: o.app_id || '—',
-        grants: grants, creds: creds, status: status
+        object_id: o.object_id,
+        grants_html: grantsHtml, creds: creds, status: status
       }};
     }});
+    var showAppColumns = ownedLinks.some(function(o) {{ return o.type !== 'Group'; }});
+    var ownedHeaders = [['Type', 'type'], ['Name', 'name']];
+    if (showAppColumns) {{
+      ownedHeaders.push(['Privileged grants', 'grants'],
+                        ['Credentials', 'creds'], ['Status', 'status']);
+    }}
     var ownedHtml = ownedLinks.length
         ? cappedTableHtml(
-            [['Type', 'type'], ['Name', 'name'], ['ObjectId', 'object_id'],
-             ['AppId', 'app_id'], ['Privileged grants', 'grants'],
-             ['Credentials', 'creds'], ['Status', 'status']],
+            ownedHeaders,
             ownedLinks.map(function(r) {{
-              return ['<td>' + pEsc(r.type) + '</td>', '<td>' + r.name + '</td>',
-                      '<td class="mono">' + pEsc(r.object_id) + '</td>',
-                      '<td class="mono">' + pEsc(r.app_id) + '</td>',
-                      '<td>' + pEsc(r.grants) + '</td>',
-                      '<td>' + pEsc(r.creds) + '</td>',
-                      '<td>' + pEsc(r.status) + '</td>'];
-            }}))
+              var cells = ['<td>' + pEsc(r.type) + '</td>',
+                           '<td>' + r.name + '</td>'];
+              if (showAppColumns) {{
+                if (r.type === 'Group') {{
+                  cells.push('<td colspan="3" class="muted">—</td>');
+                }} else {{
+                  cells.push('<td class="owned-grants">' + r.grants_html + '</td>',
+                             '<td>' + pEsc(r.creds) + '</td>',
+                             '<td>' + pEsc(r.status) + '</td>');
+                }}
+              }}
+              return cells;
+            }}), 'user-owned-table')
         : '<p class="muted">No owned objects recorded.</p>';
     var deviceLinks = (p.devices || []).map(function(d) {{
       return {{
@@ -9397,11 +9408,12 @@ def render_report(results, tenant_name, db_path, config_path,
       ['devices', 'Devices (' + (p.devices ? p.devices.length : 0) + ')', devicesHtml],
       ['raw', 'Raw', rawPane]
     ];
+    var initialTab = activeTab || 'overview';
     var tabsHtml = '<div class="drawer-tabs">' + panes.map(function(pt) {{
-      return '<button type="button" class="drawer-tab' + (pt[0] === 'overview' ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pEsc(pt[1]) + '</button>';
+      return '<button type="button" class="drawer-tab' + (pt[0] === initialTab ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pEsc(pt[1]) + '</button>';
     }}).join('') + '</div>';
     var panesHtml = panes.map(function(pt) {{
-      return '<div class="dtab-pane' + (pt[0] === 'overview' ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pt[2] + '</div>';
+      return '<div class="dtab-pane' + (pt[0] === initialTab ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pt[2] + '</div>';
     }}).join('');
     var wrap = document.createElement('div');
     wrap.className = 'drawer-tabs-wrap';
@@ -9463,6 +9475,9 @@ def render_report(results, tenant_name, db_path, config_path,
       b.addEventListener('click', function() {{
         var oid = b.getAttribute('data-obj-id');
         var kind = b.getAttribute('data-obj-kind');
+        var activeTab = container.querySelector(
+          '.drawer-tabs-wrap .drawer-tab.active');
+        var returnTab = activeTab ? activeTab.getAttribute('data-dtab') : 'overview';
         container.innerHTML = '';
         var backRow = document.createElement('div');
         backRow.className = 'drawer-back-row';
@@ -9471,7 +9486,7 @@ def render_report(results, tenant_name, db_path, config_path,
         Array.prototype.forEach.call(backRow.querySelectorAll('.drawer-back'), function(x) {{
           x.addEventListener('click', function() {{
             container.innerHTML = '';
-            renderProfileTabs(p, container);
+            renderProfileTabs(p, container, returnTab);
           }});
         }});
         var prof2 = null;
@@ -9527,13 +9542,14 @@ def render_report(results, tenant_name, db_path, config_path,
         + 'Show all (' + lis.length + ')</button>';
   }}
 
-  function cappedTableHtml(headers, rows) {{
+  function cappedTableHtml(headers, rows, tableClass) {{
+    var tableClassAttr = 'minor-table' + (tableClass ? ' ' + tableClass : '');
     function tableHtml(r) {{
-      return '<table class="minor-table"><thead><tr>'
+      return '<table class="' + tableClassAttr + '"><thead><tr>'
           + headers.map(function(c) {{ return '<th>' + pEsc(c[0]) + '</th>'; }}).join('')
           + '</tr></thead><tbody>'
           + r.map(function(row) {{
-              return '<tr>' + row.map(function(c) {{ return '<td>' + c + '</td>'; }}).join('') + '</tr>';
+              return '<tr>' + row.join('') + '</tr>';
             }}).join('')
           + '</tbody></table>';
     }}

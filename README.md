@@ -1,6 +1,6 @@
 # Entra Surface
 
-Entra ID attack-surface report from a [ROADrecon](https://github.com/dirkjanm/ROADtools) database. Serves a sortable, filterable HTML report with drilldowns.
+Entra ID attack-surface report from a [ROADrecon](https://github.com/dirkjanm/ROADtools) database. It runs the configured checks and serves a sortable, filterable HTML report with drilldowns. The sidebar switches between **Analysis**, **Collect**, and **Tokens**.
 
 <img width="1384" height="808" alt="image" src="https://github.com/user-attachments/assets/18f39b77-cd95-468b-9bcb-989b336af9c9" />
 
@@ -8,7 +8,7 @@ Entra ID attack-surface report from a [ROADrecon](https://github.com/dirkjanm/RO
 
 - Python 3
 - A ROADrecon SQLite database (optional)
-- Collection: `msal`, `requests`, and `PySocks` (SOCKS) from `requirements.txt`
+- For collection: `msal`, `requests`, and `PySocks` from `requirements.txt`
 
 ## Collection
 
@@ -24,9 +24,11 @@ Or collect from the in-app **Collect** tab.
 python3 entra-surface.py --db roadrecon.db
 ```
 
-Opens `http://127.0.0.1:8787`. Omit `--db` to open the GUI shell and load or analyze a database from `data/databases` (or a custom path). Analysis is cached; use `--refresh` to force a re-run or `--no-cache` to disable caching.
+Open `http://127.0.0.1:8787`.
 
-### Options
+Omit `--db` to start with an empty GUI shell; use **Analysis** to load a database from `data/databases` or a custom path. Analysis is cached: `--refresh` re-runs it, `--no-cache` disables caching.
+
+## Options
 
 | Option | Description |
 | --- | --- |
@@ -38,46 +40,43 @@ Opens `http://127.0.0.1:8787`. Omit `--db` to open the GUI shell and load or ana
 | `--no-cache` | Disable the analysis cache |
 | `--timing` | Print per-phase timings and peak memory |
 
-## Collect tab
+## Collect
 
-- **Graph:** bundled collector under `entra_surface/collector`. Output defaults to `data/databases/collected.db`. Uses the active token; refresh tokens require a client ID. Access-token runs skip ARM.
-- **Evade Graph detections:** batches up to 20 relationship GETs per Microsoft Graph `$batch` request and uses an ADO.NET User-Agent when none is supplied.
-- **AAD Graph:** legacy collector based on ROADrecon 2.0. Output defaults to `data/databases/aadgraph.db` and is recreated each run. Accepts a refresh or AAD Graph access token.
-- **AAD Graph options:** autotoken, evade, gather-all (requires a refresh token), and MFA details.
-- Collector deps: `msal`, `requests`, and `PySocks`; no ROADRecon package. Override the backend with `ENTRA_COLLECTOR_DIR`.
+- **Graph:** bundled collector under `entra_surface/collector`. Output defaults to `data/databases/entra-graph.db`. Uses the active token.
+- **AAD Graph:** legacy collector based on ROADrecon 2.0. Output defaults to `data/databases/entra-aad.db`. Uses the active token.
+- **Dependencies:** `msal`, `requests`, and `PySocks`; no ROADRecon package. Override the backend with `ENTRA_COLLECTOR_DIR`.
+- **Throttling:** 429 backoffs appear in the log with the wait time and running count.
 
 Headless AAD Graph collection:
 
 ```sh
-python3 -m entra_surface.collect --backend aadgraph \
-  -rt <refresh-token> -c <client-id> --evade --gather-all \
-  -o data/databases/aadgraph.db
+python3 -m entra_surface.collect --backend aadgraph -rt <refresh-token> -c <client-id> --evade --gather-all -o data/databases/entra-aad.db
 ```
 
 ## Tokens
 
-- Add a refresh token with its client ID, or a bare access token.
+- **Collected tokens** lists saved tokens; **Add token** accepts a refresh token with its client ID or a bare access token.
 - Redeem refresh tokens for any listed resource or a custom client/resource.
 - FOCI tokens expose **Access Token** and **FOCI** client options.
-- Access tokens are nested under their source refresh; FOCI sibling redemption creates a separate refresh entry.
 - **Decode** shows JWT header and payload.
+- Refresh-token rows link to the client in entrascopes.
 - Resource and client lists use the cached entrascopes dataset.
 - Tokens are stored in `.entra-surface-auth.json` (mode `0600`, gitignored).
 
 ## Settings
 
-- The sidebar gear opens Settings.
-- **Proxy:** HTTP, HTTPS, SOCKS4, and SOCKS5 for collection and token refresh; optional auth and no-proxy hosts for Graph, ARM, and AAD Graph requests.
-- **Test proxy** checks the current form values against Microsoft Graph.
-- Settings are stored in `.entra-surface-settings.json` (mode `0600`, gitignored).
-- SOCKS requires `PySocks` in the collector virtualenv.
+- **User agents:** **Global** applies to all outbound requests; **Collect** covers Graph/AAD Graph/ARM collection including token acquisition, and **Tokens** covers Tokens-tab exchanges and token-resource metadata. Area settings override Global.
+- **Proxy:** HTTP, HTTPS, SOCKS4, and SOCKS5 for collection and token refresh, with optional auth and no-proxy hosts for Graph, ARM, and AAD Graph.
 
-## Report
+## Analysis
 
-- **Tabs:** Apps / Service principals, Users, Active Directory / On-prem, Groups, Conditional Access, Azure Arc.
+- **Tabs:** Apps / Service principals, Users, Active Directory / On-prem, Groups, Conditional Access Policies, Azure Arc.
 - **Column manager:** add, remove, and reorder columns per table.
 - **Filters:** free text plus advanced queries (`field:value`, `contains:`, `AND`/`OR`/`NOT`, `uniq:column`).
 - **Drawers:** details, roles, owners, Azure RBAC, and raw records; PIM-eligible roles open a PIM detail table.
 - **Azure Arc:** Arc machines, role holders, onboarding service principals, and resource providers.
 
-Checks are configured in `privileged_roles.json`; the full report is always served.
+Credits:
+
+- https://github.com/dirkjanm/ROADtools
+- https://github.com/f-bader/entrascopes.com

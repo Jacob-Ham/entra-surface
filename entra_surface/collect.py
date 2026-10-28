@@ -1468,6 +1468,11 @@ def styles_html() -> str:
     color: var(--text-muted); font-size: 12px; line-height: 1.35;
     margin-top: 2px; overflow-wrap: anywhere;
   }
+  .token-entrascopes { margin-top: 3px; }
+  .token-entrascopes-link {
+    color: var(--accent); font-size: 11.5px; text-decoration: none;
+  }
+  .token-entrascopes-link:hover { text-decoration: underline; }
   .token-row-actions {
     display: flex; gap: 5px; align-items: center; flex: none;
     flex-wrap: wrap; justify-content: flex-end;
@@ -2089,11 +2094,11 @@ def tokens_view_html() -> str:
     <span class="mono">__AUTH_FILE__</span> and never sent back to the browser
     until explicitly revealed.</p>
   <div class="drawer-tabs token-tabs" id="token-tabs">
-    <button type="button" class="drawer-tab active" data-token-view="add">Add token</button>
-    <button type="button" class="drawer-tab" data-token-view="collected">Collected tokens <span class="tab-count" id="token-count">0</span></button>
+    <button type="button" class="drawer-tab active" data-token-view="collected">Collected tokens <span class="tab-count" id="token-count">0</span></button>
+    <button type="button" class="drawer-tab" data-token-view="add">Add token</button>
   </div>
   <div class="tokens-flash hidden" id="tokens-flash"></div>
-  <div id="token-pane-add">
+  <div id="token-pane-add" class="hidden">
     <div class="collect-card">
       <label class="collect-field">
         <span>Token type</span>
@@ -2132,7 +2137,7 @@ def tokens_view_html() -> str:
       </div>
     </div>
   </div>
-  <div id="token-pane-collected" class="hidden">
+  <div id="token-pane-collected">
     <div class="token-toolbar">
       <input id="token-filter-text" type="search"
              placeholder="Filter principal, client, audience, note..."
@@ -2937,7 +2942,7 @@ def tokens_view_html() -> str:
     var typeClass = hasRefresh && hasAccess ? 'both'
       : (hasRefresh ? 'refresh' : 'access');
     var savedLine = '';
-    if (t.updated_at) {
+    if (t.updated_at && !(t.has_refresh_token && !t.has_access_token)) {
       var stamp = (t.has_refresh_token && t.has_access_token) ? 'Redeemed ' : 'Saved ';
       savedLine = stamp + t.updated_at;
     }
@@ -2957,6 +2962,14 @@ def tokens_view_html() -> str:
     var noteLine = t.note
       ? '<div class="token-row-note"><span class="token-row-label">Note:</span> '
         + esc(t.note) + '</div>'
+      : '';
+    var entrascopesLine = hasRefresh && t.client_id
+      ? '<div class="token-row-meta token-entrascopes">'
+        + '<span class="token-row-label">Info:</span> '
+        + '<a class="token-entrascopes-link" target="_blank"'
+        + ' rel="noopener noreferrer" title="Open in entrascopes"'
+        + ' href="https://entrascopes.com/?view='
+        + encodeURIComponent(t.client_id) + '">entrascopes ↗</a></div>'
       : '';
     var secretFields = '';
     if (t.has_access_token) {
@@ -3014,7 +3027,7 @@ def tokens_view_html() -> str:
       + fociHtml
       + amrHtml
       + healthHtml + '</div>'
-      + (nestedAccess ? ''
+      + ((nestedAccess || hasRefresh) ? ''
         : '<div class="token-row-meta"' + audienceTitle + '>'
           + '<span class="token-row-label">Audience:</span> '
           + esc(audienceText) + '</div>')
@@ -3025,6 +3038,7 @@ def tokens_view_html() -> str:
       + (usedLine ? '<div class="token-row-meta">' + esc(usedLine) + '</div>' : '')
       + (expiresLine ? '<div class="token-row-meta">' + esc(expiresLine) + '</div>' : '')
       + noteLine
+      + entrascopesLine
       + '</div><div class="token-row-actions">' + actions + '</div></div>'
       + '<div class="token-secret hidden" data-secret-for="' + esc(t.id) + '">'
       + secretFields + '</div>';
