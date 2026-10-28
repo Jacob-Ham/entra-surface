@@ -8,8 +8,9 @@ principals, and tenant configuration. Each check emits structured findings
 (check_id, category, severity, evidence, object ids); a single renderer turns
 them into a sortable/filterable HTML report with drilldown and entity details,
 served interactively over HTTP (rows, profiles and drilldowns are fetched on
-demand, so it scales to large tenants). The tool always runs every enabled
-check and serves the whole report; check selection lives in the config.
+demand, so it scales to large tenants). Without --db, it serves the GUI shell
+with no analysis data. The tool always runs every enabled check and serves the
+whole report; check selection lives in the config.
 
 Checks (config: privileged_roles.json -> "checks"):
   priv_app_ownership      - privileged application (app-only) permission grants
@@ -56,17 +57,24 @@ import argparse
 import datetime
 import gc
 import gzip
+import hashlib
 import html
 import http.server
 import json
+import os
 import re
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
 from collections import defaultdict, Counter
 from pathlib import Path
+
+from entra_surface import analysis
+from entra_surface import collect as collect_backend
+from entra_surface import settings as surface_settings
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = SCRIPT_DIR / "privileged_roles.json"
@@ -945,12 +953,6 @@ def build_graph(cur):
                     out["provider"] = parts[i + 1]
                     break
         return out
-
-    def az_scope_type(scope):
-        return az_scope_parse(scope)["type"]
-
-    def az_scope_sub(scope):
-        return az_scope_parse(scope)["sub"]
 
     def az_scope_label(scope):
         p = az_scope_parse(scope)
@@ -3100,10 +3102,6 @@ def check_groups(ctx):
             return uid
         return u.get("userPrincipalName") or u.get("displayName") or uid
 
-    def user_disp(uid):
-        u = graph["user"].get(uid)
-        return (u.get("displayName") or u.get("userPrincipalName") or uid) if u else uid
-
     def group_label(gid):
         rec = graph["group"].get(gid)
         return rec.get("displayName") if rec else gid
@@ -3843,9 +3841,7 @@ CHECK_SPECS = [
         "id": "azure_arc_machines",
         "category": "arc",
         "title": "Azure Arc machines",
-        "description": ("Servers onboarded to Azure Arc, identified by the "
-                        "Microsoft.HybridCompute resource path on their managed identities "
-                        "(resource-provider namespace, never display names)."),
+        "description": (""),
         "run": check_azure_arc_machines,
     },
     {
@@ -3868,8 +3864,6 @@ CHECK_SPECS = [
         "run": check_azure_arc_providers,
     },
 ]
-
-CHECK_IDS = {spec["id"] for spec in CHECK_SPECS}
 
 
 def run_checks(graph, config_resources, check_cfg,
@@ -4034,21 +4028,6 @@ def run_checks(graph, config_resources, check_cfg,
 # Detail-view fields (drilldown modal)
 # ---------------------------------------------------------------------------
 
-APPLICATION_DETAIL_FIELDS = [
-    "displayName", "appId", "objectId", "publisherDomain", "verifiedPublisher",
-    "availableToOtherTenants", "publicClient", "homepage", "replyUrls", "identifierUris",
-    "requiredResourceAccess", "keyCredentials", "passwordCredentials",
-    "oauth2AllowImplicitFlow", "oauth2AllowIdTokenImplicitFlow", "disabledByMicrosoftStatus",
-]
-
-SP_DETAIL_FIELDS = [
-    "displayName", "appDisplayName", "appId", "objectId", "accountEnabled",
-    "servicePrincipalType", "appOwnerTenantId", "microsoftFirstParty",
-    "appRoleAssignmentRequired", "publisherName", "managedIdentityResourceId",
-    "notificationEmailAddresses", "replyUrls", "keyCredentials", "passwordCredentials",
-    "tags", "preferredSingleSignOnMode",
-]
-
 DEVICE_DETAIL_FIELDS = [
     "displayName", "objectId", "accountEnabled", "deviceOSType", "deviceOSVersion",
     "deviceModel", "deviceManufacturer", "deviceCategory", "deviceOwnership",
@@ -4205,7 +4184,7 @@ def make_profile_builder(graph, check_cfg, group_roles=None, group_eligible_role
     Indexes the app-role assignment list (by resource and by principal) and
     the group memberships (SP -> groups) once, so building a single profile
     costs O(roles of that principal) instead of full-table scans. Profiles are
-    memoized; the batch wrapper build_entity_profiles() uses this builder."""
+    memoized."""
     role_sev = check_cfg["directory_roles"]
     role_labels = check_cfg.get("role_labels") or {}
     if group_roles is None:
@@ -4424,23 +4403,6 @@ def make_profile_builder(graph, check_cfg, group_roles=None, group_eligible_role
     return {"sp": sp_profile, "app": app_profile}
 
 
-def build_entity_profiles(graph, check_cfg, sp_ids, app_ids,
-                          group_roles=None, group_eligible_roles=None,
-                          sp_dir_resolver=None):
-    """Relationship data for every referenced SP/app drawer profile (batch
-    wrapper around make_profile_builder)."""
-    builder = make_profile_builder(graph, check_cfg, group_roles,
-                                   group_eligible_roles, sp_dir_resolver)
-    profiles = {"sp": {}, "app": {}}
-    for sp_oid in sorted(sp_ids):
-        if sp_oid in graph["sp"]:
-            profiles["sp"][sp_oid] = builder["sp"](sp_oid)
-    for app_oid in sorted(app_ids):
-        if app_oid in graph["app"]:
-            profiles["app"][app_oid] = builder["app"](app_oid)
-    return profiles
-
-
 # ---------------------------------------------------------------------------
 # HTML rendering
 # ---------------------------------------------------------------------------
@@ -4513,14 +4475,7 @@ def cap_annotate(items):
 #   * shell-rendered azure-roles tables (extras delivered via data blobs),
 #   * the client-side column manager (window.__TABLE_CATALOG).
 #
-# Extra families: "sp", "user", "group", "policy" (see COLUMN_FAMILIES).
-
-COLUMN_FAMILIES = {
-    "sp": "SP / application",
-    "user": "User",
-    "group": "Group",
-    "policy": "CA policy",
-}
+# Extra columns are declared per table in TABLE_SPECS.
 
 DASH_INNER = '<span class="muted">&mdash;</span>'
 SORT_TITLE = "Click to sort \u00b7 drag to reorder"
@@ -5726,19 +5681,39 @@ def legacy_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=No
     tid = "owned-table"
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
-    selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                            legacy_search_text,
-                            lambda f, k: legacy_sort_value(f, k, ctx))
+    items = findings
+    if q:
+        needle = q.lower()
+        items = [f for f in items if needle in legacy_search_text(f)]
+    if sort_key:
+        items = sorted(items, key=lambda f: legacy_sort_value(f, sort_key, ctx),
+                       reverse=bool(desc))
+    else:
+        items = sorted(
+            items,
+            key=lambda f: (severity_rank(f.get("severity", "Info")),
+                           str(f.get("title") or "").lower()))
+    total = sum(len(f.get("owners") or []) for f in items)
+    if stop is None:
+        stop = total
     out = []
-    for f in selected:
-        for owner in f["owners"]:
-            key = f"row-{len(out)}"
-            r = {"graph": (ctx or {}).get("graph"), "owner": owner, "tid": tid,
-                 "sp_id": f.get("principal_id"), "app_id": f.get("app_object_id")}
-            tr_attrs = (f'data-sp-id="{esc(f["principal_id"])}" '
-                        f'data-app-id="{esc(f["app_object_id"] or "")}" '
-                        f'data-owner-id="{esc(owner["object_id"])}"')
-            out.append(row_html(tid, tr_attrs, key, fields, f, r))
+    row_index = 0
+    for f in items:
+        for owner in f.get("owners") or []:
+            if row_index >= stop:
+                break
+            if row_index >= start:
+                key = f"row-{row_index}"
+                r = {"graph": (ctx or {}).get("graph"), "owner": owner,
+                     "tid": tid, "sp_id": f.get("principal_id"),
+                     "app_id": f.get("app_object_id")}
+                tr_attrs = (f'data-sp-id="{esc(f["principal_id"])}" '
+                            f'data-app-id="{esc(f["app_object_id"] or "")}" '
+                            f'data-owner-id="{esc(owner["object_id"])}"')
+                out.append(row_html(tid, tr_attrs, key, fields, f, r))
+            row_index += 1
+        if row_index >= stop:
+            break
     return out, total
 
 
@@ -6684,13 +6659,6 @@ def render_report(results, tenant_name, db_path, config_path,
 
     category_counts = Counter(res["category"] for res in results for _ in res["findings"])
 
-    EXPAND_BUTTON = '<button type="button" class="icon-btn expand-btn" aria-label="View full details">+</button>'
-
-    # ---- drawer (inline dropdown) helper ---------------------------------
-    def drawer_for(key, colspan):
-        return (f'<tr class="drawer" data-detail-for="{esc(key)}">'
-                f'<td colspan="{colspan}"><div class="drawer-body"></div></td></tr>')
-
     serve_pager = _serve_pager
     col_ctx = {"graph": graph}
     extras_blobs = {}
@@ -6718,7 +6686,7 @@ def render_report(results, tenant_name, db_path, config_path,
             return a.get("scope_mgmt") or "—"
         return "—"
 
-    def azure_roles_section(title, table_id, category, principal_header, rows, az_field):
+    def azure_roles_section(title, table_id, category, rows):
         if not rows:
             return ""
         spec = table_spec(table_id)
@@ -6821,11 +6789,10 @@ def render_report(results, tenant_name, db_path, config_path,
     {'<div class="empty">No unowned privileged applications found.</div>' if not unowned else ''}
   </section>
 """ + azure_roles_section(
-        "Azure Roles (service principals)", "azure-roles-apps", "apps", "Application / SP",
+        "Azure Roles (service principals)", "azure-roles-apps", "apps",
         az_rows_for(graph["az_sp_roles"], "sp",
                     lambda oid: ((graph["sp"].get(oid) or {}).get("displayName")
-                                 or (oid if oid in graph["sp"] else None))),
-        "azSpRoles")
+                                 or (oid if oid in graph["sp"] else None))))
 
     # ---- generic findings sections ---------------------------------------
     def generic_section(res):
@@ -6900,11 +6867,10 @@ def render_report(results, tenant_name, db_path, config_path,
     {pager}
   </section>
 """ + azure_roles_section(
-        "Azure Roles (groups)", "azure-roles-groups", "groups", "Group",
+        "Azure Roles (groups)", "azure-roles-groups", "groups",
         az_rows_for(graph["az_roles"], "group",
                     lambda gid: ((graph["group"].get(gid) or {}).get("displayName")
-                                 or (gid if gid in graph["group"] else None))),
-        "azRoles")
+                                 or (gid if gid in graph["group"] else None))))
 
     def dynamic_groups_table(res):
         dyn = [f for f in res["findings"] if f.get("dyn_rule")]
@@ -6942,12 +6908,11 @@ def render_report(results, tenant_name, db_path, config_path,
     {pager}
   </section>
 """ + azure_roles_section(
-        "Azure Roles (users)", "azure-roles-users", "users", "User",
+        "Azure Roles (users)", "azure-roles-users", "users",
         az_rows_for(graph["az_user_roles"], "user",
                     lambda uid: (lambda u: ((u.get("userPrincipalName")
                                              or u.get("displayName") or uid) if u else None))(
-                        graph["user"].get(uid))),
-        "azUsrRoles")
+                        graph["user"].get(uid))))
 
     # ---- app directory roles section --------------------------------------
     def app_dir_roles_section(res):
@@ -6998,7 +6963,6 @@ def render_report(results, tenant_name, db_path, config_path,
                 bits.append("new SPNs auto-added")
             rows.append(f"<tr><th>Desktop SSO</th><td>{esc(bits[0])}"
                         + (f' <span class="muted">({esc(bits[1])})</span>' if len(bits) > 1 else "") + "</td></tr>")
-        sync_detail = v("Synchronized users")
         if f.get("sync_count"):
             imm = f.get("immutable_count", 0)
             if imm >= f["sync_count"]:
@@ -7053,15 +7017,14 @@ def render_report(results, tenant_name, db_path, config_path,
     {pager}
   </section>
 """ + azure_roles_section(
-        "Azure Roles (synced users)", "azure-roles-ad", "ad", "User",
+        "Azure Roles (synced users)", "azure-roles-ad", "ad",
         az_rows_for(
             {uid: roles for uid, roles in graph["az_user_roles"].items()
              if (graph["user"].get(uid) or {}).get("dirSyncEnabled") in (1, True)},
             "user",
             lambda uid: (lambda u: ((u.get("userPrincipalName")
                                      or u.get("displayName") or uid) if u else None))(
-                graph["user"].get(uid))),
-        "azUsrRoles")
+                graph["user"].get(uid))))
 
     sections_html = []
     diff_entries = []
@@ -7077,6 +7040,7 @@ def render_report(results, tenant_name, db_path, config_path,
                                          e["f"].get("check_id", ""),
                                          ((e["f"].get("target") or {}).get("name")
                                           or "").lower()))
+    app_dir_rendered = False
     for res in results:
         if res["id"] == "priv_app_ownership":
             owned_html = legacy_owned_section()
@@ -7085,17 +7049,18 @@ def render_report(results, tenant_name, db_path, config_path,
             # 'Directory roles assigned to applications' renders as the
             # second table, right after the ownership table
             app_dir = next((r for r in results if r["id"] == "app_dir_roles"), None)
-            if app_dir:
+            if app_dir and not app_dir_rendered:
                 sections_html.append(app_dir_roles_section(app_dir))
+                app_dir_rendered = True
             unowned_html = legacy_unowned_section()
             if unowned_html:
                 sections_html.append(unowned_html)
         elif res["id"] == "app_dir_roles":
-            pass  # already rendered after the first table above
+            if not app_dir_rendered:
+                sections_html.append(app_dir_roles_section(res))
+                app_dir_rendered = True
         elif res["id"] == "privileged_users":
             sections_html.append(users_section(res))
-        elif res["id"] == "app_dir_roles":
-            sections_html.append(app_dir_roles_section(res))
         elif res["id"] == "groups":
             sections_html.append(groups_section(res))
             dyn_html = dynamic_groups_table(res)
@@ -7257,6 +7222,10 @@ def render_report(results, tenant_name, db_path, config_path,
             tabs_html.append(
                 f'<button type="button" class="tab-btn" data-category="{cat}">'
                 f'{esc(CATEGORY_LABELS.get(cat, cat))} <span class="tab-count">{count}</span></button>')
+    if db_path is not None:
+        tabs_html.append(
+            '<button type="button" class="tab-btn reanalyze-btn" id="reanalyze-btn">'
+            'Re-analyze</button>')
     tabs_html = "\n      ".join(tabs_html)
 
     # ---- tenant summary bar (lean inline facts) ---------------------------
@@ -7282,27 +7251,15 @@ def render_report(results, tenant_name, db_path, config_path,
         sid_title = ts.get("sid_prefix", "").rstrip("-") + "-x" if ts.get("sid_prefix") else ""
         bar.append(item("Realm", f'<span class="mono">{esc(ts["realm"])}</span>', sid_title))
     if ts.get("engine"):
-        bar.append(item("Sync", f'<span class="mono">{esc(ts["engine"])}</span>'))
+        engine = str(ts["engine"]).split(" · ", 1)[0]
+        if engine == "Microsoft Entra Connect (on-prem)":
+            engine = "Entra Connect"
+        bar.append(item("Sync", f'<span class="mono">{esc(engine)}</span>'))
     if ts.get("writeback") is True:
         bar.append('<span class="sum-item tag"><span class="sum-label">Writeback</span><span class="tag-chip tag-privileged">ON</span></span>')
     if ts.get("auth_mode"):
         bar.append(item("Auth", f'<span class="tag-chip tag-divergence">{esc(ts["auth_mode"])}</span>',
                         "Authentication mode (PHS / PTA / federated), see the sync summary"))
-    if ts.get("pim"):
-        pim = ts["pim"]
-        pim_labels = {"aadroles": "AAD roles", "aadgroups": "groups",
-                      "azureResources": "Azure resources"}
-        providers = [p for p in ("aadroles", "aadgroups", "azureResources")
-                     if p in (pim.get("providers") or [])]
-        if providers:
-            pim_title = "PIM registered for " + ", ".join(pim_labels[p] for p in providers)
-            if not pim.get("governance"):
-                pim_title += " — assignment schedules not collected (run roadrecon pimgather)"
-            bar.append(item("PIM", f'<span class="mono">{esc(" \u00b7 ".join(pim_labels[p] for p in providers))}</span>',
-                            pim_title))
-        elif not pim.get("governance"):
-            bar.append(item("PIM", "<b>not observed</b>",
-                            "No privileged-access providers registered (PIM may not be licensed/enabled)"))
     if "users" in ts:
         synced_note = f'<span class="muted">({ts.get("synced", "?")} synced)</span>' if "synced" in ts else ""
         bar.append(item("Users", f'{ts.get("users", 0)} {synced_note}'))
@@ -7318,20 +7275,6 @@ def render_report(results, tenant_name, db_path, config_path,
         arc_principals = next((r for r in results if r["id"] == "azure_arc_sps"), None)
         arc_note = f'{len(arc_machines["findings"])} machines, {len(arc_principals["findings"]) if arc_principals else 0} Arc principals'
         bar.append(item("Arc", f"<b>{len(arc_machines['findings'])}</b>", arc_note))
-    # ---- cache / diff chips ------------------------------------------------
-    if cache_meta:
-        at = cache_meta.get("generated_at") or ""
-        if cache_meta.get("off"):
-            bar.append(item("Cache", "<b>off</b>", "caching disabled (--no-cache)"))
-        elif cache_meta.get("hit"):
-            bar.append(item("Cache", "<b>hit</b>", f"last analyzed {at}"))
-        else:
-            label = "created" if cache_meta.get("fresh") else "updated"
-            html = f"<b>{label}</b>"
-            title = f"analyzed {at}"
-            if diff_entries:
-                html += f" \u00b7 <b>{len(diff_entries)}</b> changes"
-            bar.append(item("Cache", html, title))
     summary_bar_html = "\n    ".join(bar)
 
     catalog_data = {}
@@ -7422,6 +7365,190 @@ def render_report(results, tenant_name, db_path, config_path,
     color: var(--text-primary);
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   }}
+  .app-main {{
+    min-height: 100vh;
+    transition: margin-left 0.18s ease;
+  }}
+  body.sidebar-open .app-main {{ margin-left: 260px; }}
+  .sidebar {{
+    position: fixed; inset: 0 auto 0 0; width: 260px; z-index: 90;
+    display: flex; flex-direction: column;
+    padding: 24px 18px 20px; overflow-y: auto;
+    background: var(--surface-1); border-right: 1px solid var(--border);
+    box-shadow: 10px 0 30px rgba(0,0,0,0.10);
+    transform: translateX(-100%); visibility: hidden;
+    transition: transform 0.18s ease, visibility 0.18s;
+  }}
+  body.sidebar-open .sidebar {{ transform: translateX(0); visibility: visible; }}
+  .sidebar-title {{
+    margin: 0; color: var(--text-muted); font-size: 10px; font-weight: 600;
+    letter-spacing: 0.08em; text-transform: uppercase;
+  }}
+  .sidebar-brand {{
+    color: var(--text-primary); font-size: 16px; font-weight: 700;
+    letter-spacing: 0; text-transform: none;
+  }}
+  .sidebar-head {{
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 8px; position: relative;
+  }}
+  .sidebar-settings-btn {{
+    width: 24px; height: 24px; padding: 0; flex: none;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: transparent; color: var(--text-muted);
+    border: 1px solid transparent; border-radius: 6px;
+    font-family: inherit; cursor: pointer;
+  }}
+  .sidebar-settings-btn:hover,
+  .sidebar-settings-btn[aria-expanded="true"] {{
+    background: var(--row-hover); color: var(--text-primary);
+    border-color: var(--border);
+  }}
+  .sidebar-theme {{
+    margin-top: 14px; padding-top: 14px;
+    border-top: 1px solid var(--gridline);
+  }}
+  .sidebar-theme .theme-toggle {{ width: 100%; }}
+  .sidebar-theme .theme-toggle button {{
+    flex: 1; padding: 6px 8px; font-size: 12px;
+  }}
+  .settings-overlay {{
+    position: fixed; inset: 0; z-index: 200;
+    background: rgba(0,0,0,0.45);
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px;
+  }}
+  .settings-overlay.hidden {{ display: none; }}
+  body.settings-open {{ overflow: hidden; }}
+  .settings-box {{
+    width: min(620px, 94vw); max-height: min(82vh, 720px);
+    display: flex; flex-direction: column; overflow: hidden;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; box-shadow: 0 24px 70px rgba(0,0,0,0.38);
+  }}
+  .settings-head {{
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 12px; padding: 14px 18px;
+    border-bottom: 1px solid var(--gridline);
+  }}
+  .settings-head h3 {{ margin: 0; font-size: 16px; }}
+  .settings-head .sub {{
+    margin: 2px 0 0; color: var(--text-secondary); font-size: 12px;
+  }}
+  .settings-tabs {{
+    display: flex; flex-wrap: wrap; gap: 4px; padding: 10px 14px 0;
+    border-bottom: 1px solid var(--gridline);
+  }}
+  .settings-tab {{
+    background: transparent; border: 1px solid transparent; border-bottom: 0;
+    border-radius: 7px 7px 0 0; color: var(--text-secondary);
+    padding: 7px 14px; font: inherit; font-size: 12.5px; cursor: pointer;
+  }}
+  .settings-tab:hover {{ color: var(--text-primary); background: var(--row-hover); }}
+  .settings-tab.active {{
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+    font-weight: 600;
+  }}
+  .settings-body {{ padding: 16px 18px; overflow: auto; }}
+  .settings-panel.hidden {{ display: none; }}
+  .settings-section + .settings-section {{
+    margin-top: 16px; padding-top: 16px;
+    border-top: 1px solid var(--gridline);
+  }}
+  .settings-section h4 {{
+    margin: 0 0 6px; color: var(--text-muted); font-size: 10.5px;
+    font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+  }}
+  .settings-value {{
+    color: var(--text-secondary); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px; line-height: 1.45; overflow-wrap: anywhere;
+  }}
+  .settings-note {{
+    margin: 0; color: var(--text-secondary); font-size: 12.5px; line-height: 1.5;
+  }}
+  .settings-field {{
+    display: flex; flex-direction: column; gap: 4px;
+    color: var(--text-secondary); font-size: 12px;
+  }}
+  .settings-field input {{
+    background: var(--page-plane); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 7px 9px; font-size: 12.5px; font-family: inherit;
+  }}
+  .settings-field input:focus {{
+    outline: none;
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  }}
+  .settings-grid {{
+    display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px;
+    margin-top: 12px;
+  }}
+  .settings-grid .wide {{ grid-column: 1 / -1; }}
+  .settings-actions {{ margin-top: 12px; }}
+  .settings-check {{
+    display: flex; align-items: center; gap: 8px; margin-top: 10px;
+    color: var(--text-secondary); font-size: 12.5px; cursor: pointer;
+  }}
+  .settings-check input {{ margin: 0; }}
+  .settings-status {{
+    margin-top: 10px; font-size: 12px; color: var(--text-secondary);
+  }}
+  .settings-status.error {{ color: var(--status-critical); }}
+  .settings-status.hidden {{ display: none; }}
+  @media (max-width: 520px) {{
+    .settings-grid {{ grid-template-columns: 1fr; }}
+  }}
+  .settings-foot {{
+    display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+    flex-wrap: wrap; padding: 12px 18px;
+    border-top: 1px solid var(--gridline);
+  }}
+  .settings-foot .settings-status {{ margin: 0; flex: 1; }}
+  .sidebar-nav {{ display: flex; flex-direction: column; gap: 4px; margin-top: 14px; }}
+  .sidebar-nav-item {{
+    display: flex; align-items: center; width: 100%;
+    background: transparent; border: 1px solid transparent; border-radius: 7px;
+    padding: 8px 10px; color: var(--text-secondary); text-align: left;
+    font-size: 13px; line-height: 1.35; font-family: inherit; cursor: pointer;
+  }}
+  .sidebar-nav-item:hover {{ background: var(--row-hover); color: var(--text-primary); }}
+  .sidebar-nav-item.active {{
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+    color: var(--accent); font-weight: 600;
+  }}
+  .sidebar-principal {{
+    margin-top: auto; padding-top: 14px;
+    border-top: 1px solid var(--gridline);
+  }}
+  .sidebar-principal-body {{
+    display: flex; align-items: center; gap: 10px; margin-top: 10px;
+    min-width: 0;
+  }}
+  .sidebar-principal-info {{ min-width: 0; }}
+  .sidebar-principal-name {{
+    font-size: 12.5px; font-weight: 600; overflow-wrap: anywhere;
+  }}
+  .sidebar-principal-sub {{
+    color: var(--text-muted); font-size: 10.5px;
+    margin-top: 2px; overflow-wrap: anywhere;
+  }}
+  .sidebar-principal-empty {{ color: var(--text-muted); font-size: 11.5px; }}
+  .sidebar-toggle {{
+    position: fixed; top: 50%; left: 0; transform: translateY(-50%);
+    z-index: 95; width: 26px; height: 52px; padding: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--surface-1); color: var(--text-muted);
+    border: 1px solid var(--border); border-left: 0;
+    border-radius: 0 8px 8px 0;
+    box-shadow: 4px 4px 16px rgba(0,0,0,0.12);
+    font-size: 18px; line-height: 1; font-family: inherit; cursor: pointer;
+    transition: left 0.18s ease, color 0.15s ease, background 0.15s ease;
+  }}
+  .sidebar-toggle:hover {{ color: var(--text-primary); background: var(--row-hover); }}
+  body.sidebar-open .sidebar-toggle {{ left: 260px; }}
   .wrap {{ max-width: 1400px; margin: 0 auto; padding: 36px 28px 72px; }}
   header {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }}
   header h1 {{ font-size: 22px; margin: 0 0 4px; }}
@@ -7454,6 +7581,7 @@ def render_report(results, tenant_name, db_path, config_path,
   }}
   .tab-btn.active {{ background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); font-weight: 600; border-color: color-mix(in srgb, var(--accent) 35%, transparent); }}
   .tab-btn .tab-count {{ color: var(--text-muted); font-size: 11px; margin-left: 5px; }}
+  .reanalyze-btn {{ margin-left: auto; }}
   .controls {{
     display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
     margin: 10px 0 12px;
@@ -7709,6 +7837,12 @@ def render_report(results, tenant_name, db_path, config_path,
     color: var(--text-muted); font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.02em;
   }}
   .minor-table td {{ padding: 6px 10px; border-bottom: 1px solid var(--gridline); overflow-wrap: anywhere; vertical-align: top; }}
+  .user-owned-table th:first-child, .user-owned-table td:first-child {{ width: 140px; white-space: nowrap; }}
+  .user-owned-table th:nth-child(2), .user-owned-table td:nth-child(2) {{ min-width: 220px; }}
+  .user-owned-table th {{ padding: 8px 10px; }}
+  .user-owned-table td {{ padding: 8px 10px; line-height: 1.45; }}
+  .user-owned-table .owned-grant {{ display: block; }}
+  .user-owned-table .owned-grant + .owned-grant {{ margin-top: 2px; }}
   .dtab-sp-link, .app-link {{
     background: none; border: none; padding: 0; margin: 0;
     color: var(--accent); text-decoration: underline; cursor: pointer;
@@ -7727,22 +7861,64 @@ def render_report(results, tenant_name, db_path, config_path,
     border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px;
     background: var(--surface-1);
   }}
+  {collect_backend.styles_html()}
+  {analysis.styles_html()}
+  @media (max-width: 900px) {{
+    body.sidebar-open .app-main {{ margin-left: 0; }}
+    .sidebar {{ width: min(84vw, 320px); }}
+    body.sidebar-open .sidebar-toggle {{ left: min(84vw, 320px); }}
+  }}
 </style>
 </head>
-<body>
-<div class="wrap">
-  <header>
-    <div>
-      <h1>Entra ID Attack Surface</h1>
+<body class="sidebar-open">
+{analysis.client_js()}
+<aside class="sidebar" id="sidebar" aria-label="Sidebar" aria-hidden="false">
+  <div class="sidebar-head">
+    <h2 class="sidebar-title sidebar-brand">entra-surface</h2>
+    <button type="button" class="sidebar-settings-btn" id="sidebar-settings-btn"
+            aria-label="Settings" aria-haspopup="dialog" aria-expanded="false"
+            aria-controls="settings-overlay" title="Settings">
+      <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path fill="currentColor" d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"/>
+      </svg>
+    </button>
+  </div>
+  <nav class="sidebar-nav" id="sidebar-nav" aria-label="Workspace sections">
+    <button type="button" class="sidebar-nav-item active" data-view="analysis" aria-current="page">Analysis</button>
+    <button type="button" class="sidebar-nav-item" data-view="collect">Collect</button>
+    <button type="button" class="sidebar-nav-item" data-view="tokens">Tokens</button>
+  </nav>
+  <div class="sidebar-principal">
+    <div class="sidebar-title">Active token</div>
+    <div class="sidebar-principal-body" id="sidebar-principal-body">
+      <span class="sidebar-principal-empty">Loading...</span>
     </div>
+  </div>
+  <div class="sidebar-theme">
     <div class="theme-toggle" role="group" aria-label="Color theme">
       <button type="button" id="theme-light-btn" aria-pressed="false">Light</button>
       <button type="button" id="theme-dark-btn" aria-pressed="false">Dark</button>
+    </div>
+  </div>
+</aside>
+<button type="button" class="sidebar-toggle" id="sidebar-toggle" aria-controls="sidebar" aria-expanded="true" aria-label="Close sidebar" title="Close sidebar">
+  <span class="sidebar-toggle-arrow" aria-hidden="true">&lsaquo;</span>
+</button>
+<div class="app-main">
+<div class="wrap">
+  <div class="app-view" data-view="analysis">
+  <header>
+    <div>
+      <h1>Analysis</h1>
     </div>
   </header>
 
   <div class="summary-bar">
     {summary_bar_html}
+  </div>
+
+  <div id="analysis-start-wrap" class="{'' if db_path is None else 'hidden'}">
+    {analysis.start_panel_html(db_path)}
   </div>
 
   <div class="tabs" id="category-tabs" role="tablist">
@@ -7760,8 +7936,158 @@ def render_report(results, tenant_name, db_path, config_path,
 
   {''.join(sections_html)}
 
-  {'<div class="empty">No findings were produced. Check the check configuration.</div>' if not all_findings else ''}
+  {'<div class="empty">No database loaded. Start with --db to run the analysis.</div>' if not all_findings and db_path is None else ('<div class="empty">No findings were produced. Check the check configuration.</div>' if not all_findings else '')}
 
+  </div>
+  <div class="app-view hidden" data-view="collect">{collect_backend.view_html()}</div>
+  <div class="app-view hidden" data-view="tokens">{collect_backend.tokens_view_html()}</div>
+</div>
+</div>
+
+<div class="settings-overlay hidden" id="settings-overlay"
+     role="dialog" aria-modal="true" aria-labelledby="settings-title">
+  <div class="settings-box">
+    <div class="settings-head">
+      <div>
+        <h3 id="settings-title">Settings</h3>
+        <p class="sub">Local report and collection preferences.</p>
+      </div>
+      <button type="button" class="icon-btn" id="settings-close"
+              aria-label="Close settings">&times;</button>
+    </div>
+    <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+      <button type="button" class="settings-tab active" id="settings-tab-general"
+              data-settings-tab="general" role="tab" aria-selected="true"
+              aria-controls="settings-panel-general">General</button>
+      <button type="button" class="settings-tab" id="settings-tab-global"
+              data-settings-tab="global" role="tab" aria-selected="false"
+              aria-controls="settings-panel-global">Global</button>
+      <button type="button" class="settings-tab" id="settings-tab-collect"
+              data-settings-tab="collect" role="tab" aria-selected="false"
+              aria-controls="settings-panel-collect">Collect</button>
+      <button type="button" class="settings-tab" id="settings-tab-tokens"
+              data-settings-tab="tokens" role="tab" aria-selected="false"
+              aria-controls="settings-panel-tokens">Tokens</button>
+      <button type="button" class="settings-tab" id="settings-tab-proxy"
+              data-settings-tab="proxy" role="tab" aria-selected="false"
+              aria-controls="settings-panel-proxy">Proxy</button>
+    </div>
+    <div class="settings-body">
+      <section class="settings-panel" id="settings-panel-general"
+               role="tabpanel" aria-labelledby="settings-tab-general">
+        <div class="settings-section">
+          <h4>Database</h4>
+          <div class="settings-value"
+               title="{esc(str(db_path)) if db_path is not None else 'No database loaded'}">{esc(str(db_path)) if db_path is not None else 'No database loaded'}</div>
+        </div>
+        <div class="settings-section">
+          <h4>Appearance</h4>
+          <p class="settings-note">Use the Light / Dark toggle at the bottom of
+            the sidebar.</p>
+        </div>
+      </section>
+      <section class="settings-panel hidden" id="settings-panel-global"
+               role="tabpanel" aria-labelledby="settings-tab-global">
+        <div class="settings-section">
+          <h4>User agent</h4>
+          <p class="settings-note">Applies to all outbound requests unless the
+            Collect or Tokens tab overrides it. Leave blank to use each area's
+            built-in default.</p>
+          <div class="settings-grid">
+            <label class="settings-field wide">
+              <span>Global User-Agent</span>
+              <input id="settings-ua-global" type="text" autocomplete="off"
+                     spellcheck="false" maxlength="512"
+                     placeholder="e.g. Mozilla/5.0 ...">
+            </label>
+          </div>
+        </div>
+      </section>
+      <section class="settings-panel hidden" id="settings-panel-collect"
+               role="tabpanel" aria-labelledby="settings-tab-collect">
+        <div class="settings-section">
+          <h4>Collect user agent</h4>
+          <p class="settings-note">Used for Graph, AAD Graph, and ARM collection
+            traffic, including token acquisition.</p>
+          <div class="settings-grid">
+            <label class="settings-field wide">
+              <span>Collect User-Agent</span>
+              <input id="settings-ua-collect" type="text" autocomplete="off"
+                     spellcheck="false" maxlength="512"
+                     placeholder="Leave blank to fall back to Global">
+            </label>
+          </div>
+        </div>
+      </section>
+      <section class="settings-panel hidden" id="settings-panel-tokens"
+               role="tabpanel" aria-labelledby="settings-tab-tokens">
+        <div class="settings-section">
+          <h4>Tokens user agent</h4>
+          <p class="settings-note">Used for Tokens-tab exchange/refresh and
+            token-resource metadata requests. Collection token acquisition uses
+            the Collect setting. Overrides Global in the Tokens area.</p>
+          <div class="settings-grid">
+            <label class="settings-field wide">
+              <span>Tokens User-Agent</span>
+              <input id="settings-ua-tokens" type="text" autocomplete="off"
+                     spellcheck="false" maxlength="512"
+                     placeholder="Leave blank to fall back to Global">
+            </label>
+          </div>
+        </div>
+      </section>
+      <section class="settings-panel hidden" id="settings-panel-proxy"
+               role="tabpanel" aria-labelledby="settings-tab-proxy">
+        <div class="settings-section">
+          <h4>Proxy</h4>
+          <p class="settings-note">Route collector and token-refresh traffic
+            through an HTTP, HTTPS, SOCKS4, or SOCKS5 proxy.</p>
+          <label class="settings-check">
+            <input type="checkbox" id="settings-proxy-enabled">
+            <span>Use a proxy for collection and token refresh</span>
+          </label>
+          <div class="settings-grid">
+            <label class="settings-field wide">
+              <span>Proxy URL</span>
+              <input id="settings-proxy-url" type="text" autocomplete="off"
+                     spellcheck="false"
+                     placeholder="http://127.0.0.1:8080 or socks5h://127.0.0.1:1080">
+            </label>
+            <label class="settings-field">
+              <span>Username (optional)</span>
+              <input id="settings-proxy-user" type="text" autocomplete="off"
+                     spellcheck="false">
+            </label>
+            <label class="settings-field">
+              <span>Password (optional)</span>
+              <input id="settings-proxy-pass" type="password"
+                     autocomplete="new-password">
+            </label>
+            <label class="settings-field wide">
+              <span>No-proxy hosts (optional)</span>
+              <input id="settings-proxy-no-proxy" type="text" autocomplete="off"
+                     spellcheck="false" placeholder="localhost,127.0.0.1">
+            </label>
+          </div>
+          <label class="settings-check">
+            <input type="checkbox" id="settings-proxy-insecure">
+            <span>Accept any TLS certificate through the proxy (self-signed/untrusted)</span>
+          </label>
+          <div class="settings-actions">
+            <button type="button" class="mode-btn" id="settings-test">Test proxy</button>
+          </div>
+          <div class="settings-status hidden" id="settings-proxy-status"
+               role="status" aria-live="polite"></div>
+        </div>
+      </section>
+    </div>
+    <div class="settings-foot">
+      <div class="settings-status hidden" id="settings-status"
+           role="status" aria-live="polite"></div>
+      <button type="button" class="mode-btn" id="settings-save">Save</button>
+      <button type="button" class="mode-btn" id="settings-done">Done</button>
+    </div>
+  </div>
 </div>
 
 <div class="overlay hidden" id="drilldown-overlay">
@@ -7828,6 +8154,349 @@ def render_report(results, tenant_name, db_path, config_path,
   lightBtn.addEventListener('click', function() {{ setTheme('light'); }});
   darkBtn.addEventListener('click', function() {{ setTheme('dark'); }});
   updateThemeButtons();
+}})();
+
+(function() {{
+  var gear = document.getElementById('sidebar-settings-btn');
+  var overlay = document.getElementById('settings-overlay');
+  var closeBtn = document.getElementById('settings-close');
+  var doneBtn = document.getElementById('settings-done');
+  var saveBtn = document.getElementById('settings-save');
+  var testBtn = document.getElementById('settings-test');
+  var proxyEnabled = document.getElementById('settings-proxy-enabled');
+  var proxyUrl = document.getElementById('settings-proxy-url');
+  var proxyUser = document.getElementById('settings-proxy-user');
+  var proxyPass = document.getElementById('settings-proxy-pass');
+  var proxyNoProxy = document.getElementById('settings-proxy-no-proxy');
+  var proxyInsecure = document.getElementById('settings-proxy-insecure');
+  var proxyStatus = document.getElementById('settings-proxy-status');
+  var settingsStatus = document.getElementById('settings-status');
+  var uaGlobal = document.getElementById('settings-ua-global');
+  var uaCollect = document.getElementById('settings-ua-collect');
+  var uaTokens = document.getElementById('settings-ua-tokens');
+  var tabs = Array.prototype.slice.call(
+    document.querySelectorAll('#settings-overlay button[data-settings-tab]'));
+  if (!gear || !overlay) return;
+
+  function setProxyStatus(text, failed) {{
+    if (!proxyStatus) return;
+    proxyStatus.textContent = text || '';
+    proxyStatus.classList.toggle('hidden', !text);
+    proxyStatus.classList.toggle('error', !!failed);
+  }}
+
+  function setStatus(text, failed) {{
+    if (!settingsStatus) return;
+    settingsStatus.textContent = text || '';
+    settingsStatus.classList.toggle('hidden', !text);
+    settingsStatus.classList.toggle('error', !!failed);
+  }}
+
+  function fillProxy(proxy) {{
+    proxy = proxy || {{}};
+    if (proxyEnabled) proxyEnabled.checked = !!proxy.enabled;
+    if (proxyUrl) proxyUrl.value = proxy.url || '';
+    if (proxyUser) proxyUser.value = proxy.username || '';
+    if (proxyPass) proxyPass.value = proxy.password || '';
+    if (proxyNoProxy) proxyNoProxy.value = proxy.no_proxy || '';
+    if (proxyInsecure) proxyInsecure.checked = !!proxy.insecure_tls;
+  }}
+
+  function fillUserAgents(userAgents) {{
+    userAgents = userAgents || {{}};
+    if (uaGlobal) uaGlobal.value = userAgents.global || '';
+    if (uaCollect) uaCollect.value = userAgents.collect || '';
+    if (uaTokens) uaTokens.value = userAgents.tokens || '';
+  }}
+
+  function userAgentPayload() {{
+    return {{
+      global: uaGlobal ? uaGlobal.value.trim() : '',
+      collect: uaCollect ? uaCollect.value.trim() : '',
+      tokens: uaTokens ? uaTokens.value.trim() : ''
+    }};
+  }}
+
+  function proxyPayload() {{
+    return {{
+      enabled: !!(proxyEnabled && proxyEnabled.checked),
+      url: proxyUrl ? proxyUrl.value.trim() : '',
+      username: proxyUser ? proxyUser.value.trim() : '',
+      password: proxyPass ? proxyPass.value : '',
+      no_proxy: proxyNoProxy ? proxyNoProxy.value.trim() : '',
+      insecure_tls: !!(proxyInsecure && proxyInsecure.checked)
+    }};
+  }}
+
+  function loadSettings() {{
+    return fetch('/api/settings')
+      .then(function(r) {{
+        return r.json().then(function(data) {{
+          if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+          return data;
+        }});
+      }})
+      .then(function(data) {{
+        fillProxy(data.proxy);
+        fillUserAgents(data.user_agents);
+        setProxyStatus('', false);
+        setStatus('', false);
+      }})
+      .catch(function(err) {{
+        setStatus(err.message || 'Could not load settings.', true);
+      }});
+  }}
+
+  function saveSettings() {{
+    var proxy = proxyPayload();
+    var userAgents = userAgentPayload();
+    if (proxy.enabled && !proxy.url) {{
+      setStatus('Enter a proxy URL.', true);
+      selectTab('proxy');
+      if (proxyUrl) proxyUrl.focus();
+      return;
+    }}
+    if (saveBtn) saveBtn.disabled = true;
+    setStatus('Saving...', false);
+    fetch('/api/settings', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ proxy: proxy, user_agents: userAgents }})
+    }}).then(function(r) {{
+      return r.json().then(function(data) {{
+        if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+        return data;
+      }});
+    }}).then(function(data) {{
+      fillProxy(data.proxy);
+      fillUserAgents(data.user_agents);
+      setStatus('Settings saved.', false);
+    }}).catch(function(err) {{
+      setStatus(err.message || 'Could not save settings.', true);
+    }}).then(function() {{
+      if (saveBtn) saveBtn.disabled = false;
+    }});
+  }}
+
+  function testProxy() {{
+    var proxy = proxyPayload();
+    if (!proxy.enabled) {{
+      setProxyStatus('Enable the proxy before testing it.', true);
+      selectTab('proxy');
+      return;
+    }}
+    if (!proxy.url) {{
+      setProxyStatus('Enter a proxy URL.', true);
+      selectTab('proxy');
+      if (proxyUrl) proxyUrl.focus();
+      return;
+    }}
+    if (testBtn) testBtn.disabled = true;
+    setProxyStatus('Testing proxy...', false);
+    fetch('/api/settings/test', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ proxy: proxy }})
+    }}).then(function(r) {{
+      return r.json().then(function(data) {{
+        if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+        return data;
+      }});
+    }}).then(function(data) {{
+      var bits = ['Proxy connection OK'];
+      if (data.status) bits.push('HTTP ' + data.status);
+      if (typeof data.elapsed_ms === 'number') bits.push(data.elapsed_ms + ' ms');
+      if (data.tls_verify === false) bits.push('TLS verification off');
+      setProxyStatus(bits.join(' \u00b7 ') + '.', false);
+    }}).catch(function(err) {{
+      setProxyStatus(err.message || 'Could not reach the proxy.', true);
+    }}).then(function() {{
+      if (testBtn) testBtn.disabled = false;
+    }});
+  }}
+
+  function selectTab(name) {{
+    tabs.forEach(function(tab) {{
+      var active = tab.getAttribute('data-settings-tab') === name;
+      tab.classList.toggle('active', active);
+      tab.setAttribute('aria-selected', String(active));
+      var panel = document.getElementById(
+        'settings-panel-' + tab.getAttribute('data-settings-tab'));
+      if (panel) panel.classList.toggle('hidden', !active);
+    }});
+  }}
+
+  function setOpen(open) {{
+    if (open) {{
+      selectTab('general');
+      overlay.classList.remove('hidden');
+      document.body.classList.add('settings-open');
+      gear.setAttribute('aria-expanded', 'true');
+      if (closeBtn) closeBtn.focus();
+      loadSettings();
+    }} else {{
+      overlay.classList.add('hidden');
+      document.body.classList.remove('settings-open');
+      gear.setAttribute('aria-expanded', 'false');
+      gear.focus();
+    }}
+  }}
+
+  gear.addEventListener('click', function(event) {{
+    event.stopPropagation();
+    setOpen(true);
+  }});
+  if (closeBtn) closeBtn.addEventListener('click', function() {{ setOpen(false); }});
+  if (doneBtn) doneBtn.addEventListener('click', function() {{ setOpen(false); }});
+  if (saveBtn) saveBtn.addEventListener('click', saveSettings);
+  if (testBtn) testBtn.addEventListener('click', testProxy);
+  overlay.addEventListener('click', function(event) {{
+    if (event.target === overlay) setOpen(false);
+  }});
+  tabs.forEach(function(tab) {{
+    tab.addEventListener('click', function() {{
+      selectTab(tab.getAttribute('data-settings-tab'));
+    }});
+    tab.addEventListener('keydown', function(event) {{
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+      event.preventDefault();
+      var index = tabs.indexOf(tab);
+      var step = event.key === 'ArrowRight' ? 1 : -1;
+      var next = tabs[(index + step + tabs.length) % tabs.length];
+      selectTab(next.getAttribute('data-settings-tab'));
+      next.focus();
+    }});
+  }});
+  document.addEventListener('keydown', function(event) {{
+    if (event.key !== 'Escape' || overlay.classList.contains('hidden')) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    setOpen(false);
+  }});
+}})();
+
+(function() {{
+  var body = document.body;
+  var sidebar = document.getElementById('sidebar');
+  var toggle = document.getElementById('sidebar-toggle');
+  var arrow = toggle && toggle.querySelector('.sidebar-toggle-arrow');
+  if (!sidebar || !toggle) return;
+
+  function setOpen(open) {{
+    body.classList.toggle('sidebar-open', open);
+    toggle.setAttribute('aria-expanded', String(open));
+    toggle.setAttribute('aria-label', open ? 'Close sidebar' : 'Open sidebar');
+    toggle.title = open ? 'Close sidebar' : 'Open sidebar';
+    if (arrow) arrow.textContent = open ? '\u2039' : '\u203a';
+    sidebar.setAttribute('aria-hidden', String(!open));
+    sidebar.toggleAttribute('inert', !open);
+    try {{ localStorage.setItem('entra-audit-sidebar', open ? 'open' : 'closed'); }} catch (e) {{}}
+  }}
+  var stored = null;
+  try {{ stored = localStorage.getItem('entra-audit-sidebar'); }} catch (e) {{}}
+  setOpen(stored !== 'closed');
+  toggle.addEventListener('click', function() {{
+    setOpen(!body.classList.contains('sidebar-open'));
+  }});
+  document.addEventListener('keydown', function(e) {{
+    if (e.key === 'Escape' && body.classList.contains('sidebar-open')) {{
+      setOpen(false);
+      toggle.focus();
+    }}
+  }});
+}})();
+
+(function() {{
+  var target = document.getElementById('sidebar-principal-body');
+  if (!target) return;
+
+  function showEmpty(text) {{
+    target.innerHTML = '';
+    var span = document.createElement('span');
+    span.className = 'sidebar-principal-empty';
+    span.textContent = text;
+    target.appendChild(span);
+  }}
+
+  function render(data) {{
+    var tokens = data.tokens || [];
+    var active = null;
+    for (var i = 0; i < tokens.length; i++) {{
+      if (tokens[i].active) {{ active = tokens[i]; break; }}
+    }}
+    target.innerHTML = '';
+    if (!active) {{
+      showEmpty('No active token');
+      return;
+    }}
+    var p = active.principal || {{}};
+    var name = p.name || p.upn || 'Unredeemed refresh token';
+    var activeClient = active.client_name || active.client_id || '';
+    var sub = p.upn || (activeClient ? 'Client: ' + activeClient : '');
+    var avatar = document.createElement('span');
+    avatar.className = 'token-avatar';
+    avatar.textContent = (name || '?').trim().charAt(0).toUpperCase() || '?';
+    var info = document.createElement('div');
+    info.className = 'sidebar-principal-info';
+    var nameEl = document.createElement('div');
+    nameEl.className = 'sidebar-principal-name';
+    nameEl.textContent = name;
+    info.appendChild(nameEl);
+    if (sub) {{
+      var subEl = document.createElement('div');
+      subEl.className = 'sidebar-principal-sub';
+      subEl.textContent = sub;
+      info.appendChild(subEl);
+    }}
+    if (p.audience) {{
+      var audEl = document.createElement('div');
+      audEl.className = 'sidebar-principal-sub';
+      var aud = String(active.audience_name || p.audience || '');
+      if (aud.indexOf('https://') === 0) aud = aud.slice(8);
+      else if (aud.indexOf('http://') === 0) aud = aud.slice(7);
+      audEl.textContent = aud;
+      if (active.audience_name && p.audience) audEl.title = p.audience;
+      info.appendChild(audEl);
+    }}
+    target.appendChild(avatar);
+    target.appendChild(info);
+  }}
+
+  function refresh() {{
+    fetch('/api/tokens?enrich=0')
+      .then(function(r) {{ return r.json(); }})
+      .then(render)
+      .catch(function() {{ showEmpty('Could not load active token'); }});
+  }}
+
+  document.addEventListener('tokens:changed', refresh);
+  document.addEventListener('visibilitychange', function() {{
+    if (!document.hidden) refresh();
+  }});
+  refresh();
+}})();
+
+(function() {{
+  var nav = document.getElementById('sidebar-nav');
+  if (!nav) return;
+  var items = Array.prototype.slice.call(nav.querySelectorAll('button[data-view]'));
+  var views = Array.prototype.slice.call(document.querySelectorAll('.app-view[data-view]'));
+  function apply(view) {{
+    views.forEach(function(v) {{
+      v.classList.toggle('hidden', v.getAttribute('data-view') !== view);
+    }});
+    items.forEach(function(b) {{
+      var active = b.getAttribute('data-view') === view;
+      b.classList.toggle('active', active);
+      if (active) b.setAttribute('aria-current', 'page');
+      else b.removeAttribute('aria-current');
+    }});
+    document.dispatchEvent(new CustomEvent('app:view', {{ detail: view }}));
+    window.scrollTo(0, 0);
+  }}
+  items.forEach(function(b) {{
+    b.addEventListener('click', function() {{ apply(b.getAttribute('data-view')); }});
+  }});
 }})();
 
 (function() {{
@@ -8258,7 +8927,7 @@ def render_report(results, tenant_name, db_path, config_path,
     return '<table class="kv-table">' + rows + '</table>';
   }}
 
-  function renderSpAppTabs(prof, rec, container) {{
+  function renderSpAppTabs(prof, rec, container, activeTab) {{
     var isSp = (prof.kind || 'sp') === 'sp';
     var kvRows = [];
     if (rec) {{
@@ -8355,11 +9024,12 @@ def render_report(results, tenant_name, db_path, config_path,
         ['raw', 'Raw', rawPane]
       ];
     }}
+    var initialTab = activeTab || 'overview';
     var tabsHtml = '<div class="drawer-tabs">' + panes.map(function(pt) {{
-      return '<button type="button" class="drawer-tab' + (pt[0] === 'overview' ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pEsc(pt[1]) + '</button>';
+      return '<button type="button" class="drawer-tab' + (pt[0] === initialTab ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pEsc(pt[1]) + '</button>';
     }}).join('') + '</div>';
     var panesHtml = panes.map(function(pt) {{
-      return '<div class="dtab-pane' + (pt[0] === 'overview' ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pt[2] + '</div>';
+      return '<div class="dtab-pane' + (pt[0] === initialTab ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pt[2] + '</div>';
     }}).join('');
 
     var wrap = document.createElement('div');
@@ -8381,16 +9051,27 @@ def render_report(results, tenant_name, db_path, config_path,
       b.addEventListener('click', function() {{
         var spOid = b.getAttribute('data-sp-id');
         var spProf = PROFILES2.sp[spOid];
-        if (!spProf) return;
+        // Keep outer back rows (for example, the user drawer's "Back to user")
+        // so nested navigation does not lose its way home.
+        var outerBacks = Array.prototype.filter.call(
+          container.children, function(el) {{
+            return el.classList && el.classList.contains('drawer-back-row');
+          }});
         container.innerHTML = '';
+        outerBacks.forEach(function(row) {{ container.appendChild(row); }});
         var backRow = document.createElement('div');
         backRow.className = 'drawer-back-row';
         backRow.innerHTML = '<button type="button" class="drawer-tab drawer-back">&larr; Back to ' + pEsc(prof.application || 'application') + '</button>';
         container.appendChild(backRow);
         Array.prototype.forEach.call(backRow.querySelectorAll('.drawer-back'), function(x) {{
           x.addEventListener('click', function() {{
-            container.innerHTML = '';
-            renderSpAppTabs(prof, rec, container);
+            backRow.remove();
+            Array.prototype.forEach.call(
+              Array.prototype.slice.call(container.children),
+              function(el) {{
+                if (outerBacks.indexOf(el) < 0) el.remove();
+              }});
+            renderSpAppTabs(prof, rec, container, 'sps');
           }});
         }});
         if (spProf) {{
@@ -8649,37 +9330,52 @@ def render_report(results, tenant_name, db_path, config_path,
     }}
   }}
 
-  function renderProfileTabs(p, container) {{
+  function renderProfileTabs(p, container, activeTab) {{
     var overview = privilegeAnalysisHtml(p) + '<div class="user-desc"></div>' + openProfileHtml(p);
     var ownedLinks = (p.owned_objects || []).map(function(o) {{
-      var isGroup = o.type === 'Group';
-      var grants = (o.grants && o.grants.length)
-          ? o.grants.map(function(g) {{ return g.permission + ' @ ' + g.resource; }}).join('; ')
+      var grantsHtml = (o.grants && o.grants.length)
+          ? o.grants.map(function(g) {{
+              return '<span class="owned-grant">' + pEsc(g.permission)
+                  + ' @ ' + pEsc(g.resource) + '</span>';
+            }}).join('')
           : '—';
-      var creds = (o.pw || o.key) ? (o.pw + ' password, ' + o.key + ' key credential(s)') : '—';
+      var credParts = [];
+      if (o.pw) credParts.push(o.pw + (o.pw === 1 ? ' password' : ' passwords'));
+      if (o.key) credParts.push(o.key + (o.key === 1 ? ' key' : ' keys'));
+      var creds = credParts.length ? credParts.join(', ') : '—';
       var status = (typeof o.status === 'boolean') ? (o.status ? 'Enabled' : 'Disabled') : '—';
       var kind = o.type === 'Application' ? 'app' : 'sp';
       var nameCell = '<button type="button" class="dtab-sp-link obj-link" data-obj-id="' + o.object_id + '" data-obj-kind="' + (o.type === 'Group' ? 'group' : kind) + '">' + pEsc(o.name) + '</button>';
       return {{
         type: o.type,
         name: nameCell,
-        object_id: o.object_id, app_id: o.app_id || '—',
-        grants: grants, creds: creds, status: status
+        object_id: o.object_id,
+        grants_html: grantsHtml, creds: creds, status: status
       }};
     }});
+    var showAppColumns = ownedLinks.some(function(o) {{ return o.type !== 'Group'; }});
+    var ownedHeaders = [['Type', 'type'], ['Name', 'name']];
+    if (showAppColumns) {{
+      ownedHeaders.push(['Privileged grants', 'grants'],
+                        ['Credentials', 'creds'], ['Status', 'status']);
+    }}
     var ownedHtml = ownedLinks.length
         ? cappedTableHtml(
-            [['Type', 'type'], ['Name', 'name'], ['ObjectId', 'object_id'],
-             ['AppId', 'app_id'], ['Privileged grants', 'grants'],
-             ['Credentials', 'creds'], ['Status', 'status']],
+            ownedHeaders,
             ownedLinks.map(function(r) {{
-              return ['<td>' + pEsc(r.type) + '</td>', '<td>' + r.name + '</td>',
-                      '<td class="mono">' + pEsc(r.object_id) + '</td>',
-                      '<td class="mono">' + pEsc(r.app_id) + '</td>',
-                      '<td>' + pEsc(r.grants) + '</td>',
-                      '<td>' + pEsc(r.creds) + '</td>',
-                      '<td>' + pEsc(r.status) + '</td>'];
-            }}))
+              var cells = ['<td>' + pEsc(r.type) + '</td>',
+                           '<td>' + r.name + '</td>'];
+              if (showAppColumns) {{
+                if (r.type === 'Group') {{
+                  cells.push('<td colspan="3" class="muted">—</td>');
+                }} else {{
+                  cells.push('<td class="owned-grants">' + r.grants_html + '</td>',
+                             '<td>' + pEsc(r.creds) + '</td>',
+                             '<td>' + pEsc(r.status) + '</td>');
+                }}
+              }}
+              return cells;
+            }}), 'user-owned-table')
         : '<p class="muted">No owned objects recorded.</p>';
     var deviceLinks = (p.devices || []).map(function(d) {{
       return {{
@@ -8712,11 +9408,12 @@ def render_report(results, tenant_name, db_path, config_path,
       ['devices', 'Devices (' + (p.devices ? p.devices.length : 0) + ')', devicesHtml],
       ['raw', 'Raw', rawPane]
     ];
+    var initialTab = activeTab || 'overview';
     var tabsHtml = '<div class="drawer-tabs">' + panes.map(function(pt) {{
-      return '<button type="button" class="drawer-tab' + (pt[0] === 'overview' ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pEsc(pt[1]) + '</button>';
+      return '<button type="button" class="drawer-tab' + (pt[0] === initialTab ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pEsc(pt[1]) + '</button>';
     }}).join('') + '</div>';
     var panesHtml = panes.map(function(pt) {{
-      return '<div class="dtab-pane' + (pt[0] === 'overview' ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pt[2] + '</div>';
+      return '<div class="dtab-pane' + (pt[0] === initialTab ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pt[2] + '</div>';
     }}).join('');
     var wrap = document.createElement('div');
     wrap.className = 'drawer-tabs-wrap';
@@ -8778,6 +9475,9 @@ def render_report(results, tenant_name, db_path, config_path,
       b.addEventListener('click', function() {{
         var oid = b.getAttribute('data-obj-id');
         var kind = b.getAttribute('data-obj-kind');
+        var activeTab = container.querySelector(
+          '.drawer-tabs-wrap .drawer-tab.active');
+        var returnTab = activeTab ? activeTab.getAttribute('data-dtab') : 'overview';
         container.innerHTML = '';
         var backRow = document.createElement('div');
         backRow.className = 'drawer-back-row';
@@ -8786,7 +9486,7 @@ def render_report(results, tenant_name, db_path, config_path,
         Array.prototype.forEach.call(backRow.querySelectorAll('.drawer-back'), function(x) {{
           x.addEventListener('click', function() {{
             container.innerHTML = '';
-            renderProfileTabs(p, container);
+            renderProfileTabs(p, container, returnTab);
           }});
         }});
         var prof2 = null;
@@ -8842,13 +9542,14 @@ def render_report(results, tenant_name, db_path, config_path,
         + 'Show all (' + lis.length + ')</button>';
   }}
 
-  function cappedTableHtml(headers, rows) {{
+  function cappedTableHtml(headers, rows, tableClass) {{
+    var tableClassAttr = 'minor-table' + (tableClass ? ' ' + tableClass : '');
     function tableHtml(r) {{
-      return '<table class="minor-table"><thead><tr>'
+      return '<table class="' + tableClassAttr + '"><thead><tr>'
           + headers.map(function(c) {{ return '<th>' + pEsc(c[0]) + '</th>'; }}).join('')
           + '</tr></thead><tbody>'
           + r.map(function(row) {{
-              return '<tr>' + row.map(function(c) {{ return '<td>' + c + '</td>'; }}).join('') + '</tr>';
+              return '<tr>' + row.join('') + '</tr>';
             }}).join('')
           + '</tbody></table>';
     }}
@@ -10426,6 +11127,123 @@ SERVE_STATE = {"shell": "", "user_findings": [], "tables": {},
                "group_eligible_roles": {}, "profile_builder": None,
                "profiles_lru": {}, "details_lru": {}}
 
+
+def _install_analysis_state(results, graph, group_roles, group_eligible_roles,
+                            check_cfg, report_html, serve_tables, db_path):
+    SERVE_STATE["shell"] = report_html
+    SERVE_STATE["db_path"] = str(db_path) if db_path is not None else None
+    SERVE_STATE["ca_analysis"] = None
+    SERVE_STATE["tables"] = serve_tables or {}
+    SERVE_STATE["user_findings"] = next(
+        (res["findings"] for res in results if res["id"] == "privileged_users"), [])
+    SERVE_STATE["group_profiles"] = {
+        f["group_id"]: f for res in results if res["id"] == "groups"
+        for f in res["findings"]}
+    SERVE_STATE["policy_profiles"] = {
+        f["policy_id"]: f for res in results if res["id"] == "ca_exposure"
+        for f in res["findings"] if f.get("policy_id")}
+    SERVE_STATE["records"] = build_serve_records(results)
+    SERVE_STATE["graph"] = graph
+    SERVE_STATE["check_cfg"] = check_cfg
+    SERVE_STATE["group_roles"] = group_roles
+    SERVE_STATE["group_eligible_roles"] = group_eligible_roles
+    SERVE_STATE["profile_builder"] = None
+    SERVE_STATE["profiles_lru"] = {}
+    SERVE_STATE["details_lru"] = {}
+    SERVE_STATE.pop("ca_table_ids", None)
+
+
+def run_runtime_analysis(db_path, use_cache=True):
+    """Analyze a database chosen from the UI and swap the live report shell."""
+    db_path = Path(db_path)
+    config_path = Path(SERVE_STATE.get("config_path") or DEFAULT_CONFIG)
+    azure_config = Path(SERVE_STATE.get("azure_config_path") or DEFAULT_AZURE_CONFIG)
+    if not config_path.exists():
+        raise RuntimeError(f"config not found: {config_path}")
+    cache_path, cache_meta_path = cache_paths(db_path)
+
+    analysis.set_message("Loading database")
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        cur = conn.cursor()
+        tenant_name = None
+        try:
+            cur.execute("SELECT displayName FROM TenantDetails LIMIT 1")
+            row = cur.fetchone()
+            tenant_name = row[0] if row else None
+        except sqlite3.OperationalError:
+            pass
+        fingerprint = compute_db_fingerprint(db_path, cur)
+
+        config_resources, check_cfg = load_config(config_path)
+        azure_role_sev = load_azure_roles(azure_config)
+        check_cfg["azure_roles"] = azure_role_sev
+
+        analysis.set_message("Building graph")
+        graph = build_graph(cur)
+        apply_azure_severity(graph, azure_role_sev)
+    finally:
+        conn.close()
+
+    cached = load_cache(cache_path) if use_cache else None
+    cache_hit = bool(
+        use_cache and cached and cached.get("version") == CACHE_VERSION
+        and cached.get("fingerprint") == fingerprint)
+
+    if cache_hit:
+        analysis.set_message("Using cached analysis")
+        results = cached["results"]
+        group_roles = cached.get("group_roles") or {}
+        group_eligible_roles = cached.get("group_eligible_roles") or {}
+        tenant_summary = build_tenant_summary(graph, results)
+        diff = None
+        cache_meta = {"hit": True,
+                      "generated_at": cached.get("generated_at") or ""}
+    else:
+        analysis.set_message("Computing group roles")
+        group_roles = compute_group_roles(graph, check_cfg)
+        group_eligible_roles = compute_group_eligible_roles(graph, check_cfg)
+        sp_dir_resolver = make_sp_dir_resolver(graph, group_roles,
+                                               check_cfg["directory_roles"],
+                                               group_eligible_roles)
+
+        analysis.set_message("Running checks")
+        results = run_checks(graph, config_resources, check_cfg,
+                             group_roles=group_roles,
+                             group_eligible_roles=group_eligible_roles,
+                             sp_dir_resolver=sp_dir_resolver)
+
+        tenant_summary = build_tenant_summary(graph, results)
+        diff = compute_diff(cached.get("results", []), results) if cached else None
+        if use_cache:
+            cache_meta = {
+                "hit": False,
+                "off": False,
+                "fresh": cached is None,
+                "generated_at": datetime.datetime.now(
+                    datetime.timezone.utc).isoformat(timespec="seconds"),
+                "previous_at": cached.get("generated_at") if cached else None,
+            }
+        else:
+            cache_meta = {"hit": False, "off": True}
+
+    analysis.set_message("Rendering report")
+    serve_tables = {}
+    report_html = render_report(results, tenant_name, db_path, config_path,
+                                tenant_summary, graph=graph,
+                                serve_tables=serve_tables,
+                                group_roles=group_roles,
+                                group_eligible_roles=group_eligible_roles,
+                                cache_meta=cache_meta, diff=diff)
+    _install_analysis_state(results, graph, group_roles, group_eligible_roles,
+                            check_cfg, report_html, serve_tables, db_path)
+
+    if use_cache and not cache_hit:
+        write_analysis_cache(cache_path, cache_meta_path, db_path, fingerprint,
+                             cache_meta["generated_at"], results,
+                             tenant_summary, group_roles, group_eligible_roles)
+
+
 PROFILE_LRU_MAX = 4000
 DETAIL_LRU_MAX = 4000
 
@@ -10736,29 +11554,19 @@ def serve_table_response(table_id, qs):
         payload["fields"] = fields
         payload["thead_html"] = thead_html
         payload["colgroup_html"] = colgroup_html
-    if table_id == "owned-table":
-        # one row per owner: paginate by row, not by finding
-        rows_html, _ = entry["rows"](findings, q=row_q, sort_key=sort_key,
-                                     desc=desc, **row_kwargs)
-        total = len(rows_html)
-        pages = max(1, -(-total // size))
-        page = min(page, pages)
-        start = (page - 1) * size
-        payload.update({
-            "rows_html": "".join(rows_html[start:start + size]),
-            "total": total,
-            "page": page,
-            "pages": pages,
-            "size": size,
-        })
-        return payload, 200
-    rows, total = entry["rows"](findings, q=row_q, sort_key=sort_key,
-                                desc=desc, **row_kwargs)
-    pages = max(1, -(-total // size))
-    page = min(page, pages)
     start = (page - 1) * size
+    rows, total = entry["rows"](
+        findings, q=row_q, sort_key=sort_key, desc=desc,
+        start=start, stop=start + size, **row_kwargs)
+    pages = max(1, -(-total // size))
+    if page > pages:
+        page = pages
+        start = (page - 1) * size
+        rows, total = entry["rows"](
+            findings, q=row_q, sort_key=sort_key, desc=desc,
+            start=start, stop=start + size, **row_kwargs)
     payload.update({
-        "rows_html": "".join(rows[start:start + size]),
+        "rows_html": "".join(rows),
         "total": total,
         "page": page,
         "pages": pages,
@@ -10799,6 +11607,7 @@ def _fetch_one_detail(kind, oid):
     db_path = SERVE_STATE.get("db_path")
     if not db_path:
         return None
+    con = None
     try:
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         cur = con.cursor()
@@ -10807,10 +11616,12 @@ def _fetch_one_detail(kind, oid):
                                   {oid} if kind == "app" else set(),
                                   {oid} if kind == "user" else set(),
                                   {oid} if kind == "device" else set())
-        con.close()
         return (recs.get(kind) or {}).get(oid)
     except sqlite3.Error:
         return None
+    finally:
+        if con is not None:
+            con.close()
 
 
 def serve_profile_response(kind, oid):
@@ -11564,15 +12375,6 @@ def run_ca_analysis(db_path, progress, target_upn=None,
               "trusted_location": (None if scenario.get("trusted_location") in (None, "")
                                    else str(scenario["trusted_location"]).lower() == "true")}
 
-        def _list_match(inc, exc, value, all_token="all"):
-            if exc and (all_token in [str(e).lower() for e in exc]
-                        or (value is not None and str(value).lower() in [str(e).lower() for e in exc])):
-                return False
-            if inc and (all_token in [str(i).lower() for i in inc]
-                        or (value is not None and str(value).lower() in [str(i).lower() for i in inc])):
-                return True
-            return False
-
         def _app_axis(p):
             if not p["apps_inc"] and not p["apps_exc"]:
                 return True, None
@@ -11957,7 +12759,9 @@ def make_ca_rows_fn():
             else:
                 items = sorted(items, key=lambda r: str(
                     (r.get("fields") or {}).get(sort_key, "")).lower(), reverse=desc)
-        return [r["_html"] for r in items], len(items)
+        if stop is None:
+            stop = len(items)
+        return [r["_html"] for r in items[start:stop]], len(items)
     return rows_fn
 
 
@@ -12020,10 +12824,12 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def _send(self, body_bytes, ctype, code=200):
+    def _send(self, body_bytes, ctype, code=200, headers=None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body_bytes)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body_bytes)
 
@@ -12056,6 +12862,92 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                 data, code = serve_profile_response("user", uid)
                 self._send(json.dumps(data, default=str).encode("utf-8"),
                            "application/json; charset=utf-8", code)
+            elif path == "/api/collect/status":
+                self._send(json.dumps(collect_backend.get_status(),
+                                      default=str).encode("utf-8"),
+                           "application/json; charset=utf-8")
+            elif path == "/api/settings":
+                self._send(json.dumps(surface_settings.load_settings()).encode("utf-8"),
+                           "application/json; charset=utf-8",
+                           headers={"Cache-Control": "no-store"})
+            elif path == "/api/tokens":
+                enrich = (qs.get("enrich") or ["1"])[0].lower() not in (
+                    "0", "false", "no", "off")
+                self._send(json.dumps(
+                    collect_backend.get_auth_status(enrich=enrich)
+                ).encode("utf-8"), "application/json; charset=utf-8",
+                    headers={"Cache-Control": "no-store"})
+            elif path == "/api/tokens/clients":
+                data = collect_backend.get_token_clients()
+                self._send(json.dumps(data).encode("utf-8"),
+                           "application/json; charset=utf-8",
+                           headers={"Cache-Control": "no-store"})
+            elif path == "/api/tokens/resources":
+                token_id = (qs.get("id") or [""])[0]
+                client_id = (qs.get("client_id") or [""])[0]
+                try:
+                    data = collect_backend.get_token_resources(
+                        token_id, client_id)
+                except ValueError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 400)
+                    return
+                except RuntimeError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 500)
+                    return
+                self._send(json.dumps(data).encode("utf-8"),
+                           "application/json; charset=utf-8",
+                           headers={"Cache-Control": "no-store"})
+            elif path == "/api/databases":
+                db_dir = collect_backend.DEFAULT_DATA_DIR
+                databases = []
+                try:
+                    db_dir.mkdir(parents=True, exist_ok=True)
+                    for db_file in db_dir.glob("*.db"):
+                        if not db_file.is_file():
+                            continue
+                        stat = db_file.stat()
+                        cached = False
+                        cached_at = ""
+                        try:
+                            cache_file, meta_file = cache_paths(db_file)
+                            cache_meta = (load_cache_sidecar(meta_file)
+                                          if cache_file.is_file() else None)
+                            if cache_meta and cache_meta.get("version") == CACHE_VERSION:
+                                fingerprint = cache_meta.get("fingerprint") or []
+                                # The list only needs a cheap freshness check; the
+                                # full row-count fingerprint is recomputed when an
+                                # analysis actually starts.
+                                if (len(fingerprint) >= 2
+                                        and fingerprint[0] == stat.st_mtime_ns
+                                        and fingerprint[1] == stat.st_size):
+                                    cached = True
+                                    cached_at = cache_meta.get("generated_at") or ""
+                        except (OSError, sqlite3.Error):
+                            cached = False
+                        databases.append({
+                            "name": db_file.name,
+                            "path": str(db_file.resolve()),
+                            "size": stat.st_size,
+                            "modified": datetime.datetime.fromtimestamp(
+                                stat.st_mtime, datetime.timezone.utc
+                            ).isoformat(timespec="seconds"),
+                            "cached": cached,
+                            "cached_at": cached_at,
+                        })
+                except OSError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 500)
+                    return
+                databases.sort(key=lambda d: d["modified"], reverse=True)
+                self._send(json.dumps({
+                    "directory": str(db_dir.resolve()),
+                    "databases": databases,
+                }).encode("utf-8"), "application/json; charset=utf-8")
+            elif path == "/api/analyze/status":
+                self._send(json.dumps(analysis.get_status()).encode("utf-8"),
+                           "application/json; charset=utf-8")
             elif path == "/api/ca-analysis/status":
                 state = SERVE_STATE.get("ca_analysis")
                 if state is None:
@@ -12073,6 +12965,255 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         try:
+            if parsed.path == "/api/analyze":
+                payload = {}
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length:
+                        payload = json.loads(self.rfile.read(length) or b"{}") or {}
+                except (ValueError, json.JSONDecodeError):
+                    payload = {}
+                use_cache = payload.get("cache", True)
+                if isinstance(use_cache, str):
+                    use_cache = use_cache.strip().lower() not in (
+                        "", "0", "false", "no", "off")
+                try:
+                    state = analysis.start(
+                        payload.get("db") or "",
+                        lambda path, cache=bool(use_cache):
+                            run_runtime_analysis(path, cache))
+                except ValueError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 400)
+                    return
+                except RuntimeError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 500)
+                    return
+                self._send(json.dumps(state).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            if parsed.path == "/api/tokens":
+                payload = {}
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length:
+                        payload = json.loads(self.rfile.read(length) or b"{}") or {}
+                except (ValueError, json.JSONDecodeError):
+                    payload = {}
+                try:
+                    if payload.get("refresh_token"):
+                        state = collect_backend.set_auth(
+                            payload.get("refresh_token") or "",
+                            payload.get("client_id") or "")
+                    else:
+                        state = collect_backend.set_access_token(
+                            payload.get("access_token") or "")
+                except ValueError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 400)
+                    return
+                except RuntimeError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 500)
+                    return
+                self._send(json.dumps(state).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            if parsed.path == "/api/tokens/clear":
+                self._send(json.dumps(collect_backend.clear_auth()).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            if parsed.path == "/api/tokens/secrets":
+                payload = {}
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length:
+                        payload = json.loads(self.rfile.read(length) or b"{}") or {}
+                except (ValueError, json.JSONDecodeError):
+                    payload = {}
+                try:
+                    data = collect_backend.get_token_secrets(payload.get("id") or "")
+                except ValueError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 400)
+                    return
+                self._send(json.dumps(data).encode("utf-8"),
+                           "application/json; charset=utf-8",
+                           headers={"Cache-Control": "no-store"})
+                return
+            if parsed.path == "/api/tokens/redeem":
+                payload = {}
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length:
+                        payload = json.loads(self.rfile.read(length) or b"{}") or {}
+                except (ValueError, json.JSONDecodeError):
+                    payload = {}
+                try:
+                    state = collect_backend.redeem_saved_token(
+                        payload.get("id") or "",
+                        payload.get("target") or "",
+                        payload.get("resource") or "",
+                        payload.get("client_id") or "")
+                except ValueError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 400)
+                    return
+                except RuntimeError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 500)
+                    return
+                self._send(json.dumps(state).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            if parsed.path == "/api/tokens/update":
+                payload = {}
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length:
+                        payload = json.loads(self.rfile.read(length) or b"{}") or {}
+                except (ValueError, json.JSONDecodeError):
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                try:
+                    state = collect_backend.update_token_metadata(
+                        payload.get("id") or "",
+                        payload.get("principal"),
+                        payload.get("note") if "note" in payload else None)
+                except ValueError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 400)
+                    return
+                self._send(json.dumps(state).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            if parsed.path in ("/api/tokens/select", "/api/tokens/delete"):
+                payload = {}
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length:
+                        payload = json.loads(self.rfile.read(length) or b"{}") or {}
+                except (ValueError, json.JSONDecodeError):
+                    payload = {}
+                try:
+                    if parsed.path == "/api/tokens/select":
+                        state = collect_backend.select_token(payload.get("id") or "")
+                    else:
+                        state = collect_backend.delete_token(payload.get("id") or "")
+                except ValueError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 400)
+                    return
+                self._send(json.dumps(state).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            if parsed.path == "/api/settings/test":
+                payload = {}
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length:
+                        payload = json.loads(
+                            self.rfile.read(length) or b"{}") or {}
+                except (ValueError, json.JSONDecodeError):
+                    payload = {}
+                proxy = payload.get("proxy") if isinstance(payload, dict) else {}
+                try:
+                    result = collect_backend.test_proxy(proxy or {})
+                except ValueError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 400)
+                    return
+                except RuntimeError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 502)
+                    return
+                except OSError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 502)
+                    return
+                self._send(json.dumps(result).encode("utf-8"),
+                           "application/json; charset=utf-8",
+                           headers={"Cache-Control": "no-store"})
+                return
+            if parsed.path == "/api/settings":
+                payload = {}
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length:
+                        payload = json.loads(
+                            self.rfile.read(length) or b"{}") or {}
+                except (ValueError, json.JSONDecodeError):
+                    payload = {}
+                try:
+                    state = surface_settings.save_settings(payload)
+                except (ValueError, OSError) as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 400)
+                    return
+                self._send(json.dumps(state).encode("utf-8"),
+                           "application/json; charset=utf-8",
+                           headers={"Cache-Control": "no-store"})
+                return
+            if parsed.path == "/api/collect/stop":
+                try:
+                    state = collect_backend.stop_collection()
+                except ValueError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 400)
+                    return
+                except RuntimeError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 500)
+                    return
+                self._send(json.dumps(state).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            if parsed.path == "/api/collect":
+                payload = {}
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    raw = self.rfile.read(length) if length else b""
+                    ctype = (self.headers.get("Content-Type") or "").split(
+                        ";", 1)[0].strip().lower()
+                    if ctype == "application/x-www-form-urlencoded":
+                        payload = {k: v[0] for k, v in urllib.parse.parse_qs(
+                            raw.decode("utf-8", "replace")).items()}
+                    else:
+                        payload = json.loads(raw or b"{}") or {}
+                except (ValueError, json.JSONDecodeError):
+                    payload = {}
+
+                def _flag(name, default=False):
+                    value = payload.get(name, default)
+                    if isinstance(value, bool):
+                        return value
+                    return str(value).strip().lower() in (
+                        "1", "true", "yes", "on")
+
+                try:
+                    state = collect_backend.start_collection(
+                        refresh_token=payload.get("refresh_token") or "",
+                        out=payload.get("out") or "",
+                        client_id=(payload.get("client_id") or "").strip(),
+                        user_agent=(payload.get("user_agent") or "").strip(),
+                        backend=(payload.get("backend") or "graph").strip().lower(),
+                        evade=_flag("evade"),
+                        gather_all=_flag("gather_all"),
+                        autotoken=_flag("autotoken", True),
+                        mfa=_flag("mfa"))
+                except ValueError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 400)
+                    return
+                except RuntimeError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 500)
+                    return
+                self._send(json.dumps(state).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
             if parsed.path == "/api/ca-analysis":
                 payload = {}
                 try:
@@ -12136,12 +13277,58 @@ def start_serve(port, total=None, after_start=None):
 # new analysis is diffed against the cached one and surfaced in the report.
 
 CACHE_VERSION = 3
-CACHE_FILENAME = ".entra-surface.cache"
+CACHE_DIR = SCRIPT_DIR / "data" / "databases" / ".cache"
 
 CACHE_FINGERPRINT_TABLES = (
     "Users", "ServicePrincipals", "Applications", "Groups", "Devices",
     "RoleAssignments", "AppRoleAssignments", "AZroleAssignments", "Policys",
 )
+
+
+def cache_paths(db_path):
+    """Per-database cache and sidecar metadata paths."""
+    db = Path(db_path).resolve()
+    digest = hashlib.sha1(str(db).encode("utf-8")).hexdigest()[:16]
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", db.stem).strip("-")[:60] or "db"
+    return (CACHE_DIR / f"{safe}-{digest}.cache.gz",
+            CACHE_DIR / f"{safe}-{digest}.meta.json")
+
+
+def save_cache_sidecar(path, db_path, fingerprint, generated_at):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "version": CACHE_VERSION,
+            "db": str(Path(db_path).resolve()),
+            "fingerprint": fingerprint,
+            "generated_at": generated_at,
+        }, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(f"warning: could not write cache metadata: {exc}", file=sys.stderr)
+
+
+def load_cache_sidecar(path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_analysis_cache(cache_path, meta_path, db_path, fingerprint,
+                         generated_at, results, tenant_summary,
+                         group_roles, group_eligible_roles):
+    wrote = save_cache(cache_path, {
+        "version": CACHE_VERSION,
+        "fingerprint": fingerprint,
+        "generated_at": generated_at,
+        "results": results,
+        "tenant_summary": tenant_summary,
+        "group_roles": group_roles,
+        "group_eligible_roles": group_eligible_roles,
+    })
+    if wrote:
+        save_cache_sidecar(meta_path, db_path, fingerprint, generated_at)
 
 
 def compute_db_fingerprint(db_path, cur):
@@ -12177,13 +13364,33 @@ def save_cache(path, payload):
     """Stream the payload to the cache file in small chunks (no full deep
     copy or monolithic string) and gzip it — findings JSON compresses very
     well, keeping the save-time memory spike flat and the file small."""
+    path = Path(path)
+    tmp_path = None
     try:
-        with gzip.open(path, "wt", encoding="utf-8") as fh:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        with gzip.open(tmp_path, "wt", encoding="utf-8") as fh:
             for chunk in json.JSONEncoder(default=_json_default,
                                           separators=(",", ":")).iterencode(payload):
                 fh.write(chunk)
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, path)
+        return True
     except OSError as exc:
         print(f"warning: could not write cache: {exc}", file=sys.stderr)
+        return False
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def load_cache(path):
@@ -12224,7 +13431,9 @@ def compute_diff(old_results, new_results):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", default="roadrecon.db", help="Path to the roadrecon SQLite database (default: roadrecon.db)")
+    parser.add_argument("--db", default=None,
+                        help="Path to the roadrecon SQLite database "
+                             "(omit to serve the GUI shell with no data)")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Path to the privileged-roles config JSON (default: privileged_roles.json)")
     parser.add_argument("--azure-config", default=str(DEFAULT_AZURE_CONFIG), help="Path to the azure-roles config JSON (default: azure_roles.json)")
     parser.add_argument("--port", type=int, default=8787,
@@ -12237,8 +13446,43 @@ def main():
                         help="Print per-phase timings and peak memory at the end of the run")
     args = parser.parse_args()
 
-    db_path = Path(args.db)
+    db_path = Path(args.db) if args.db else None
     config_path = Path(args.config)
+    SERVE_STATE["config_path"] = str(config_path)
+    SERVE_STATE["azure_config_path"] = args.azure_config
+
+    if db_path is None:
+        print("no database: serving the empty GUI shell")
+        with sqlite3.connect(":memory:") as empty_conn:
+            graph = build_graph(empty_conn.cursor())
+        results = []
+        group_roles = {}
+        group_eligible_roles = {}
+        tenant_summary = build_tenant_summary(graph, results)
+        check_cfg = dict(DEFAULT_CHECK_CFG)
+        check_cfg["directory_roles"] = {}
+        check_cfg["role_labels"] = dict(DEFAULT_ROLE_LABELS)
+        check_cfg["azure_roles"] = {}
+        serve_tables = {}
+        report_html = render_report(
+            results, None, None, config_path, tenant_summary, graph=graph,
+            serve_tables=serve_tables, group_roles=group_roles,
+            group_eligible_roles=group_eligible_roles)
+        SERVE_STATE["shell"] = report_html
+        SERVE_STATE["db_path"] = None
+        SERVE_STATE["ca_analysis"] = None
+        SERVE_STATE["tables"] = serve_tables
+        SERVE_STATE["user_findings"] = []
+        SERVE_STATE["group_profiles"] = {}
+        SERVE_STATE["policy_profiles"] = {}
+        SERVE_STATE["records"] = []
+        SERVE_STATE["graph"] = graph
+        SERVE_STATE["check_cfg"] = check_cfg
+        SERVE_STATE["group_roles"] = group_roles
+        SERVE_STATE["group_eligible_roles"] = group_eligible_roles
+        SERVE_STATE["profile_builder"] = None
+        start_serve(args.port, 0)
+        return 0
 
     if not db_path.exists():
         print(f"error: database not found: {db_path}", file=sys.stderr)
@@ -12270,7 +13514,7 @@ def main():
     def now_iso():
         return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
-    cache_path = Path(CACHE_FILENAME)
+    cache_path, cache_meta_path = cache_paths(db_path)
     fingerprint = compute_db_fingerprint(db_path, cur)
     cached = None if (args.refresh or args.no_cache) else load_cache(cache_path)
     cache_hit = bool(
@@ -12365,15 +13609,10 @@ def main():
     else:
         def write_cache_now():
             print(f"Writing analysis cache to {cache_path}...", flush=True)
-            save_cache(cache_path, {
-                "version": CACHE_VERSION,
-                "fingerprint": fingerprint,
-                "generated_at": cache_meta["generated_at"],
-                "results": results,
-                "tenant_summary": tenant_summary,
-                "group_roles": group_roles,
-                "group_eligible_roles": group_eligible_roles,
-            })
+            write_analysis_cache(cache_path, cache_meta_path, db_path,
+                                 fingerprint, cache_meta["generated_at"],
+                                 results, tenant_summary, group_roles,
+                                 group_eligible_roles)
             try:
                 size = cache_path.stat().st_size
                 print(f"Analysis cache written ({size:,} bytes)", flush=True)
