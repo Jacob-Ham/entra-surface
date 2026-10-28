@@ -193,10 +193,18 @@ def start_panel_html(db_path=None) -> str:
   var btn = document.getElementById('analysis-start-btn');
   var status = document.getElementById('analysis-status');
   var startEl = document.getElementById('analysis-start');
+  var analysisView = document.querySelector('.app-view[data-view="analysis"]');
+  var analysisActive = !!(analysisView && !analysisView.classList.contains('hidden'));
+  var startWrap = document.getElementById('analysis-start-wrap');
   var currentDb = startEl
     ? (startEl.getAttribute('data-current-db') || '') : '';
   if (!btn) return;
   var lastSignature = null;
+
+  function startPanelVisible() {
+    return !!(analysisActive && startWrap
+      && !startWrap.classList.contains('hidden'));
+  }
 
   function setStatus(text, failed) {
     status.textContent = text || '';
@@ -307,11 +315,12 @@ def start_panel_html(db_path=None) -> str:
   });
 
   document.addEventListener('app:view', function(e) {
-    if (e.detail === 'analysis') loadDatabases();
+    analysisActive = e.detail === 'analysis';
+    if (startPanelVisible()) loadDatabases();
   });
-  loadDatabases();
+  if (startPanelVisible()) loadDatabases();
   setInterval(function() {
-    if (!document.hidden) loadDatabases();
-  }, 3000);
+    if (!document.hidden && startPanelVisible()) loadDatabases();
+  }, 5000);
 })();
 </script>""".replace("__CURRENT_DB__", html.escape(current_db, quote=True))

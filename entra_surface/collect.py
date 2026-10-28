@@ -148,6 +148,18 @@ def _amr_values(raw) -> list[str]:
     return values
 
 
+def _expiry_from_claims(claims: dict) -> str:
+    """Return an ISO expiry from a JWT ``exp`` claim."""
+    expires = claims.get("exp")
+    if not expires:
+        return ""
+    try:
+        return datetime.fromtimestamp(
+            int(expires), timezone.utc).isoformat(timespec="seconds")
+    except (ValueError, TypeError, OSError):
+        return ""
+
+
 def _token_summary(rec: dict, active_id: str) -> dict:
     principal = dict(rec.get("principal") or {})
     if principal.get("audience"):
@@ -161,6 +173,9 @@ def _token_summary(rec: dict, active_id: str) -> dict:
         except ValueError:
             claims = {}
         amr = _amr_values(claims.get("amr"))
+        token_expiry = _expiry_from_claims(claims)
+        if token_expiry:
+            principal["access_expires_at"] = token_expiry
     if not decoded:
         amr = _amr_values(principal.get("amr"))
     principal["amr"] = amr
@@ -242,11 +257,19 @@ def get_token_secrets(token_id: str) -> dict:
         if rec is None:
             raise ValueError("token not found")
         principal = rec.get("principal") or {}
+        access_token = rec.get("access_token") or ""
+        expires_at = principal.get("access_expires_at") or ""
+        if access_token:
+            try:
+                expires_at = (_expiry_from_claims(
+                    _decode_access_claims(access_token)) or expires_at)
+            except ValueError:
+                pass
         return {
             "id": rec.get("id") or "",
-            "access_token": rec.get("access_token") or "",
+            "access_token": access_token,
             "refresh_token": rec.get("refresh_token") or "",
-            "access_expires_at": principal.get("access_expires_at") or "",
+            "access_expires_at": expires_at,
         }
 
 
@@ -598,14 +621,7 @@ def _principal_from_claims(claims: dict) -> dict:
     if isinstance(audience, list):
         audience = ", ".join(str(a) for a in audience)
     audience = str(audience).rstrip("/")
-    expires = claims.get("exp")
-    expires_at = ""
-    if expires:
-        try:
-            expires_at = datetime.fromtimestamp(
-                int(expires), timezone.utc).isoformat(timespec="seconds")
-        except (ValueError, TypeError, OSError):
-            expires_at = ""
+    expires_at = _expiry_from_claims(claims)
     identity = (claims.get("upn") or claims.get("unique_name")
                 or claims.get("oid") or "")
     return {

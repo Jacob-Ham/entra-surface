@@ -1151,7 +1151,7 @@ def collect_ig(runner: Runner) -> None:
     except Degraded:
         pass
     try:
-        for co in runner.c.paged("/identityGovernance/entitlementManagement/connectedOrganizations"):
+        for _co in runner.c.paged("/identityGovernance/entitlementManagement/connectedOrganizations"):
             n["connectedOrgs"] += 1
     except Degraded:
         pass

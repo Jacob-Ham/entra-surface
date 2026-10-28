@@ -61,9 +61,11 @@ import hashlib
 import html
 import http.server
 import json
+import os
 import re
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -951,12 +953,6 @@ def build_graph(cur):
                     out["provider"] = parts[i + 1]
                     break
         return out
-
-    def az_scope_type(scope):
-        return az_scope_parse(scope)["type"]
-
-    def az_scope_sub(scope):
-        return az_scope_parse(scope)["sub"]
 
     def az_scope_label(scope):
         p = az_scope_parse(scope)
@@ -3106,10 +3102,6 @@ def check_groups(ctx):
             return uid
         return u.get("userPrincipalName") or u.get("displayName") or uid
 
-    def user_disp(uid):
-        u = graph["user"].get(uid)
-        return (u.get("displayName") or u.get("userPrincipalName") or uid) if u else uid
-
     def group_label(gid):
         rec = graph["group"].get(gid)
         return rec.get("displayName") if rec else gid
@@ -3873,8 +3865,6 @@ CHECK_SPECS = [
     },
 ]
 
-CHECK_IDS = {spec["id"] for spec in CHECK_SPECS}
-
 
 def run_checks(graph, config_resources, check_cfg,
                group_roles=None, group_eligible_roles=None, sp_dir_resolver=None):
@@ -4038,21 +4028,6 @@ def run_checks(graph, config_resources, check_cfg,
 # Detail-view fields (drilldown modal)
 # ---------------------------------------------------------------------------
 
-APPLICATION_DETAIL_FIELDS = [
-    "displayName", "appId", "objectId", "publisherDomain", "verifiedPublisher",
-    "availableToOtherTenants", "publicClient", "homepage", "replyUrls", "identifierUris",
-    "requiredResourceAccess", "keyCredentials", "passwordCredentials",
-    "oauth2AllowImplicitFlow", "oauth2AllowIdTokenImplicitFlow", "disabledByMicrosoftStatus",
-]
-
-SP_DETAIL_FIELDS = [
-    "displayName", "appDisplayName", "appId", "objectId", "accountEnabled",
-    "servicePrincipalType", "appOwnerTenantId", "microsoftFirstParty",
-    "appRoleAssignmentRequired", "publisherName", "managedIdentityResourceId",
-    "notificationEmailAddresses", "replyUrls", "keyCredentials", "passwordCredentials",
-    "tags", "preferredSingleSignOnMode",
-]
-
 DEVICE_DETAIL_FIELDS = [
     "displayName", "objectId", "accountEnabled", "deviceOSType", "deviceOSVersion",
     "deviceModel", "deviceManufacturer", "deviceCategory", "deviceOwnership",
@@ -4209,7 +4184,7 @@ def make_profile_builder(graph, check_cfg, group_roles=None, group_eligible_role
     Indexes the app-role assignment list (by resource and by principal) and
     the group memberships (SP -> groups) once, so building a single profile
     costs O(roles of that principal) instead of full-table scans. Profiles are
-    memoized; the batch wrapper build_entity_profiles() uses this builder."""
+    memoized."""
     role_sev = check_cfg["directory_roles"]
     role_labels = check_cfg.get("role_labels") or {}
     if group_roles is None:
@@ -4428,23 +4403,6 @@ def make_profile_builder(graph, check_cfg, group_roles=None, group_eligible_role
     return {"sp": sp_profile, "app": app_profile}
 
 
-def build_entity_profiles(graph, check_cfg, sp_ids, app_ids,
-                          group_roles=None, group_eligible_roles=None,
-                          sp_dir_resolver=None):
-    """Relationship data for every referenced SP/app drawer profile (batch
-    wrapper around make_profile_builder)."""
-    builder = make_profile_builder(graph, check_cfg, group_roles,
-                                   group_eligible_roles, sp_dir_resolver)
-    profiles = {"sp": {}, "app": {}}
-    for sp_oid in sorted(sp_ids):
-        if sp_oid in graph["sp"]:
-            profiles["sp"][sp_oid] = builder["sp"](sp_oid)
-    for app_oid in sorted(app_ids):
-        if app_oid in graph["app"]:
-            profiles["app"][app_oid] = builder["app"](app_oid)
-    return profiles
-
-
 # ---------------------------------------------------------------------------
 # HTML rendering
 # ---------------------------------------------------------------------------
@@ -4517,14 +4475,7 @@ def cap_annotate(items):
 #   * shell-rendered azure-roles tables (extras delivered via data blobs),
 #   * the client-side column manager (window.__TABLE_CATALOG).
 #
-# Extra families: "sp", "user", "group", "policy" (see COLUMN_FAMILIES).
-
-COLUMN_FAMILIES = {
-    "sp": "SP / application",
-    "user": "User",
-    "group": "Group",
-    "policy": "CA policy",
-}
+# Extra columns are declared per table in TABLE_SPECS.
 
 DASH_INNER = '<span class="muted">&mdash;</span>'
 SORT_TITLE = "Click to sort \u00b7 drag to reorder"
@@ -5730,19 +5681,39 @@ def legacy_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=No
     tid = "owned-table"
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
-    selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                            legacy_search_text,
-                            lambda f, k: legacy_sort_value(f, k, ctx))
+    items = findings
+    if q:
+        needle = q.lower()
+        items = [f for f in items if needle in legacy_search_text(f)]
+    if sort_key:
+        items = sorted(items, key=lambda f: legacy_sort_value(f, sort_key, ctx),
+                       reverse=bool(desc))
+    else:
+        items = sorted(
+            items,
+            key=lambda f: (severity_rank(f.get("severity", "Info")),
+                           str(f.get("title") or "").lower()))
+    total = sum(len(f.get("owners") or []) for f in items)
+    if stop is None:
+        stop = total
     out = []
-    for f in selected:
-        for owner in f["owners"]:
-            key = f"row-{len(out)}"
-            r = {"graph": (ctx or {}).get("graph"), "owner": owner, "tid": tid,
-                 "sp_id": f.get("principal_id"), "app_id": f.get("app_object_id")}
-            tr_attrs = (f'data-sp-id="{esc(f["principal_id"])}" '
-                        f'data-app-id="{esc(f["app_object_id"] or "")}" '
-                        f'data-owner-id="{esc(owner["object_id"])}"')
-            out.append(row_html(tid, tr_attrs, key, fields, f, r))
+    row_index = 0
+    for f in items:
+        for owner in f.get("owners") or []:
+            if row_index >= stop:
+                break
+            if row_index >= start:
+                key = f"row-{row_index}"
+                r = {"graph": (ctx or {}).get("graph"), "owner": owner,
+                     "tid": tid, "sp_id": f.get("principal_id"),
+                     "app_id": f.get("app_object_id")}
+                tr_attrs = (f'data-sp-id="{esc(f["principal_id"])}" '
+                            f'data-app-id="{esc(f["app_object_id"] or "")}" '
+                            f'data-owner-id="{esc(owner["object_id"])}"')
+                out.append(row_html(tid, tr_attrs, key, fields, f, r))
+            row_index += 1
+        if row_index >= stop:
+            break
     return out, total
 
 
@@ -6688,13 +6659,6 @@ def render_report(results, tenant_name, db_path, config_path,
 
     category_counts = Counter(res["category"] for res in results for _ in res["findings"])
 
-    EXPAND_BUTTON = '<button type="button" class="icon-btn expand-btn" aria-label="View full details">+</button>'
-
-    # ---- drawer (inline dropdown) helper ---------------------------------
-    def drawer_for(key, colspan):
-        return (f'<tr class="drawer" data-detail-for="{esc(key)}">'
-                f'<td colspan="{colspan}"><div class="drawer-body"></div></td></tr>')
-
     serve_pager = _serve_pager
     col_ctx = {"graph": graph}
     extras_blobs = {}
@@ -6722,7 +6686,7 @@ def render_report(results, tenant_name, db_path, config_path,
             return a.get("scope_mgmt") or "—"
         return "—"
 
-    def azure_roles_section(title, table_id, category, principal_header, rows, az_field):
+    def azure_roles_section(title, table_id, category, rows):
         if not rows:
             return ""
         spec = table_spec(table_id)
@@ -6825,11 +6789,10 @@ def render_report(results, tenant_name, db_path, config_path,
     {'<div class="empty">No unowned privileged applications found.</div>' if not unowned else ''}
   </section>
 """ + azure_roles_section(
-        "Azure Roles (service principals)", "azure-roles-apps", "apps", "Application / SP",
+        "Azure Roles (service principals)", "azure-roles-apps", "apps",
         az_rows_for(graph["az_sp_roles"], "sp",
                     lambda oid: ((graph["sp"].get(oid) or {}).get("displayName")
-                                 or (oid if oid in graph["sp"] else None))),
-        "azSpRoles")
+                                 or (oid if oid in graph["sp"] else None))))
 
     # ---- generic findings sections ---------------------------------------
     def generic_section(res):
@@ -6904,11 +6867,10 @@ def render_report(results, tenant_name, db_path, config_path,
     {pager}
   </section>
 """ + azure_roles_section(
-        "Azure Roles (groups)", "azure-roles-groups", "groups", "Group",
+        "Azure Roles (groups)", "azure-roles-groups", "groups",
         az_rows_for(graph["az_roles"], "group",
                     lambda gid: ((graph["group"].get(gid) or {}).get("displayName")
-                                 or (gid if gid in graph["group"] else None))),
-        "azRoles")
+                                 or (gid if gid in graph["group"] else None))))
 
     def dynamic_groups_table(res):
         dyn = [f for f in res["findings"] if f.get("dyn_rule")]
@@ -6946,12 +6908,11 @@ def render_report(results, tenant_name, db_path, config_path,
     {pager}
   </section>
 """ + azure_roles_section(
-        "Azure Roles (users)", "azure-roles-users", "users", "User",
+        "Azure Roles (users)", "azure-roles-users", "users",
         az_rows_for(graph["az_user_roles"], "user",
                     lambda uid: (lambda u: ((u.get("userPrincipalName")
                                              or u.get("displayName") or uid) if u else None))(
-                        graph["user"].get(uid))),
-        "azUsrRoles")
+                        graph["user"].get(uid))))
 
     # ---- app directory roles section --------------------------------------
     def app_dir_roles_section(res):
@@ -7002,7 +6963,6 @@ def render_report(results, tenant_name, db_path, config_path,
                 bits.append("new SPNs auto-added")
             rows.append(f"<tr><th>Desktop SSO</th><td>{esc(bits[0])}"
                         + (f' <span class="muted">({esc(bits[1])})</span>' if len(bits) > 1 else "") + "</td></tr>")
-        sync_detail = v("Synchronized users")
         if f.get("sync_count"):
             imm = f.get("immutable_count", 0)
             if imm >= f["sync_count"]:
@@ -7057,15 +7017,14 @@ def render_report(results, tenant_name, db_path, config_path,
     {pager}
   </section>
 """ + azure_roles_section(
-        "Azure Roles (synced users)", "azure-roles-ad", "ad", "User",
+        "Azure Roles (synced users)", "azure-roles-ad", "ad",
         az_rows_for(
             {uid: roles for uid, roles in graph["az_user_roles"].items()
              if (graph["user"].get(uid) or {}).get("dirSyncEnabled") in (1, True)},
             "user",
             lambda uid: (lambda u: ((u.get("userPrincipalName")
                                      or u.get("displayName") or uid) if u else None))(
-                graph["user"].get(uid))),
-        "azUsrRoles")
+                graph["user"].get(uid))))
 
     sections_html = []
     diff_entries = []
@@ -7081,6 +7040,7 @@ def render_report(results, tenant_name, db_path, config_path,
                                          e["f"].get("check_id", ""),
                                          ((e["f"].get("target") or {}).get("name")
                                           or "").lower()))
+    app_dir_rendered = False
     for res in results:
         if res["id"] == "priv_app_ownership":
             owned_html = legacy_owned_section()
@@ -7089,17 +7049,18 @@ def render_report(results, tenant_name, db_path, config_path,
             # 'Directory roles assigned to applications' renders as the
             # second table, right after the ownership table
             app_dir = next((r for r in results if r["id"] == "app_dir_roles"), None)
-            if app_dir:
+            if app_dir and not app_dir_rendered:
                 sections_html.append(app_dir_roles_section(app_dir))
+                app_dir_rendered = True
             unowned_html = legacy_unowned_section()
             if unowned_html:
                 sections_html.append(unowned_html)
         elif res["id"] == "app_dir_roles":
-            pass  # already rendered after the first table above
+            if not app_dir_rendered:
+                sections_html.append(app_dir_roles_section(res))
+                app_dir_rendered = True
         elif res["id"] == "privileged_users":
             sections_html.append(users_section(res))
-        elif res["id"] == "app_dir_roles":
-            sections_html.append(app_dir_roles_section(res))
         elif res["id"] == "groups":
             sections_html.append(groups_section(res))
             dyn_html = dynamic_groups_table(res)
@@ -11483,29 +11444,19 @@ def serve_table_response(table_id, qs):
         payload["fields"] = fields
         payload["thead_html"] = thead_html
         payload["colgroup_html"] = colgroup_html
-    if table_id == "owned-table":
-        # one row per owner: paginate by row, not by finding
-        rows_html, _ = entry["rows"](findings, q=row_q, sort_key=sort_key,
-                                     desc=desc, **row_kwargs)
-        total = len(rows_html)
-        pages = max(1, -(-total // size))
-        page = min(page, pages)
-        start = (page - 1) * size
-        payload.update({
-            "rows_html": "".join(rows_html[start:start + size]),
-            "total": total,
-            "page": page,
-            "pages": pages,
-            "size": size,
-        })
-        return payload, 200
-    rows, total = entry["rows"](findings, q=row_q, sort_key=sort_key,
-                                desc=desc, **row_kwargs)
-    pages = max(1, -(-total // size))
-    page = min(page, pages)
     start = (page - 1) * size
+    rows, total = entry["rows"](
+        findings, q=row_q, sort_key=sort_key, desc=desc,
+        start=start, stop=start + size, **row_kwargs)
+    pages = max(1, -(-total // size))
+    if page > pages:
+        page = pages
+        start = (page - 1) * size
+        rows, total = entry["rows"](
+            findings, q=row_q, sort_key=sort_key, desc=desc,
+            start=start, stop=start + size, **row_kwargs)
     payload.update({
-        "rows_html": "".join(rows[start:start + size]),
+        "rows_html": "".join(rows),
         "total": total,
         "page": page,
         "pages": pages,
@@ -11546,6 +11497,7 @@ def _fetch_one_detail(kind, oid):
     db_path = SERVE_STATE.get("db_path")
     if not db_path:
         return None
+    con = None
     try:
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         cur = con.cursor()
@@ -11554,10 +11506,12 @@ def _fetch_one_detail(kind, oid):
                                   {oid} if kind == "app" else set(),
                                   {oid} if kind == "user" else set(),
                                   {oid} if kind == "device" else set())
-        con.close()
         return (recs.get(kind) or {}).get(oid)
     except sqlite3.Error:
         return None
+    finally:
+        if con is not None:
+            con.close()
 
 
 def serve_profile_response(kind, oid):
@@ -12311,15 +12265,6 @@ def run_ca_analysis(db_path, progress, target_upn=None,
               "trusted_location": (None if scenario.get("trusted_location") in (None, "")
                                    else str(scenario["trusted_location"]).lower() == "true")}
 
-        def _list_match(inc, exc, value, all_token="all"):
-            if exc and (all_token in [str(e).lower() for e in exc]
-                        or (value is not None and str(value).lower() in [str(e).lower() for e in exc])):
-                return False
-            if inc and (all_token in [str(i).lower() for i in inc]
-                        or (value is not None and str(value).lower() in [str(i).lower() for i in inc])):
-                return True
-            return False
-
         def _app_axis(p):
             if not p["apps_inc"] and not p["apps_exc"]:
                 return True, None
@@ -12704,7 +12649,9 @@ def make_ca_rows_fn():
             else:
                 items = sorted(items, key=lambda r: str(
                     (r.get("fields") or {}).get(sort_key, "")).lower(), reverse=desc)
-        return [r["_html"] for r in items], len(items)
+        if stop is None:
+            stop = len(items)
+        return [r["_html"] for r in items[start:stop]], len(items)
     return rows_fn
 
 
@@ -12854,14 +12801,13 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                             cache_meta = (load_cache_sidecar(meta_file)
                                           if cache_file.is_file() else None)
                             if cache_meta and cache_meta.get("version") == CACHE_VERSION:
-                                conn = sqlite3.connect(
-                                    f"file:{db_file}?mode=ro", uri=True)
-                                try:
-                                    fingerprint = compute_db_fingerprint(
-                                        db_file, conn.cursor())
-                                finally:
-                                    conn.close()
-                                if cache_meta.get("fingerprint") == fingerprint:
+                                fingerprint = cache_meta.get("fingerprint") or []
+                                # The list only needs a cheap freshness check; the
+                                # full row-count fingerprint is recomputed when an
+                                # analysis actually starts.
+                                if (len(fingerprint) >= 2
+                                        and fingerprint[0] == stat.st_mtime_ns
+                                        and fingerprint[1] == stat.st_size):
                                     cached = True
                                     cached_at = cache_meta.get("generated_at") or ""
                         except (OSError, sqlite3.Error):
@@ -13236,7 +13182,7 @@ def load_cache_sidecar(path):
 def write_analysis_cache(cache_path, meta_path, db_path, fingerprint,
                          generated_at, results, tenant_summary,
                          group_roles, group_eligible_roles):
-    save_cache(cache_path, {
+    wrote = save_cache(cache_path, {
         "version": CACHE_VERSION,
         "fingerprint": fingerprint,
         "generated_at": generated_at,
@@ -13245,7 +13191,8 @@ def write_analysis_cache(cache_path, meta_path, db_path, fingerprint,
         "group_roles": group_roles,
         "group_eligible_roles": group_eligible_roles,
     })
-    save_cache_sidecar(meta_path, db_path, fingerprint, generated_at)
+    if wrote:
+        save_cache_sidecar(meta_path, db_path, fingerprint, generated_at)
 
 
 def compute_db_fingerprint(db_path, cur):
@@ -13281,14 +13228,33 @@ def save_cache(path, payload):
     """Stream the payload to the cache file in small chunks (no full deep
     copy or monolithic string) and gzip it — findings JSON compresses very
     well, keeping the save-time memory spike flat and the file small."""
+    path = Path(path)
+    tmp_path = None
     try:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with gzip.open(path, "wt", encoding="utf-8") as fh:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+        with gzip.open(tmp_path, "wt", encoding="utf-8") as fh:
             for chunk in json.JSONEncoder(default=_json_default,
                                           separators=(",", ":")).iterencode(payload):
                 fh.write(chunk)
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, path)
+        return True
     except OSError as exc:
         print(f"warning: could not write cache: {exc}", file=sys.stderr)
+        return False
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def load_cache(path):

@@ -20,6 +20,7 @@ import datetime as dt
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -58,14 +59,27 @@ class SavingProvider(TokenProvider):
         if not path_name:
             return
         path = Path(path_name)
-        path.write_text(value)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
         try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(value)
+            try:
+                os.chmod(tmp_name, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp_name, path)
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
 
     def _save(self) -> None:
-        self._write(self._rt, self._token_out)
+        if not self._token_out:
+            return
+        with self._lock:
+            self._write(self._rt, self._token_out)
 
     def get_token(self, resource: str) -> str:
         token = super().get_token(resource)
@@ -307,6 +321,7 @@ def _run_collection(graph: GraphClient, arm, args, identity: str,
                     tenant_id: str) -> int:
     Path(args.out).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
     store = Store(args.out)
+    store.reset()
     store.set_meta("started_at", dt.datetime.now(dt.UTC).isoformat())
     store.set_meta("identity", identity)
     store.set_meta("tenant_id", tenant_id)
