@@ -1,7 +1,7 @@
 """Persistent local settings for entra-surface.
 
-Only non-token preferences live here (currently the collection proxy).  The
-file is separate from ``.entra-surface-auth.json`` so proxy settings can be
+Only non-token preferences live here (the collection proxy and user agents).
+The file is separate from ``.entra-surface-auth.json`` so preferences can be
 edited without touching saved credentials.
 """
 from __future__ import annotations
@@ -25,6 +25,12 @@ DEFAULT_PROXY = {
     "no_proxy": "",
     "insecure_tls": False,
 }
+DEFAULT_USER_AGENTS = {
+    "global": "",
+    "collect": "",
+    "tokens": "",
+}
+USER_AGENT_MAX_LENGTH = 512
 
 
 def _as_bool(value) -> bool:
@@ -46,12 +52,64 @@ def _proxy_from(data) -> dict:
     return proxy
 
 
+def _user_agent_value(value, label: str = "user agent") -> str:
+    text = str(value or "").strip()
+    if len(text) > USER_AGENT_MAX_LENGTH:
+        raise ValueError(
+            f"{label} is too long (max {USER_AGENT_MAX_LENGTH} characters)")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        raise ValueError(f"{label} contains control characters")
+    try:
+        text.encode("latin-1")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{label} must contain Latin-1 characters") from exc
+    return text
+
+
+def _user_agents_from(data, strict: bool = False) -> dict:
+    agents = dict(DEFAULT_USER_AGENTS)
+    if not isinstance(data, dict):
+        return agents
+    for key in DEFAULT_USER_AGENTS:
+        if key not in data or data[key] is None:
+            continue
+        try:
+            agents[key] = _user_agent_value(data[key], f"{key} user agent")
+        except ValueError:
+            if strict:
+                raise
+            agents[key] = ""
+    return agents
+
+
 def load_settings() -> dict:
     try:
         data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         data = {}
-    return {"proxy": _proxy_from(data.get("proxy") if isinstance(data, dict) else {})}
+    if not isinstance(data, dict):
+        data = {}
+    return {
+        "proxy": _proxy_from(data.get("proxy") or {}),
+        "user_agents": _user_agents_from(data.get("user_agents") or {}),
+    }
+
+
+def effective_user_agent(area: str = "", override: str = "") -> str:
+    """Return the configured user agent for an area.
+
+    A non-empty per-run override wins.  Otherwise the area-specific setting is
+    used, falling back to the global setting and finally an empty string so the
+    caller can apply its built-in default.
+    """
+    override = _user_agent_value(override, "user agent")
+    if override:
+        return override
+    agents = load_settings()["user_agents"]
+    key = str(area or "").strip().lower()
+    if key in agents and agents[key]:
+        return agents[key]
+    return agents.get("global") or ""
 
 
 def validate_proxy(proxy: dict) -> dict:
@@ -84,12 +142,22 @@ def save_settings(data: dict) -> dict:
     if not isinstance(data, dict):
         raise ValueError("settings payload must be an object")
     proxy = validate_proxy(data.get("proxy") or {})
+    raw_agents = data.get("user_agents")
+    if raw_agents is None:
+        user_agents = load_settings()["user_agents"]
+    elif not isinstance(raw_agents, dict):
+        raise ValueError("user_agents must be an object")
+    else:
+        merged = dict(load_settings()["user_agents"])
+        merged.update(raw_agents)
+        user_agents = _user_agents_from(merged, strict=True)
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(
         prefix=".entra-surface-settings-", dir=str(SETTINGS_FILE.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({"proxy": proxy}, handle, indent=2)
+            json.dump({"proxy": proxy, "user_agents": user_agents}, handle,
+                      indent=2)
             handle.write("\n")
         try:
             os.chmod(name, 0o600)
@@ -101,7 +169,7 @@ def save_settings(data: dict) -> dict:
             os.unlink(name)
         except OSError:
             pass
-    return {"proxy": proxy}
+    return {"proxy": proxy, "user_agents": user_agents}
 
 
 def _proxy_url(proxy: dict) -> str:

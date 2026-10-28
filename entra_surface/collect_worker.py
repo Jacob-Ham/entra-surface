@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import inspect
 import json
 import os
 import sys
@@ -43,14 +44,24 @@ from graphcollect.store import Store  # noqa: E402
 from graphcollect.tls import InsecureTLSAdapter  # noqa: E402
 
 
+try:
+    _TOKEN_PROVIDER_HAS_UA = "user_agent" in inspect.signature(
+        TokenProvider.__init__).parameters
+except (TypeError, ValueError):
+    _TOKEN_PROVIDER_HAS_UA = False
+
+
 class SavingProvider(TokenProvider):
     """TokenProvider that persists the newest rotated refresh token."""
 
     def __init__(self, refresh_token: str, client_id: str, token_out: str,
                  access_out: str = "", proxies: dict | None = None,
-                 verify: bool = True):
+                 verify: bool = True, user_agent: str = ""):
+        kwargs = {}
+        if _TOKEN_PROVIDER_HAS_UA:
+            kwargs["user_agent"] = user_agent
         super().__init__(refresh_token, client_id=client_id, proxies=proxies,
-                         verify=verify)
+                         verify=verify, **kwargs)
         self._token_out = token_out
         self._access_out = access_out
         self._save()
@@ -138,9 +149,11 @@ def _load_proxy_config() -> tuple[dict | None, str, bool]:
     return proxies, str(proxy.get("no_proxy") or "").strip(), verify
 
 
-def _http_session(verify: bool):
+def _http_session(verify: bool, user_agent: str = ""):
     import requests
     session = requests.Session()
+    if user_agent:
+        session.headers["User-Agent"] = user_agent
     if not verify:
         adapter = InsecureTLSAdapter(
             pool_connections=4, pool_maxsize=8, max_retries=0)
@@ -149,43 +162,17 @@ def _http_session(verify: bool):
     return session
 
 
-def _graph_get(token: str, url: str, proxies: dict | None = None,
-               no_proxy: str = "", verify: bool = True) -> dict:
-    try:
-        if proxies and no_proxy:
-            from requests.utils import should_bypass_proxies
-            if should_bypass_proxies(url, no_proxy):
-                proxies = {}
-        session = _http_session(verify)
-        session.trust_env = proxies is None
-        r = session.get(url, headers={"Authorization": f"Bearer {token}"},
-                        timeout=20, proxies=proxies, verify=verify)
-        if r.ok:
-            data = r.json()
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        pass
-    return {}
-
-
 def _principal(provider: SavingProvider,
-               resource: str = GRAPH_RES,
-               proxies: dict | None = None,
-               no_proxy: str = "",
-               verify: bool = True) -> tuple[dict, str]:
+               resource: str = GRAPH_RES) -> tuple[dict, str]:
+    """Derive principal metadata from the access token itself.
+
+    The token carries the user/service identity (``upn``/``name``/``oid``/
+    ``tid``), so no ``/me`` or ``/organization`` calls are needed.  The tenant
+    display name is not a claim; callers can reuse a known name from the local
+    token store or display the tenant ID instead.
+    """
     token = provider.get_token(resource)
     claims = _claims(token)
-    me = {}
-    org = {}
-    if resource.rstrip("/") == GRAPH_RES:
-        me = _graph_get(token, "https://graph.microsoft.com/v1.0/me"
-                               "?$select=displayName,userPrincipalName,id,mail",
-                        proxies=proxies, no_proxy=no_proxy, verify=verify)
-        orgs = _graph_get(token, "https://graph.microsoft.com/v1.0/organization"
-                                 "?$select=displayName,id",
-                          proxies=proxies, no_proxy=no_proxy,
-                          verify=verify).get("value") or []
-        org = orgs[0] if orgs else {}
     scopes = (claims.get("scp") or "").split()
     roles = claims.get("roles") or []
     audience = claims.get("aud") or ""
@@ -196,12 +183,12 @@ def _principal(provider: SavingProvider,
     identity = (claims.get("upn") or claims.get("unique_name")
                 or claims.get("oid") or claims.get("sub") or "?")
     return {
-        "upn": me.get("userPrincipalName") or claims.get("upn") or claims.get("unique_name") or "",
-        "name": me.get("displayName") or claims.get("name") or "",
-        "object_id": me.get("id") or claims.get("oid") or "",
-        "mail": me.get("mail") or claims.get("email") or "",
-        "tenant_id": claims.get("tid") or org.get("id") or "",
-        "tenant_name": org.get("displayName") or "",
+        "upn": claims.get("upn") or claims.get("unique_name") or "",
+        "name": claims.get("name") or claims.get("app_displayname") or "",
+        "object_id": claims.get("oid") or "",
+        "mail": claims.get("email") or claims.get("mail") or "",
+        "tenant_id": claims.get("tid") or "",
+        "tenant_name": claims.get("tenant_name") or "",
         "client_id": claims.get("appid") or "",
         "audience": str(audience),
         "scopes": scopes,
@@ -220,6 +207,11 @@ def proxy_test(args) -> int:
     except RuntimeError as exc:
         print(f"[proxy] {exc}", file=sys.stderr)
         return 1
+    try:
+        user_agent = surface_settings.effective_user_agent("global")
+    except ValueError as exc:
+        print(f"[settings] {exc}", file=sys.stderr)
+        return 1
     if not proxies:
         print("[proxy] no proxy is enabled", file=sys.stderr)
         return 1
@@ -230,7 +222,7 @@ def proxy_test(args) -> int:
             print(f"[proxy] {url} matches the no-proxy list; the connection "
                   "would bypass the proxy", file=sys.stderr)
             return 1
-    session = _http_session(verify)
+    session = _http_session(verify, user_agent)
     session.trust_env = False
     started = time.monotonic()
     try:
@@ -257,19 +249,20 @@ def proxy_test(args) -> int:
 
 def probe(args) -> int:
     try:
-        proxies, no_proxy, verify = _load_proxy_config()
+        proxies, _, verify = _load_proxy_config()
+        user_agent = surface_settings.effective_user_agent("tokens")
         provider = SavingProvider(args.refresh_token, args.client_id,
                                   args.token_out, proxies=proxies,
-                                  verify=verify)
+                                  verify=verify, user_agent=user_agent)
         resource = (getattr(args, "resource_uri", "") or "").strip()
         if not resource:
             resource = PROBE_RESOURCES.get(args.resource, GRAPH_RES)
-        principal, access_token = _principal(provider, resource,
-                                             proxies=proxies,
-                                             no_proxy=no_proxy,
-                                             verify=verify)
+        principal, access_token = _principal(provider, resource)
     except AuthError as exc:
         print(f"[auth] failed: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"[settings] {exc}", file=sys.stderr)
         return 1
     except RuntimeError as exc:
         print(f"[proxy] {exc}", file=sys.stderr)
@@ -284,22 +277,27 @@ def probe(args) -> int:
 def run(args) -> int:
     try:
         proxies, no_proxy, verify = _load_proxy_config()
+        user_agent = surface_settings.effective_user_agent(
+            "collect", args.user_agent)
+        token_user_agent = user_agent
+        evade = bool(getattr(args, "evade", False))
+        if evade and not user_agent:
+            user_agent = "Microsoft ADO.NET Data Services"
         provider = SavingProvider(args.refresh_token, args.client_id,
                                   args.token_out, args.access_out,
-                                  proxies=proxies, verify=verify)
+                                  proxies=proxies, verify=verify,
+                                  user_agent=token_user_agent)
         claims = provider.claims
     except AuthError as exc:
         print(f"[auth] failed: {exc}")
+        return 1
+    except ValueError as exc:
+        print(f"[settings] {exc}")
         return 1
     except RuntimeError as exc:
         print(f"[proxy] {exc}")
         return 1
     print(f"[auth] {provider.identity} (tid: {claims.get('tid')})")
-
-    user_agent = (args.user_agent or "").strip()
-    evade = bool(getattr(args, "evade", False))
-    if evade and not user_agent:
-        user_agent = "Microsoft ADO.NET Data Services"
     graph = GraphClient(lambda: provider.get_token(GRAPH_RES), verbose=args.verbose,
                         user_agent=user_agent, batch=evade,
                         proxies=proxies, no_proxy=no_proxy, verify=verify)
@@ -371,7 +369,12 @@ def run_access(args) -> int:
     except RuntimeError as exc:
         print(f"[proxy] {exc}", file=sys.stderr)
         return 1
-    user_agent = (args.user_agent or "").strip()
+    try:
+        user_agent = surface_settings.effective_user_agent(
+            "collect", args.user_agent)
+    except ValueError as exc:
+        print(f"[settings] {exc}", file=sys.stderr)
+        return 1
     evade = bool(getattr(args, "evade", False))
     if evade and not user_agent:
         user_agent = "Microsoft ADO.NET Data Services"
@@ -396,6 +399,15 @@ def run_aadgraph(args) -> int:
     except RuntimeError as exc:
         print(f"[proxy] {exc}", file=sys.stderr)
         return 1
+    try:
+        user_agent = surface_settings.effective_user_agent(
+            "collect", args.user_agent)
+    except ValueError as exc:
+        print(f"[settings] {exc}", file=sys.stderr)
+        return 1
+    token_user_agent = user_agent
+    if args.evade and not user_agent:
+        user_agent = "Microsoft ADO.NET Data Services"
     provider = None
     if refresh:
         if not client_id:
@@ -403,7 +415,8 @@ def run_aadgraph(args) -> int:
                   "is provided", file=sys.stderr)
             return 1
         provider = SavingProvider(refresh, client_id, args.token_out,
-                                  proxies=proxies, verify=verify)
+                                  proxies=proxies, verify=verify,
+                                  user_agent=token_user_agent)
 
     use_autotoken = bool((args.autotoken and provider is not None)
                          or (refresh and not access))
@@ -435,9 +448,6 @@ def run_aadgraph(args) -> int:
     identity = (claims.get("upn") or claims.get("unique_name")
                 or claims.get("oid") or "?")
     tenant_id = claims.get("tid") or (args.tenant or "") or "myorganization"
-    user_agent = (args.user_agent or "").strip()
-    if args.evade and not user_agent:
-        user_agent = "Microsoft ADO.NET Data Services"
     print(f"[auth] {identity} (tid: {tenant_id})")
     if use_autotoken:
         def token_getter():

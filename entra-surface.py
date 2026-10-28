@@ -7458,7 +7458,7 @@ def render_report(results, tenant_name, db_path, config_path,
     margin: 2px 0 0; color: var(--text-secondary); font-size: 12px;
   }}
   .settings-tabs {{
-    display: flex; gap: 4px; padding: 10px 14px 0;
+    display: flex; flex-wrap: wrap; gap: 4px; padding: 10px 14px 0;
     border-bottom: 1px solid var(--gridline);
   }}
   .settings-tab {{
@@ -7523,9 +7523,11 @@ def render_report(results, tenant_name, db_path, config_path,
     .settings-grid {{ grid-template-columns: 1fr; }}
   }}
   .settings-foot {{
-    display: flex; justify-content: flex-end; gap: 8px;
-    padding: 12px 18px; border-top: 1px solid var(--gridline);
+    display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+    flex-wrap: wrap; padding: 12px 18px;
+    border-top: 1px solid var(--gridline);
   }}
+  .settings-foot .settings-status {{ margin: 0; flex: 1; }}
   .sidebar-nav {{ display: flex; flex-direction: column; gap: 4px; margin-top: 14px; }}
   .sidebar-nav-item {{
     display: flex; align-items: center; width: 100%;
@@ -7973,6 +7975,15 @@ def render_report(results, tenant_name, db_path, config_path,
       <button type="button" class="settings-tab active" id="settings-tab-general"
               data-settings-tab="general" role="tab" aria-selected="true"
               aria-controls="settings-panel-general">General</button>
+      <button type="button" class="settings-tab" id="settings-tab-global"
+              data-settings-tab="global" role="tab" aria-selected="false"
+              aria-controls="settings-panel-global">Global</button>
+      <button type="button" class="settings-tab" id="settings-tab-collect"
+              data-settings-tab="collect" role="tab" aria-selected="false"
+              aria-controls="settings-panel-collect">Collect</button>
+      <button type="button" class="settings-tab" id="settings-tab-tokens"
+              data-settings-tab="tokens" role="tab" aria-selected="false"
+              aria-controls="settings-panel-tokens">Tokens</button>
       <button type="button" class="settings-tab" id="settings-tab-proxy"
               data-settings-tab="proxy" role="tab" aria-selected="false"
               aria-controls="settings-panel-proxy">Proxy</button>
@@ -7989,6 +8000,56 @@ def render_report(results, tenant_name, db_path, config_path,
           <h4>Appearance</h4>
           <p class="settings-note">Use the Light / Dark toggle at the bottom of
             the sidebar.</p>
+        </div>
+      </section>
+      <section class="settings-panel hidden" id="settings-panel-global"
+               role="tabpanel" aria-labelledby="settings-tab-global">
+        <div class="settings-section">
+          <h4>User agent</h4>
+          <p class="settings-note">Applies to all outbound requests unless the
+            Collect or Tokens tab overrides it. Leave blank to use each area's
+            built-in default.</p>
+          <div class="settings-grid">
+            <label class="settings-field wide">
+              <span>Global User-Agent</span>
+              <input id="settings-ua-global" type="text" autocomplete="off"
+                     spellcheck="false" maxlength="512"
+                     placeholder="e.g. Mozilla/5.0 ...">
+            </label>
+          </div>
+        </div>
+      </section>
+      <section class="settings-panel hidden" id="settings-panel-collect"
+               role="tabpanel" aria-labelledby="settings-tab-collect">
+        <div class="settings-section">
+          <h4>Collect user agent</h4>
+          <p class="settings-note">Used for Graph, AAD Graph, and ARM collection
+            traffic, including token acquisition.</p>
+          <div class="settings-grid">
+            <label class="settings-field wide">
+              <span>Collect User-Agent</span>
+              <input id="settings-ua-collect" type="text" autocomplete="off"
+                     spellcheck="false" maxlength="512"
+                     placeholder="Leave blank to fall back to Global">
+            </label>
+          </div>
+        </div>
+      </section>
+      <section class="settings-panel hidden" id="settings-panel-tokens"
+               role="tabpanel" aria-labelledby="settings-tab-tokens">
+        <div class="settings-section">
+          <h4>Tokens user agent</h4>
+          <p class="settings-note">Used for Tokens-tab exchange/refresh and
+            token-resource metadata requests. Collection token acquisition uses
+            the Collect setting. Overrides Global in the Tokens area.</p>
+          <div class="settings-grid">
+            <label class="settings-field wide">
+              <span>Tokens User-Agent</span>
+              <input id="settings-ua-tokens" type="text" autocomplete="off"
+                     spellcheck="false" maxlength="512"
+                     placeholder="Leave blank to fall back to Global">
+            </label>
+          </div>
         </div>
       </section>
       <section class="settings-panel hidden" id="settings-panel-proxy"
@@ -8037,6 +8098,8 @@ def render_report(results, tenant_name, db_path, config_path,
       </section>
     </div>
     <div class="settings-foot">
+      <div class="settings-status hidden" id="settings-status"
+           role="status" aria-live="polite"></div>
       <button type="button" class="mode-btn" id="settings-save">Save</button>
       <button type="button" class="mode-btn" id="settings-done">Done</button>
     </div>
@@ -8123,6 +8186,10 @@ def render_report(results, tenant_name, db_path, config_path,
   var proxyNoProxy = document.getElementById('settings-proxy-no-proxy');
   var proxyInsecure = document.getElementById('settings-proxy-insecure');
   var proxyStatus = document.getElementById('settings-proxy-status');
+  var settingsStatus = document.getElementById('settings-status');
+  var uaGlobal = document.getElementById('settings-ua-global');
+  var uaCollect = document.getElementById('settings-ua-collect');
+  var uaTokens = document.getElementById('settings-ua-tokens');
   var tabs = Array.prototype.slice.call(
     document.querySelectorAll('#settings-overlay button[data-settings-tab]'));
   if (!gear || !overlay) return;
@@ -8134,6 +8201,13 @@ def render_report(results, tenant_name, db_path, config_path,
     proxyStatus.classList.toggle('error', !!failed);
   }}
 
+  function setStatus(text, failed) {{
+    if (!settingsStatus) return;
+    settingsStatus.textContent = text || '';
+    settingsStatus.classList.toggle('hidden', !text);
+    settingsStatus.classList.toggle('error', !!failed);
+  }}
+
   function fillProxy(proxy) {{
     proxy = proxy || {{}};
     if (proxyEnabled) proxyEnabled.checked = !!proxy.enabled;
@@ -8142,6 +8216,21 @@ def render_report(results, tenant_name, db_path, config_path,
     if (proxyPass) proxyPass.value = proxy.password || '';
     if (proxyNoProxy) proxyNoProxy.value = proxy.no_proxy || '';
     if (proxyInsecure) proxyInsecure.checked = !!proxy.insecure_tls;
+  }}
+
+  function fillUserAgents(userAgents) {{
+    userAgents = userAgents || {{}};
+    if (uaGlobal) uaGlobal.value = userAgents.global || '';
+    if (uaCollect) uaCollect.value = userAgents.collect || '';
+    if (uaTokens) uaTokens.value = userAgents.tokens || '';
+  }}
+
+  function userAgentPayload() {{
+    return {{
+      global: uaGlobal ? uaGlobal.value.trim() : '',
+      collect: uaCollect ? uaCollect.value.trim() : '',
+      tokens: uaTokens ? uaTokens.value.trim() : ''
+    }};
   }}
 
   function proxyPayload() {{
@@ -8165,27 +8254,30 @@ def render_report(results, tenant_name, db_path, config_path,
       }})
       .then(function(data) {{
         fillProxy(data.proxy);
+        fillUserAgents(data.user_agents);
         setProxyStatus('', false);
+        setStatus('', false);
       }})
       .catch(function(err) {{
-        setProxyStatus(err.message || 'Could not load settings.', true);
+        setStatus(err.message || 'Could not load settings.', true);
       }});
   }}
 
   function saveSettings() {{
     var proxy = proxyPayload();
+    var userAgents = userAgentPayload();
     if (proxy.enabled && !proxy.url) {{
-      setProxyStatus('Enter a proxy URL.', true);
+      setStatus('Enter a proxy URL.', true);
       selectTab('proxy');
       if (proxyUrl) proxyUrl.focus();
       return;
     }}
     if (saveBtn) saveBtn.disabled = true;
-    setProxyStatus('Saving...', false);
+    setStatus('Saving...', false);
     fetch('/api/settings', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ proxy: proxy }})
+      body: JSON.stringify({{ proxy: proxy, user_agents: userAgents }})
     }}).then(function(r) {{
       return r.json().then(function(data) {{
         if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
@@ -8193,9 +8285,10 @@ def render_report(results, tenant_name, db_path, config_path,
       }});
     }}).then(function(data) {{
       fillProxy(data.proxy);
-      setProxyStatus('Proxy settings saved.', false);
+      fillUserAgents(data.user_agents);
+      setStatus('Settings saved.', false);
     }}).catch(function(err) {{
-      setProxyStatus(err.message || 'Could not save settings.', true);
+      setStatus(err.message || 'Could not save settings.', true);
     }}).then(function() {{
       if (saveBtn) saveBtn.disabled = false;
     }});
@@ -8386,15 +8479,16 @@ def render_report(results, tenant_name, db_path, config_path,
   }}
 
   function refresh() {{
-    fetch('/api/tokens')
+    fetch('/api/tokens?enrich=0')
       .then(function(r) {{ return r.json(); }})
       .then(render)
       .catch(function() {{ showEmpty('Could not load active token'); }});
   }}
 
-  document.addEventListener('app:view', refresh);
   document.addEventListener('tokens:changed', refresh);
-  setInterval(refresh, 3000);
+  document.addEventListener('visibilitychange', function() {{
+    if (!document.hidden) refresh();
+  }});
   refresh();
 }})();
 
@@ -12761,8 +12855,12 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                            "application/json; charset=utf-8",
                            headers={"Cache-Control": "no-store"})
             elif path == "/api/tokens":
-                self._send(json.dumps(collect_backend.get_auth_status()).encode("utf-8"),
-                           "application/json; charset=utf-8")
+                enrich = (qs.get("enrich") or ["1"])[0].lower() not in (
+                    "0", "false", "no", "off")
+                self._send(json.dumps(
+                    collect_backend.get_auth_status(enrich=enrich)
+                ).encode("utf-8"), "application/json; charset=utf-8",
+                    headers={"Cache-Control": "no-store"})
             elif path == "/api/tokens/clients":
                 data = collect_backend.get_token_clients()
                 self._send(json.dumps(data).encode("utf-8"),
@@ -12949,6 +13047,28 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                 except RuntimeError as exc:
                     self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
                                "application/json; charset=utf-8", 500)
+                    return
+                self._send(json.dumps(state).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            if parsed.path == "/api/tokens/update":
+                payload = {}
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length:
+                        payload = json.loads(self.rfile.read(length) or b"{}") or {}
+                except (ValueError, json.JSONDecodeError):
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                try:
+                    state = collect_backend.update_token_metadata(
+                        payload.get("id") or "",
+                        payload.get("principal"),
+                        payload.get("note") if "note" in payload else None)
+                except ValueError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 400)
                     return
                 self._send(json.dumps(state).encode("utf-8"),
                            "application/json; charset=utf-8")

@@ -1,4 +1,5 @@
 .entra-surface-auth.json
+.entra-surface-settings.json
 data/databases/*
 !data/databases/.gitkeep
 data/token-resources/

@@ -9,9 +9,9 @@ the status to the report server.
 CLI usage:
 
     python3 -m entra_surface.collect -rt <refresh-token> -c <client-id> \
-        -o data/databases/collected.db
+        -o data/databases/entra-graph.db
     python3 -m entra_surface.collect --backend aadgraph -rt <refresh-token> \
-        -c <client-id> --evade --gather-all -o data/databases/aadgraph.db
+        -c <client-id> --evade --gather-all -o data/databases/entra-aad.db
 
 Set ENTRA_COLLECTOR_DIR to override with an external collector checkout.
 """
@@ -37,8 +37,8 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 BASE_DIR = PACKAGE_DIR.parent
 DEFAULT_COLLECTOR_DIR = PACKAGE_DIR / "collector"
 DEFAULT_DATA_DIR = BASE_DIR / "data" / "databases"
-DEFAULT_OUTPUT = DEFAULT_DATA_DIR / "collected.db"
-DEFAULT_AADGRAPH_OUTPUT = DEFAULT_DATA_DIR / "aadgraph.db"
+DEFAULT_OUTPUT = DEFAULT_DATA_DIR / "entra-graph.db"
+DEFAULT_AADGRAPH_OUTPUT = DEFAULT_DATA_DIR / "entra-aad.db"
 WORKER = PACKAGE_DIR / "collect_worker.py"
 AUTH_FILE = Path(os.environ.get("ENTRA_SURFACE_AUTH")
                  or (Path.cwd() / ".entra-surface-auth.json")).expanduser()
@@ -54,6 +54,12 @@ REDEEM_TARGETS = {
     "graph": "https://graph.microsoft.com",
     "aadgraph": "https://graph.windows.net",
 }
+PRINCIPAL_EDIT_FIELDS = (
+    "name", "upn", "identity", "object_id", "mail", "tenant_id",
+    "tenant_name",
+)
+MAX_PRINCIPAL_FIELD_LENGTH = 512
+MAX_TOKEN_NOTE_LENGTH = 2000
 MAX_LOG_LINES = 400
 
 _LOCK = threading.Lock()
@@ -161,7 +167,7 @@ def _expiry_from_claims(claims: dict) -> str:
 
 
 def _token_summary(rec: dict, active_id: str) -> dict:
-    principal = dict(rec.get("principal") or {})
+    principal, principal_key = _effective_principal(rec)
     if principal.get("audience"):
         principal["audience"] = str(principal["audience"]).rstrip("/")
     amr = []
@@ -195,6 +201,8 @@ def _token_summary(rec: dict, active_id: str) -> dict:
         "has_refresh_token": bool(rec.get("refresh_token")),
         "has_access_token": bool(rec.get("access_token")),
         "amr": amr,
+        "note": str(rec.get("note") or ""),
+        "principal_key": principal_key,
         "principal": principal,
     }
 
@@ -220,8 +228,13 @@ def _enrich_token_info(tokens: list[dict]) -> None:
             token["audience_name"] = audience_cache[key].get("name") or ""
 
 
-def get_auth_status() -> dict:
-    """Public token metadata for the Tokens tab; refresh tokens are omitted."""
+def get_auth_status(enrich: bool = True) -> dict:
+    """Public token metadata for the Tokens tab; refresh tokens are omitted.
+
+    ``enrich=False`` skips the cached entrascopes client/audience name lookup,
+    which avoids a data download for callers that only need the active-token
+    flags (for example, the sidebar and Collect tab).
+    """
     with _LOCK:
         store = _load_store()
         active_id = store.get("active_id") or ""
@@ -245,7 +258,8 @@ def get_auth_status() -> dict:
             "tokens": summaries,
             "auth_file": str(AUTH_FILE),
         }
-    _enrich_token_info(summaries)
+    if enrich:
+        _enrich_token_info(summaries)
     return result
 
 
@@ -301,6 +315,78 @@ def delete_token(token_id: str) -> dict:
             raise ValueError("token not found")
         if store.get("active_id") == token_id:
             store["active_id"] = store["tokens"][0]["id"] if store["tokens"] else ""
+        _save_store()
+    return get_auth_status()
+
+
+def update_token_metadata(token_id: str, principal: dict | None = None,
+                          note: str | None = None) -> dict:
+    """Update display metadata for a saved token.
+
+    Principal edits are stored as overrides so they survive a later token
+    redemption that merges fresh claims into ``principal``.  An empty field
+    removes its override and falls back to the token-derived claim.
+    """
+    token_id = str(token_id or "").strip()
+    if not token_id:
+        raise ValueError("token id is required")
+
+    updates = {}
+    if principal is not None:
+        if not isinstance(principal, dict):
+            raise ValueError("principal must be an object")
+        for key in PRINCIPAL_EDIT_FIELDS:
+            if key not in principal:
+                continue
+            value = principal.get(key)
+            if value is None:
+                value = ""
+            elif not isinstance(value, str):
+                raise ValueError(f"{key} must be a string")
+            value = value.strip()
+            if len(value) > MAX_PRINCIPAL_FIELD_LENGTH:
+                raise ValueError(
+                    f"{key} is too long (max {MAX_PRINCIPAL_FIELD_LENGTH} "
+                    "characters)")
+            updates[key] = value
+
+    note_value = None
+    if note is not None:
+        if not isinstance(note, str):
+            raise ValueError("note must be a string")
+        note_value = note.strip()
+        if len(note_value) > MAX_TOKEN_NOTE_LENGTH:
+            raise ValueError(
+                f"note is too long (max {MAX_TOKEN_NOTE_LENGTH} characters)")
+
+    with _LOCK:
+        store = _load_store()
+        rec = next((t for t in store["tokens"] if t.get("id") == token_id),
+                   None)
+        if rec is None:
+            raise ValueError("token not found")
+        if updates:
+            overrides = rec.get("principal_overrides")
+            if not isinstance(overrides, dict):
+                overrides = {}
+            raw = rec.get("principal")
+            if not isinstance(raw, dict):
+                raw = {}
+            for key, value in updates.items():
+                current = str(raw.get(key) or "").strip()
+                if value and value != current:
+                    overrides[key] = value
+                else:
+                    overrides.pop(key, None)
+            if overrides:
+                rec["principal_overrides"] = overrides
+            else:
+                rec.pop("principal_overrides", None)
+        if note is not None:
+            if note_value:
+                rec["note"] = note_value
+            else:
+                rec.pop("note", None)
         _save_store()
     return get_auth_status()
 
@@ -447,8 +533,12 @@ def test_proxy(proxy: dict, url: str = "") -> dict:
         prefix=".entra-proxy-test-", suffix=".json", dir=str(parent))
     path = Path(name)
     try:
+        current = surface_settings.load_settings()
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({"proxy": proxy}, handle)
+            json.dump({
+                "proxy": proxy,
+                "user_agents": current.get("user_agents") or {},
+            }, handle)
         try:
             os.chmod(path, 0o600)
         except OSError:
@@ -525,6 +615,25 @@ def _principal_key(principal: dict) -> tuple[str, str]:
         principal.get("object_id") or principal.get("oid")
         or principal.get("upn") or principal.get("identity") or "",
     )
+
+
+def _effective_principal(rec: dict) -> tuple[dict, str]:
+    """Apply local display overrides and return the principal plus group key."""
+    raw = rec.get("principal")
+    if not isinstance(raw, dict):
+        raw = {}
+    raw = dict(raw)
+    principal = dict(raw)
+    overrides = rec.get("principal_overrides")
+    if isinstance(overrides, dict):
+        for key, value in overrides.items():
+            if key in PRINCIPAL_EDIT_FIELDS and isinstance(value, str):
+                value = value.strip()
+                if value:
+                    principal[key] = value
+    tenant, identity = _principal_key(raw)
+    group_key = f"{tenant}|{identity}" if (tenant or identity) else ""
+    return principal, group_key
 
 
 def _find_access_record(store: dict, principal: dict,
@@ -1540,9 +1649,40 @@ def styles_html() -> str:
     border: 1px solid color-mix(in srgb, var(--status-critical) 28%, transparent);
     color: var(--status-critical); font-size: 12px; line-height: 1.4;
   }
+  .token-row-note {
+    margin-top: 3px; padding-left: 7px; color: var(--text-secondary);
+    border-left: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    font-size: 12px; line-height: 1.4; white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .token-edit-box { width: min(680px, 94vw); }
+  .token-edit-body {
+    display: flex; flex-direction: column; gap: 10px;
+    padding: 14px 16px 18px; overflow: auto; min-height: 0;
+  }
+  .token-edit-hint {
+    margin: 0; color: var(--text-muted); font-size: 11.5px;
+    line-height: 1.4;
+  }
+  .token-edit-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px;
+  }
+  .token-edit-grid .collect-field { margin-bottom: 10px; }
+  .token-edit-note { margin-bottom: 0; }
+  .token-edit-note textarea {
+    min-height: 78px; font-family: inherit; font-size: 12.5px;
+  }
+  .token-edit-actions {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  .token-edit-status {
+    color: var(--text-muted); font-size: 11.5px; line-height: 1.35;
+  }
+  .token-edit-status.error { color: var(--status-critical); }
   .token-empty { padding: 24px; text-align: center; color: var(--text-muted); }
   @media (max-width: 700px) {
     .collect-grid { grid-template-columns: 1fr; }
+    .token-edit-grid { grid-template-columns: 1fr; }
   }
 """
 
@@ -1565,18 +1705,13 @@ def view_html() -> str:
         <span>Output database</span>
         <input id="collect-out" type="text" spellcheck="false" value="__DEFAULT_OUT__">
       </label>
-      <label class="collect-field">
-        <span>User-Agent (optional)</span>
-        <input id="collect-ua" type="text" autocomplete="off" spellcheck="false">
-      </label>
       <label class="collect-check">
         <input type="checkbox" id="collect-evade">
         <span>Evade Graph detections (batch relationship requests)</span>
       </label>
       <div class="collect-check-note">
-        Batches up to 20 relationship GETs per request. Top-level directory
-        listings stay as normal paged requests. Uses the ADO.NET user agent
-        when no User-Agent is supplied.
+        Batches up to 20 relationship GETs per request, sets ADO.net user
+        agent by default.
       </div>
       <div class="collect-actions">
         <button type="button" class="mode-btn" id="collect-start">Start collection</button>
@@ -1592,13 +1727,6 @@ def view_html() -> str:
         <span>Output database</span>
         <input id="collect-aad-out" type="text" spellcheck="false" value="__DEFAULT_AADGRAPH_OUT__">
       </label>
-      <label class="collect-field">
-        <span>User-Agent (optional)</span>
-        <input id="collect-aad-ua" type="text" autocomplete="off" spellcheck="false">
-      </label>
-      <div class="collect-check-note">
-        AAD Graph collection recreates the output database from a fresh snapshot.
-      </div>
       <label class="collect-check">
         <input type="checkbox" id="collect-aad-autotoken" checked>
         <span>Request an AAD Graph token from the refresh token automatically</span>
@@ -1639,13 +1767,11 @@ def view_html() -> str:
 <script>
 (function() {
   var outEl = document.getElementById('collect-out');
-  var uaEl = document.getElementById('collect-ua');
   var graphEvadeEl = document.getElementById('collect-evade');
   var startBtn = document.getElementById('collect-start');
   var stopBtn = document.getElementById('collect-stop');
   var noteEl = document.getElementById('collect-note');
   var aadOutEl = document.getElementById('collect-aad-out');
-  var aadUaEl = document.getElementById('collect-aad-ua');
   var aadStartBtn = document.getElementById('collect-aad-start');
   var aadStopBtn = document.getElementById('collect-aad-stop');
   var aadNoteEl = document.getElementById('collect-aad-note');
@@ -1683,6 +1809,7 @@ def view_html() -> str:
     });
   });
   var timer = null;
+  var collectActive = false;
   var graphConfigured = false;
   var aadConfigured = false;
   var aadMode = '';
@@ -1765,7 +1892,7 @@ def view_html() -> str:
   }
 
   function refreshAuth() {
-    return fetch('/api/tokens')
+    return fetch('/api/tokens?enrich=0')
       .then(function(r) { return r.json(); })
       .then(function(data) {
         graphConfigured = !!data.configured;
@@ -1791,13 +1918,14 @@ def view_html() -> str:
 
   function poll() {
     clearTimeout(timer);
+    if (!collectActive) return;
     fetch('/api/collect/status')
       .then(function(r) { return r.json(); })
       .then(function(data) {
-        if (render(data)) timer = setTimeout(poll, 1000);
+        if (collectActive && render(data)) timer = setTimeout(poll, 1000);
       })
       .catch(function() {
-        timer = setTimeout(poll, 3000);
+        if (collectActive) timer = setTimeout(poll, 3000);
       });
   }
 
@@ -1914,7 +2042,6 @@ def view_html() -> str:
     startBackend({
       backend: 'graph',
       out: outEl.value.trim(),
-      user_agent: uaEl.value.trim(),
       evade: !!(graphEvadeEl && graphEvadeEl.checked)
     }, startBtn, setGraphNote);
   });
@@ -1927,7 +2054,6 @@ def view_html() -> str:
     var payload = {
       backend: 'aadgraph',
       out: aadOutEl.value.trim(),
-      user_agent: aadUaEl.value.trim(),
       autotoken: !!(aadAutoEl && aadAutoEl.checked),
       evade: !!(aadEvadeEl && aadEvadeEl.checked),
       gather_all: !!(aadGatherEl && aadGatherEl.checked),
@@ -1937,14 +2063,18 @@ def view_html() -> str:
   });
 
   document.addEventListener('app:view', function(e) {
-    if (e.detail === 'collect') {
+    collectActive = e.detail === 'collect';
+    if (collectActive) {
       refreshAuth();
       poll();
+    } else {
+      clearTimeout(timer);
     }
   });
-
-  refreshAuth();
-  poll();
+  document.addEventListener('visibilitychange', function() {
+    if (document.hidden) clearTimeout(timer);
+    else if (collectActive) poll();
+  });
 })();
 </script>
 """.replace("__DEFAULT_OUT__", default_out).replace(
@@ -2005,7 +2135,8 @@ def tokens_view_html() -> str:
   <div id="token-pane-collected" class="hidden">
     <div class="token-toolbar">
       <input id="token-filter-text" type="search"
-             placeholder="Filter principal, client, audience..." autocomplete="off">
+             placeholder="Filter principal, client, audience, note..."
+             autocomplete="off">
       <select id="token-filter-type">
         <option value="">All types</option>
         <option value="refresh">Refresh Token</option>
@@ -2037,6 +2168,71 @@ def tokens_view_html() -> str:
                 aria-label="Close decoded token">&times;</button>
       </div>
       <div class="token-decode-body" id="token-decode-body"></div>
+    </div>
+  </div>
+  <div class="token-decode-overlay hidden" id="token-edit-overlay"
+       role="dialog" aria-modal="true" aria-labelledby="token-edit-title">
+    <div class="token-decode-box token-edit-box">
+      <div class="token-decode-head">
+        <div>
+          <h3 id="token-edit-title">Edit token details</h3>
+          <div class="token-decode-sub" id="token-edit-sub"></div>
+        </div>
+        <button type="button" class="token-decode-close" id="token-edit-close"
+                aria-label="Close token editor">&times;</button>
+      </div>
+      <form class="token-edit-body" id="token-edit-form">
+        <p class="token-edit-hint">These values are stored in your local token
+          file and do not change the token itself. Clear a field to fall back
+          to the token's value.</p>
+        <div class="token-edit-grid">
+          <label class="collect-field">
+            <span>Principal name</span>
+            <input id="token-edit-name" type="text" autocomplete="off"
+                   placeholder="Display name">
+          </label>
+          <label class="collect-field">
+            <span>UPN</span>
+            <input id="token-edit-upn" type="text" autocomplete="off"
+                   spellcheck="false" placeholder="user@contoso.com">
+          </label>
+          <label class="collect-field">
+            <span>Email</span>
+            <input id="token-edit-mail" type="text" autocomplete="off"
+                   spellcheck="false" placeholder="user@contoso.com">
+          </label>
+          <label class="collect-field">
+            <span>Identity</span>
+            <input id="token-edit-identity" type="text" autocomplete="off"
+                   spellcheck="false" placeholder="Fallback identity">
+          </label>
+          <label class="collect-field">
+            <span>Object ID</span>
+            <input id="token-edit-object" type="text" autocomplete="off"
+                   spellcheck="false" placeholder="Directory object ID">
+          </label>
+          <label class="collect-field">
+            <span>Tenant ID</span>
+            <input id="token-edit-tenant-id" type="text" autocomplete="off"
+                   spellcheck="false" placeholder="Tenant ID">
+          </label>
+          <label class="collect-field">
+            <span>Tenant name</span>
+            <input id="token-edit-tenant-name" type="text" autocomplete="off"
+                   placeholder="contoso.onmicrosoft.com">
+          </label>
+        </div>
+        <label class="collect-field token-edit-note">
+          <span>Custom note</span>
+          <textarea id="token-edit-note" rows="3" maxlength="2000"
+                    placeholder="Optional context for this token"></textarea>
+        </label>
+        <div class="token-edit-actions">
+          <button type="submit" class="mode-btn" id="token-edit-save">Save changes</button>
+          <button type="button" class="mode-btn" id="token-edit-cancel">Cancel</button>
+          <span class="token-edit-status" id="token-edit-status"></span>
+        </div>
+      </form>
     </div>
   </div>
 </section>
@@ -2071,6 +2267,26 @@ def tokens_view_html() -> str:
   var decodeSub = document.getElementById('token-decode-sub');
   var decodeBody = document.getElementById('token-decode-body');
   var decodeClose = document.getElementById('token-decode-close');
+  var editOverlay = document.getElementById('token-edit-overlay');
+  var editForm = document.getElementById('token-edit-form');
+  var editTitle = document.getElementById('token-edit-title');
+  var editSub = document.getElementById('token-edit-sub');
+  var editClose = document.getElementById('token-edit-close');
+  var editCancel = document.getElementById('token-edit-cancel');
+  var editSave = document.getElementById('token-edit-save');
+  var editStatus = document.getElementById('token-edit-status');
+  var editNote = document.getElementById('token-edit-note');
+  var editFields = {
+    name: document.getElementById('token-edit-name'),
+    upn: document.getElementById('token-edit-upn'),
+    identity: document.getElementById('token-edit-identity'),
+    object_id: document.getElementById('token-edit-object'),
+    mail: document.getElementById('token-edit-mail'),
+    tenant_id: document.getElementById('token-edit-tenant-id'),
+    tenant_name: document.getElementById('token-edit-tenant-name')
+  };
+  var editState = null;
+  var lastEditButton = null;
   if (!saveBtn || !listEl) return;
   var lastTokenData = {tokens: []};
   var clientApps = null;
@@ -2187,6 +2403,59 @@ def tokens_view_html() -> str:
     if (decodeClose) decodeClose.focus();
   }
 
+  function findToken(id) {
+    var tokens = (lastTokenData && lastTokenData.tokens) || [];
+    for (var i = 0; i < tokens.length; i++) {
+      if (tokens[i].id === id) return tokens[i];
+    }
+    return null;
+  }
+
+  function closeEdit() {
+    if (!editOverlay) return;
+    editOverlay.classList.add('hidden');
+    editState = null;
+    if (lastEditButton && document.contains(lastEditButton)) {
+      lastEditButton.focus();
+    }
+    lastEditButton = null;
+  }
+
+  function openEdit(id, button) {
+    var token = findToken(id);
+    if (!token) {
+      flash('Token not found.', true);
+      return;
+    }
+    if (!editOverlay || !editForm) return;
+    editState = {id: id};
+    lastEditButton = button || null;
+    var p = token.principal || {};
+    if (editForm.reset) editForm.reset();
+    Object.keys(editFields).forEach(function(key) {
+      if (editFields[key]) editFields[key].value = p[key] || '';
+    });
+    if (editNote) editNote.value = token.note || '';
+    var kind = token.has_refresh_token
+      ? (token.has_access_token ? 'Refresh + access token' : 'Refresh token')
+      : 'Access token';
+    var client = token.client_name || token.client_id || '';
+    if (editTitle) editTitle.textContent = 'Edit token details';
+    if (editSub) {
+      editSub.textContent = kind + (client ? ' · ' + client : '');
+    }
+    if (editStatus) {
+      editStatus.textContent = '';
+      editStatus.classList.remove('error');
+    }
+    if (editSave) editSave.disabled = false;
+    editOverlay.classList.remove('hidden');
+    if (editFields.name) {
+      editFields.name.focus();
+      editFields.name.select();
+    }
+  }
+
   function formatDuration(ms) {
     var seconds = Math.max(0, Math.floor(ms / 1000));
     if (seconds < 60) return seconds + 's';
@@ -2278,8 +2547,9 @@ def tokens_view_html() -> str:
     }
     var query = (filterText.value || '').trim().toLowerCase();
     if (!query) return true;
-    var text = [p.name, p.upn, p.identity, t.client_id, t.client_name,
-                p.audience, t.audience_name,
+    var text = [p.name, p.upn, p.identity, p.mail, p.object_id,
+                p.tenant_id, p.tenant_name, t.note,
+                t.client_id, t.client_name, p.audience, t.audience_name,
                 (t.client_foci && t.has_refresh_token) ? 'foci' : '',
                 (Array.isArray(t.amr) ? t.amr : []).join(' '),
                 tokenHealth(t).label].join(' ').toLowerCase();
@@ -2647,6 +2917,7 @@ def tokens_view_html() -> str:
   });
 
   function principalKey(token) {
+    if (token.principal_key) return token.principal_key;
     var p = token.principal || {};
     var identity = p.object_id || p.upn || p.identity || '';
     if (!identity && !p.tenant_id) return 'token|' + token.id;
@@ -2682,6 +2953,10 @@ def tokens_view_html() -> str:
     var healthHtml = hasAccess
       ? '<span class="token-health ' + health.key + '" data-expires="'
         + esc(p.access_expires_at || '') + '">' + esc(health.label) + '</span>'
+      : '';
+    var noteLine = t.note
+      ? '<div class="token-row-note"><span class="token-row-label">Note:</span> '
+        + esc(t.note) + '</div>'
       : '';
     var secretFields = '';
     if (t.has_access_token) {
@@ -2726,6 +3001,7 @@ def tokens_view_html() -> str:
         + ' autocomplete="off" spellcheck="false">';
     }
     actions += '<button type="button" class="mode-btn" data-action="view" data-id="' + esc(t.id) + '">View tokens</button>';
+    actions += '<button type="button" class="mode-btn" data-action="edit" data-id="' + esc(t.id) + '">Edit</button>';
     actions += t.active
       ? '<span class="tag-chip tag-privileged">Active</span>'
       : '<button type="button" class="mode-btn" data-action="use" data-id="' + esc(t.id) + '">Use</button>';
@@ -2748,6 +3024,7 @@ def tokens_view_html() -> str:
       + (savedLine ? '<div class="token-row-meta">' + esc(savedLine) + '</div>' : '')
       + (usedLine ? '<div class="token-row-meta">' + esc(usedLine) + '</div>' : '')
       + (expiresLine ? '<div class="token-row-meta">' + esc(expiresLine) + '</div>' : '')
+      + noteLine
       + '</div><div class="token-row-actions">' + actions + '</div></div>'
       + '<div class="token-secret hidden" data-secret-for="' + esc(t.id) + '">'
       + secretFields + '</div>';
@@ -2781,7 +3058,7 @@ def tokens_view_html() -> str:
     return html;
   }
 
-  function renderTokens(data) {
+  function renderTokens(data, notify) {
     closeRedeemMenu();
     lastTokenData = data;
     var hadPrevious = !!listEl.querySelector('details.principal-card');
@@ -2806,7 +3083,9 @@ def tokens_view_html() -> str:
     var allTokens = data.tokens || [];
     var tokens = allTokens.filter(tokenMatches);
     countEl.textContent = String(allTokens.length);
-    document.dispatchEvent(new CustomEvent('tokens:changed'));
+    if (notify !== false) {
+      document.dispatchEvent(new CustomEvent('tokens:changed'));
+    }
     if (!tokens.length) {
       listEl.innerHTML = '<div class="token-empty">'
         + (allTokens.length
@@ -3681,14 +3960,18 @@ def tokens_view_html() -> str:
   function refresh() {
     return fetch('/api/tokens')
       .then(function(r) { return r.json(); })
-      .then(renderTokens)
+      .then(function(data) { renderTokens(data, false); })
       .catch(function() {});
   }
 
   [filterText, filterType, filterStatus, filterAudience].forEach(function(el) {
     if (!el) return;
-    el.addEventListener('input', function() { renderTokens(lastTokenData); });
-    el.addEventListener('change', function() { renderTokens(lastTokenData); });
+    el.addEventListener('input', function() {
+      renderTokens(lastTokenData, false);
+    });
+    el.addEventListener('change', function() {
+      renderTokens(lastTokenData, false);
+    });
   });
   setInterval(updateHealthLabels, 30000);
 
@@ -3793,6 +4076,8 @@ def tokens_view_html() -> str:
         btn.disabled = false;
         flash(err.message || 'Could not load tokens.', true);
       });
+    } else if (action === 'edit') {
+      openEdit(id, btn);
     } else if (action === 'use') {
       fetch('/api/tokens/select', {
         method: 'POST',
@@ -3821,10 +4106,58 @@ def tokens_view_html() -> str:
     tab.addEventListener('click', function() {
       closeRedeemMenu();
       closeClientMenu();
+      closeEdit();
       showPane(tab.getAttribute('data-token-view'));
       flash('', false);
     });
   });
+
+  if (editForm) {
+    editForm.addEventListener('submit', function(event) {
+      event.preventDefault();
+      if (!editState || (editSave && editSave.disabled)) return;
+      var principal = {};
+      Object.keys(editFields).forEach(function(key) {
+        if (editFields[key]) principal[key] = editFields[key].value.trim();
+      });
+      var note = editNote ? editNote.value.trim() : '';
+      if (editSave) editSave.disabled = true;
+      if (editStatus) {
+        editStatus.textContent = 'Saving...';
+        editStatus.classList.remove('error');
+      }
+      fetch('/api/tokens/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: editState.id, principal: principal, note: note
+        })
+      }).then(function(r) {
+        return r.json().then(function(data) {
+          if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+          return data;
+        });
+      }).then(function(data) {
+        renderTokens(data);
+        flash('Token details updated.', false);
+        if (editSave) editSave.disabled = false;
+        closeEdit();
+      }).catch(function(err) {
+        if (editSave) editSave.disabled = false;
+        if (editStatus) {
+          editStatus.textContent = err.message || 'Could not update token.';
+          editStatus.classList.add('error');
+        }
+      });
+    });
+  }
+  if (editClose) editClose.addEventListener('click', closeEdit);
+  if (editCancel) editCancel.addEventListener('click', closeEdit);
+  if (editOverlay) {
+    editOverlay.addEventListener('click', function(event) {
+      if (event.target === editOverlay) closeEdit();
+    });
+  }
 
   if (decodeClose) decodeClose.addEventListener('click', closeDecode);
   if (decodeOverlay) {
@@ -3837,6 +4170,10 @@ def tokens_view_html() -> str:
         && !decodeOverlay.classList.contains('hidden')) {
       event.preventDefault();
       closeDecode();
+    } else if (event.key === 'Escape' && editOverlay
+        && !editOverlay.classList.contains('hidden')) {
+      event.preventDefault();
+      closeEdit();
     }
   });
 
@@ -3847,10 +4184,10 @@ def tokens_view_html() -> str:
       closeRedeemMenu();
       closeClientMenu();
       closeDecode();
+      closeEdit();
     }
   });
 
-  refresh();
 })();
 </script>
 """.replace("__AUTH_FILE__", html.escape(str(AUTH_FILE)))
@@ -3865,10 +4202,10 @@ def main(argv=None) -> int:
     ap.add_argument("-c", "--client-id", default="",
                     help="public client id used to redeem the token")
     ap.add_argument("-o", "--out", default=None,
-                    help="output database (default: data/databases/collected.db "
-                         "or data/databases/aadgraph.db)")
+                    help="output database (default: data/databases/entra-graph.db "
+                         "or data/databases/entra-aad.db)")
     ap.add_argument("-ua", "--user-agent", default="",
-                    help="custom User-Agent for HTTP requests")
+                    help="override the Collect/Global User-Agent for this run")
     ap.add_argument("--backend", choices=("graph", "aadgraph"), default="graph",
                     help="collection backend")
     ap.add_argument("--autotoken", action="store_true",

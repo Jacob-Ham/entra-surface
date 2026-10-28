@@ -18,6 +18,8 @@ import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
+from . import settings as surface_settings
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 CACHE_DIR = BASE_DIR / "data" / "token-resources"
 BASE_URL = "https://entrascopes.com"
@@ -98,8 +100,10 @@ ERROR_TTL = 60
 
 def _fetch(name: str):
     url = f"{BASE_URL}/{SOURCES[name]}"
+    user_agent = (surface_settings.effective_user_agent("tokens")
+                  or "entra-surface-token-resources/1.0")
     request = urllib.request.Request(
-        url, headers={"User-Agent": "entra-surface-token-resources/1.0"})
+        url, headers={"User-Agent": user_agent})
     with urllib.request.urlopen(request, timeout=30) as response:
         raw = response.read()
     data = json.loads(raw)
