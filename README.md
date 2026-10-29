@@ -2,13 +2,13 @@
 
 Entra ID attack-surface report from a [ROADrecon](https://github.com/dirkjanm/ROADtools) database. It runs the configured checks and serves a sortable, filterable HTML report with drilldowns. The sidebar switches between **Analysis**, **Collect**, and **Tokens**.
 
-<img width="1384" height="808" alt="image" src="https://github.com/user-attachments/assets/18f39b77-cd95-468b-9bcb-989b336af9c9" />
-
 ## Requirements
 
 - Python 3
 - A ROADrecon SQLite database (optional)
 - For collection: `msal`, `requests`, and `PySocks` from `requirements.txt`
+
+
 
 ## Collection
 
@@ -40,18 +40,18 @@ Omit `--db` to start with an empty GUI shell; use **Analysis** to load a databas
 | `--no-cache` | Disable the analysis cache |
 | `--timing` | Print per-phase timings and peak memory |
 
-## Collect
+## Analysis
 
-- **Graph:** bundled collector under `entra_surface/collector`. Output defaults to `data/databases/entra-graph.db`. Uses the active token.
-- **AAD Graph:** legacy collector based on ROADrecon 2.0. Output defaults to `data/databases/entra-aad.db`. Uses the active token.
-- **Dependencies:** `msal`, `requests`, and `PySocks`; no ROADRecon package. Override the backend with `ENTRA_COLLECTOR_DIR`.
-- **Throttling:** 429 backoffs appear in the log with the wait time and running count.
 
-Headless AAD Graph collection:
+- **Tabs:** Apps / Service principals, Users, Active Directory / On-prem, Groups, Conditional Access Policies, Azure Arc.
+- **Column manager:** add, remove, and reorder columns per table.
+- **Filters:** free text plus advanced queries (`field:value`, `contains:`, `AND`/`OR`/`NOT`, `uniq:column`).
+- **Drawers:** details, roles, owners, Azure RBAC, and raw records; PIM-eligible roles open a PIM detail table.
+- **Azure Arc:** Arc machines, role holders, onboarding service principals, and resource providers.
 
-```sh
-python3 -m entra_surface.collect --backend aadgraph -rt <refresh-token> -c <client-id> --evade --gather-all -o data/databases/entra-aad.db
-```
+
+<img width="1675" height="922" alt="image" src="https://github.com/user-attachments/assets/463f1a8c-8826-411b-82b5-7d8541f5909b" />
+
 
 ## Tokens
 
@@ -63,18 +63,16 @@ python3 -m entra_surface.collect --backend aadgraph -rt <refresh-token> -c <clie
 - Resource and client lists use the cached entrascopes dataset.
 - Tokens are stored in `.entra-surface-auth.json` (mode `0600`, gitignored).
 
+<img width="1660" height="827" alt="image" src="https://github.com/user-attachments/assets/ac080aed-8d93-48a3-b0b5-06598a3b6577" />
+
+
+
 ## Settings
 
 - **User agents:** **Global** applies to all outbound requests; **Collect** covers Graph/AAD Graph/ARM collection including token acquisition, and **Tokens** covers Tokens-tab exchanges and token-resource metadata. Area settings override Global.
 - **Proxy:** HTTP, HTTPS, SOCKS4, and SOCKS5 for collection and token refresh, with optional auth and no-proxy hosts for Graph, ARM, and AAD Graph.
 
-## Analysis
 
-- **Tabs:** Apps / Service principals, Users, Active Directory / On-prem, Groups, Conditional Access Policies, Azure Arc.
-- **Column manager:** add, remove, and reorder columns per table.
-- **Filters:** free text plus advanced queries (`field:value`, `contains:`, `AND`/`OR`/`NOT`, `uniq:column`).
-- **Drawers:** details, roles, owners, Azure RBAC, and raw records; PIM-eligible roles open a PIM detail table.
-- **Azure Arc:** Arc machines, role holders, onboarding service principals, and resource providers.
 
 Credits:
 
