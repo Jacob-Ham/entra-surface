@@ -50,7 +50,8 @@ Omit `--db` to start with an empty GUI shell; use **Analysis** to load a databas
 - **Azure Arc:** Arc machines, role holders, onboarding service principals, and resource providers.
 
 
-<img width="1675" height="922" alt="image" src="https://github.com/user-attachments/assets/463f1a8c-8826-411b-82b5-7d8541f5909b" />
+<img width="1364" height="739" alt="image" src="https://github.com/user-attachments/assets/08b333e7-10be-4312-b07e-9083f6f81b7a" />
+
 
 
 ## Tokens
@@ -62,8 +63,7 @@ Omit `--db` to start with an empty GUI shell; use **Analysis** to load a databas
 - Refresh-token rows link to the client in entrascopes.
 - Resource and client lists use the cached entrascopes dataset.
 - Tokens are stored in `.entra-surface-auth.json` (mode `0600`, gitignored).
-
-<img width="1660" height="827" alt="image" src="https://github.com/user-attachments/assets/ac080aed-8d93-48a3-b0b5-06598a3b6577" />
+<img width="1368" height="618" alt="image" src="https://github.com/user-attachments/assets/20a292d7-103c-42d0-add6-70320b63fb7c" />
 
 
 
