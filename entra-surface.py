@@ -25,6 +25,9 @@ Checks (config: privileged_roles.json -> "checks"):
   app_dir_roles           - applications (service principals) holding directory
                             roles, assigned directly or via group membership
                             (incl. nesting); rated by the most critical role
+  app_inventory           - full application / service-principal roster: every
+                            service principal plus any application registration
+                            without a local SP (unprivileged objects stay Info)
   privileged_users        - full user roster: one row per user; privileged users are
                             rated by directory roles (assigned and eligible), owned
                             privileged apps / role-carrying SPs, and role-capable group
@@ -1756,6 +1759,127 @@ def check_app_directory_roles(ctx):
     return findings
 
 
+def check_app_inventory(ctx):
+    """Exhaustive application / service-principal roster.
+
+    One row per service principal, plus any application registration that has
+    no local service principal (a registration is otherwise represented by its
+    linked SP). Privileges are seeded from configured app-role grants and then
+    raised by the shared directory-role pass; everything else stays Info.
+    """
+    graph = ctx["graph"]
+    resource_index = ctx["resource_index"]
+    findings = []
+
+    grant_sev = {}
+    grant_count = defaultdict(int)
+    assignment_count = defaultdict(int)
+    for ra in graph["role_assigns"]:
+        if ra["principal_type"] != "ServicePrincipal":
+            continue
+        assignment_count[ra["principal_id"]] += 1
+        role_info = (resource_index.get(ra["resource_id"]) or {}).get(ra["app_role_id"])
+        if not role_info:
+            continue
+        grant_count[ra["principal_id"]] += 1
+        current = grant_sev.get(ra["principal_id"], "Info")
+        if severity_rank(role_info["severity"]) < severity_rank(current):
+            grant_sev[ra["principal_id"]] = role_info["severity"]
+
+    def owner_dicts(owner_ids):
+        out = []
+        for uid in sorted(owner_ids):
+            rec = graph["user"].get(uid)
+            if not rec:
+                continue
+            out.append({
+                "object_id": uid,
+                "display_name": rec.get("displayName") or "",
+                "upn": rec.get("userPrincipalName") or "",
+                "enabled": bool(rec.get("accountEnabled")),
+                "source": ("AD" if rec.get("dirSyncEnabled") in (1, True)
+                           else "Cloud"),
+                "ad_dn": rec.get("onPremisesDistinguishedName") or "",
+                "ad_sid": rec.get("onPremisesSecurityIdentifier") or "",
+                "immutable_id": rec.get("immutableId") or "",
+            })
+        return out
+
+    def emit(name, object_type, oid, sp_oids, app_oids, app_id, sp_type,
+             pw, kc, role_count, severity, status, extra=""):
+        owner_ids = set()
+        for sp_oid in sp_oids:
+            owner_ids |= set(graph["sp_owners"].get(sp_oid, set()))
+        for app_oid in app_oids:
+            owner_ids |= set(graph["app_owners"].get(app_oid, set()))
+        evidence = (f"{object_type} · {pw} password + {kc} key credential(s) · "
+                    f"{role_count} app-role assignment(s)")
+        if extra:
+            evidence += " · " + extra
+        f = make_finding(
+            check_id="app_inventory", category="apps",
+            severity=severity,
+            title=f"{object_type}: {name}",
+            evidence=evidence,
+            remediation=("Confirm the application is still required, ensure it has an "
+                         "accountable owner, and remove unused credentials or grants."),
+            primary_id=oid,
+            object_ids={"sp": set(sp_oids), "app": set(app_oids),
+                        "user": owner_ids},
+            target={"type": object_type, "name": name, "id": oid},
+            status=status,
+        )
+        f["display_name"] = name
+        f["inventory_type"] = object_type
+        f["inventory_app_id"] = app_id
+        f["inventory_sp_type"] = sp_type
+        f["inventory_owners"] = owner_dicts(owner_ids)
+        f["pw"] = pw
+        f["keys"] = kc
+        f["roles"] = role_count
+        findings.append(f)
+
+    for oid, rec in graph["sp"].items():
+        app_oids = sorted(graph["app_by_appid"].get(rec.get("appId"), []))
+        name = sp_display_name(rec)
+        if app_oids:
+            name = (graph["app"][app_oids[0]].get("displayName") or name)
+        pw = len(json_list(rec.get("passwordCredentials")))
+        kc = len(json_list(rec.get("keyCredentials")))
+        for app_oid in app_oids:
+            app_rec = graph["app"].get(app_oid) or {}
+            pw += len(json_list(app_rec.get("passwordCredentials")))
+            kc += len(json_list(app_rec.get("keyCredentials")))
+        enabled = bool(rec.get("accountEnabled")) and not rec.get("deletionTimestamp")
+        extra = []
+        if not app_oids:
+            extra.append("no local application registration")
+        if rec.get("deletionTimestamp"):
+            extra.append("deletion pending")
+        if grant_count.get(oid):
+            extra.append(f"{grant_count[oid]} privileged app-role grant(s)")
+        emit(name, "Service Principal", oid, [oid], app_oids,
+             rec.get("appId") or "", rec.get("servicePrincipalType") or "",
+             pw, kc, assignment_count.get(oid, 0),
+             grant_sev.get(oid, "Info"),
+             {"label": "Enabled" if enabled else "Disabled", "enabled": enabled},
+             " · ".join(extra))
+
+    for oid, rec in graph["app"].items():
+        if graph["sp_by_appid"].get(rec.get("appId")):
+            continue  # represented by the linked service principal row
+        emit(rec.get("displayName") or oid, "Application registration", oid,
+             [], [oid], rec.get("appId") or "", "",
+             len(json_list(rec.get("passwordCredentials"))),
+             len(json_list(rec.get("keyCredentials"))), 0, "Info", None,
+             "no local service principal")
+
+    findings.sort(key=lambda f: (severity_rank(f["severity"]),
+                                 (f["target"]["name"] or "").lower(),
+                                 f.get("inventory_type") or ""))
+    return findings
+
+
 def check_privileged_users(ctx):
     """Aggregate every privilege signal we can attribute per user into one finding.
 
@@ -2666,8 +2790,7 @@ def check_ad_sync_summary(ctx):
     elif onprem or writeback["count"]:
         auth_mode = "PHS or PTA"
         auth_short = "PHS / PTA"
-        auth_detail = ("writeback requires the AD DS connector; collected data "
-                       "does not distinguish PHS from PTA")
+        auth_detail = "(collected data does not distinguish PHS from PTA)"
     else:
         auth_mode = "Unknown"
         auth_short = ""
@@ -3547,15 +3670,16 @@ def _arc_roles_filtered(roles):
 
 def _sp_password_credentials(graph, oid):
     """Combined password credentials of a service principal and its app
-    registration: (count, most recent start date, per-credential note lines).
-    Defensive against both Graph 'startDateTime' and legacy 'startDate' key
-    spellings, and against SPs without a local app registration."""
+    registration: (count, most recent start date, latest end date,
+    per-credential note lines). Defensive against both Graph 'startDateTime'
+    and legacy 'startDate' key spellings, and against SPs without a local app
+    registration."""
     rec = (graph.get("sp") or {}).get(oid) or {}
     creds = list(json_list(rec.get("passwordCredentials")))
     for a_oid in (graph.get("app_by_appid") or {}).get(rec.get("appId")) or []:
         a_rec = (graph.get("app") or {}).get(a_oid) or {}
         creds += list(json_list(a_rec.get("passwordCredentials")))
-    starts, lines = [], []
+    starts, ends, lines = [], [], []
     for i, c in enumerate(creds):
         if not isinstance(c, dict):
             continue
@@ -3564,9 +3688,12 @@ def _sp_password_credentials(graph, oid):
         name = c.get("displayName") or c.get("customKeyIdentifier") or f"secret {i + 1}"
         if start:
             starts.append(start)
+        if end:
+            ends.append(end)
         lines.append(f"{name}: {start or '?'} \u2192 {end or '?'}")
     last = max(starts) if starts else ""
-    return len(creds), last, "\n".join(lines)
+    expiry = max(ends) if ends else ""
+    return len(creds), last, expiry, "\n".join(lines)
 
 
 def check_azure_arc_machines(ctx):
@@ -3644,12 +3771,13 @@ def check_azure_arc_sps(ctx):
             continue
         if not include_disabled and (not rec.get("accountEnabled") or rec.get("deletionTimestamp")):
             continue
-        pw, pw_last, pw_note = _sp_password_credentials(graph, oid)
+        pw, pw_last, pw_expiry, pw_note = _sp_password_credentials(graph, oid)
         app_oids = set((graph.get("app_by_appid") or {}).get(rec.get("appId")) or [])
         emit("Service Principal", oid,
              rec.get("displayName") or rec.get("appDisplayName") or oid,
              bool(rec.get("accountEnabled")), tagged, arc_roles,
              {"sp": {oid}, "app": app_oids}, {"pw": pw, "pw_last_set": pw_last,
+                                               "pw_expiry": pw_expiry,
                                                "pw_creds_note": pw_note})
 
     for uid in sorted(graph["az_user_roles"]):
@@ -3777,6 +3905,13 @@ CHECK_SPECS = [
         "run": check_app_directory_roles,
     },
     {
+        "id": "app_inventory",
+        "category": "apps",
+        "title": "All applications / service principals",
+        "description": "",
+        "run": check_app_inventory,
+    },
+    {
         "id": "privileged_users",
         "category": "users",
         "title": "Users",
@@ -3848,19 +3983,14 @@ CHECK_SPECS = [
         "id": "azure_arc_sps",
         "category": "arc",
         "title": "Azure Arc access",
-        "description": ("Principals holding Azure Arc ARM roles — matched by the built-in "
-                        "role-definition GUIDs — and service principals created through the "
-                        "Arc deployment wizard (AzureArcSPN tag). Arc role holders can "
-                        "onboard machines and run commands on onboarded servers."),
+        "description": "Principals holding Azure Arc ARM roles",
         "run": check_azure_arc_sps,
     },
     {
         "id": "azure_arc_providers",
         "category": "arc",
         "title": "Azure Arc resource providers",
-        "description": ("First-party Microsoft Arc service principals present in the tenant "
-                        "(matched by appId) — at least one subscription is configured with "
-                        "the resource providers required for Arc."),
+        "description": "First-party Microsoft Arc service principals present in the tenant",
         "run": check_azure_arc_providers,
     },
 ]
@@ -4169,11 +4299,45 @@ def fetch_full_details(cur, sp_ids, app_ids, user_ids, device_ids=None):
 
     sp_records = fetch_all("ServicePrincipals", "objectId", sp_ids, None)
     sp_records = enrich_sp_raw(sp_records)
+    device_records = fetch_all("Devices", "objectId", device_ids or set(),
+                               DEVICE_DETAIL_FIELDS)
+    if device_records:
+        # Device drawers carry the registered owners (name / UPN / object id)
+        # alongside the device record so the drawer is useful without opening
+        # each owner separately.
+        try:
+            owner_by_device = {}
+            for chunk in chunked(list(device_records), SQLITE_IN_CHUNK):
+                placeholders = ",".join("?" * len(chunk))
+                cur.execute(f'SELECT Device, "User" FROM lnk_device_owner '
+                            f'WHERE Device IN ({placeholders})', chunk)
+                for did, uid in cur.fetchall():
+                    if did and uid:
+                        owner_by_device.setdefault(did, set()).add(uid)
+            owner_ids = set()
+            for ids in owner_by_device.values():
+                owner_ids |= ids
+            owner_records = fetch_all("Users", "objectId", owner_ids,
+                                      USER_DETAIL_FIELDS)
+            for did, rec in device_records.items():
+                owners = []
+                for uid in sorted(owner_by_device.get(did, ())):
+                    user = owner_records.get(uid) or {}
+                    owners.append({
+                        "name": user.get("displayName") or uid,
+                        "upn": user.get("userPrincipalName") or "",
+                        "objectId": uid,
+                        "enabled": bool(user.get("accountEnabled")),
+                    })
+                if owners:
+                    rec["owners"] = owners
+        except sqlite3.OperationalError:
+            pass
     return {
         "sp": sp_records,
         "app": fetch_all("Applications", "objectId", app_ids, None),
         "user": fetch_all("Users", "objectId", user_ids, USER_DETAIL_FIELDS),
-        "device": fetch_all("Devices", "objectId", device_ids or set(), DEVICE_DETAIL_FIELDS),
+        "device": device_records,
     }
 
 
@@ -4569,6 +4733,7 @@ FIELD_META = {
     "arcTag": {"label": "Arc marker", "width": 120},
     "arcAzRoles": {"label": "Azure roles", "width": 320},
     "pwLastSet": {"label": "Password last set", "width": 130},
+    "pwExpiry": {"label": "Expiration date", "width": 130},
     "arcProvider": {"label": "Provider service", "width": 210},
 }
 
@@ -5180,6 +5345,14 @@ def _cell_pw_last_set(f, r):
     return (f'<span class="perm" title="{esc(note)}">{esc(v[:10])}</span>', v[:10])
 
 
+def _cell_pw_expiry(f, r):
+    v = f.get("pw_expiry") or ""
+    if not v:
+        return _dash_pair()
+    note = f.get("pw_creds_note") or v
+    return (f'<span class="perm" title="{esc(note)}">{esc(v[:10])}</span>', v[:10])
+
+
 def _cell_arc_provider(f, r):
     v = f.get("arc_provider") or ""
     return esc(v), v
@@ -5268,6 +5441,7 @@ FIELD_RENDERERS = {
     "arcTag": _cell_arc_tag,
     "arcAzRoles": _cell_arc_az_roles,
     "pwLastSet": _cell_pw_last_set,
+    "pwExpiry": _cell_pw_expiry,
     "arcProvider": _cell_arc_provider,
 }
 
@@ -5332,6 +5506,16 @@ TABLE_SPECS = {
         "extras": [("owner", "user"), ("ownerUpn", "user"), ("ownerStatus", "user")]
                   + USER_OWNER_EXTRAS + [("appId", "sp"), ("spType", "sp")],
     },
+    "app-inventory-table": {
+        "family": "sp",
+        "defaults": ["severity", "app", "targetType", "appId", "spType",
+                     "status", "pw", "keys", "roleCount", "appDirRoles", "owner"],
+        "extras": [("ownerUpn", "user"), ("ownerStatus", "user")]
+                  + USER_OWNER_EXTRAS + [("id", "sp")],
+        "labels": {"targetType": "Object type",
+                   "roleCount": "App role assignments",
+                   "appDirRoles": "Directory roles"},
+    },
     "ad-sync-users-table": {
         "family": "user",
         "defaults": ["adUser", "adUpn", "adCn", "adDn", "adSid", "adPw",
@@ -5373,7 +5557,7 @@ TABLE_SPECS = {
     "arc-principals-table": {
         "family": "arc",
         "defaults": ["arcPrincipal", "arcPrincipalType", "arcTag", "arcAzRoles",
-                     "pw", "pwLastSet", "arcStatus"],
+                     "pw", "pwLastSet", "pwExpiry", "arcStatus"],
         "extras": [("appId", "sp"), ("owner", "user"), ("ownerUpn", "user"),
                    ("ownerStatus", "user")],
     },
@@ -5839,7 +6023,7 @@ def arc_search_text(f):
     parts = [f.get("machine_name") or "", f.get("arc_principal") or "",
              f.get("arc_provider") or "", f.get("arc_sub") or "",
              f.get("arc_rg") or "", f.get("arc_resource_id") or "",
-             f.get("severity") or ""]
+             f.get("pw_expiry") or "", f.get("severity") or ""]
     parts += [a.get("role", "") for a in f.get("arc_roles", [])]
     if f.get("arc_tagged"):
         parts.append("AzureArcSPN")
@@ -5868,6 +6052,8 @@ def arc_sort_value(f, key, ctx=None):
         return f.get("pw") or 0
     if key == "pwLastSet":
         return (f.get("pw_last_set") or "").lower()
+    if key == "pwExpiry":
+        return (f.get("pw_expiry") or "").lower()
     if key == "arcStatus":
         st = f.get("arc_status") or {}
         return (st.get("label") or "").lower()
@@ -6019,6 +6205,82 @@ def app_dir_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=N
             r["owner"] = sp_owner_dict(sp_id, (ctx or {}).get("graph"))
         tr_attrs = f'data-sp-id="{esc(sp_id)}"'
         out.append(row_html(tid, tr_attrs, key, fields, f, r))
+    return out, total
+
+
+# ---- app / service-principal inventory rows ----------------------------------
+
+def app_inventory_search_text(f):
+    t = f.get("target") or {}
+    owners = f.get("inventory_owners") or []
+    roles = ", ".join(r["name"] for r in f.get("dir_role_tags", []))
+    return " ".join([
+        t.get("name") or "", f.get("inventory_type") or "",
+        f.get("inventory_app_id") or "", f.get("inventory_sp_type") or "",
+        (f.get("status") or {}).get("label") or "", f.get("severity") or "",
+        " ".join(o.get("display_name") or "" for o in owners),
+        " ".join(o.get("upn") or "" for o in owners), roles,
+    ]).lower()
+
+
+def app_inventory_sort_value(f, key, ctx=None):
+    t = f.get("target") or {}
+    owners = f.get("inventory_owners") or []
+    owner = owners[0] if owners else {}
+    if key == "severity":
+        return severity_rank(f.get("severity", "Info"))
+    if key == "app":
+        return (t.get("name") or f.get("display_name") or "").lower()
+    if key == "targetType":
+        return (f.get("inventory_type") or "").lower()
+    if key == "appId":
+        return (f.get("inventory_app_id") or "").lower()
+    if key == "spType":
+        return (f.get("inventory_sp_type") or "").lower()
+    if key == "status":
+        return 0 if (f.get("status") or {}).get("enabled") else 1
+    if key == "pw":
+        return f.get("pw") or 0
+    if key == "keys":
+        return f.get("keys") or 0
+    if key == "roleCount":
+        return f.get("roles") or 0
+    if key == "appDirRoles":
+        return ", ".join(r["name"] for r in f.get("dir_role_tags", [])).lower()
+    if key == "id":
+        return (t.get("id") or "").lower()
+    if key in OWNER_FIELDS:
+        if key == "owner":
+            return (owner.get("display_name") or "").lower()
+        if key == "ownerUpn":
+            return (owner.get("upn") or "").lower()
+        if key == "ownerStatus":
+            return 0 if owner.get("enabled") else 1
+        return owner_attr_sort_value(
+            graph_user_record((ctx or {}).get("graph"), owner.get("object_id")), key)
+    return 0
+
+
+def app_inventory_rows_html(findings, q="", sort_key=None, desc=False, start=0,
+                            stop=None, columns=None, ctx=None):
+    tid = "app-inventory-table"
+    spec = table_spec(tid)
+    fields = list(columns) if columns else list(spec["defaults"])
+    selected, total = page_rows(findings, q, sort_key, desc, start, stop,
+                                app_inventory_search_text,
+                                lambda f, k: app_inventory_sort_value(f, k, ctx))
+    out = []
+    for f in selected:
+        o = f.get("object_ids") or {}
+        sp_id = next(iter(sorted(o.get("sp") or ())), "")
+        app_id = next(iter(sorted(o.get("app") or ())), "")
+        owners = f.get("inventory_owners") or []
+        owner_id = owners[0].get("object_id") if owners else ""
+        r = {"graph": (ctx or {}).get("graph"), "tid": tid, "sp_id": sp_id,
+             "app_id": app_id, "owner": owners[0] if owners else None}
+        tr_attrs = (f'data-sp-id="{esc(sp_id)}" data-app-id="{esc(app_id)}" '
+                    f'data-owner-id="{esc(owner_id)}"')
+        out.append(row_html(tid, tr_attrs, f"row-{len(out)}", fields, f, r))
     return out, total
 
 
@@ -6932,6 +7194,24 @@ def render_report(results, tenant_name, db_path, config_path,
   </section>
 """
 
+    # ---- all applications / service principals ---------------------------
+    def app_inventory_section(res):
+        rows_html = catalog_rows("app-inventory-table", res["findings"],
+                               app_inventory_rows_html, app_inventory_search_text)
+        pager = serve_pager()
+        return f"""
+  <section data-category="apps">
+    <h2>{esc(res["title"])}</h2>
+    <div class="table-scroll">
+    <table id="app-inventory-table" class="findings" data-serve="1">
+      {table_head_html("app-inventory-table")}
+      <tbody>{rows_html}</tbody>
+    </table>
+    </div>
+    {pager}
+  </section>
+"""
+
     # ---- ad_sync_engine assessment card --------------------------------------
     def ad_summary_card(res):
         f = res["findings"][0]
@@ -7059,6 +7339,8 @@ def render_report(results, tenant_name, db_path, config_path,
             if not app_dir_rendered:
                 sections_html.append(app_dir_roles_section(res))
                 app_dir_rendered = True
+        elif res["id"] == "app_inventory":
+            sections_html.append(app_inventory_section(res))
         elif res["id"] == "privileged_users":
             sections_html.append(users_section(res))
         elif res["id"] == "groups":
@@ -7183,7 +7465,7 @@ def render_report(results, tenant_name, db_path, config_path,
         "severity", "category", "check", "roles", "eligible", "grproles",
         "dynmods", "dynattrs", "adtags", "targettype", "status", "hybrid",
         "userstatus", "spstatus", "ownerstatus", "adstatus", "polstate",
-        "resource", "permission",
+        "resource", "permission", "appid", "sptype", "appdirroles",
         "arcmachine", "arcprincipal", "arcprincipaltype", "arctag",
         "arcazroles", "arcprovider", "arcsub", "arcrg", "arcstatus",
     }
@@ -8548,8 +8830,10 @@ def render_report(results, tenant_name, db_path, config_path,
     azApp: 'Application / SP', azUser: 'User', azGroup: 'Group',
     azScopeType: 'Scope Type', azSub: 'Subscription', azRg: 'Resource Group',
     azProvider: 'Provider', azResource: 'Resource',
-    appId: 'App ID', spType: 'SP type', polType: 'Policy type',
-    polCreated: 'Created', polModified: 'Last modified', immutableId: 'Immutable ID'
+    appId: 'App ID', spType: 'SP type', appDirRoles: 'Directory roles',
+    pwLastSet: 'Password last set', pwExpiry: 'Expiration date',
+    polType: 'Policy type', polCreated: 'Created', polModified: 'Last modified',
+    immutableId: 'Immutable ID'
   }};
   var DRILLDOWN_COLUMNS = {{
     owner:      ['app', 'resource', 'permission', 'severity', 'spStatus'],
@@ -9794,6 +10078,45 @@ def render_report(results, tenant_name, db_path, config_path,
     return wrap;
   }}
 
+  function deviceSection(record) {{
+    var owners = (record && record.owners) || [];
+    var data = {{}};
+    if (record) {{
+      Object.keys(record).forEach(function(k) {{
+        if (k !== 'owners') data[k] = record[k];
+      }});
+    }}
+    var wrap = section('Device', data);
+    var ownerWrap = document.createElement('div');
+    ownerWrap.className = 'detail-section';
+    var h4 = document.createElement('h4');
+    h4.textContent = 'Owners';
+    ownerWrap.appendChild(h4);
+    if (owners.length) {{
+      var ul = document.createElement('ul');
+      ul.className = 'profile-list';
+      owners.forEach(function(o) {{
+        var upn = o.upn || '';
+        var label = upn || o.name || o.objectId || '';
+        var bits = [];
+        if (o.name && o.name !== label) bits.push(o.name);
+        if (o.enabled === false) bits.push('disabled');
+        var li = document.createElement('li');
+        li.innerHTML = '<span class="mono">' + pEsc(label) + '</span>'
+            + (bits.length ? ' <span class="muted">(' + pEsc(bits.join(', ')) + ')</span>' : '');
+        ul.appendChild(li);
+      }});
+      ownerWrap.appendChild(ul);
+    }} else {{
+      var p = document.createElement('p');
+      p.className = 'muted';
+      p.textContent = 'No owners recorded.';
+      ownerWrap.appendChild(p);
+    }}
+    wrap.appendChild(ownerWrap);
+    return wrap;
+  }}
+
   function drawerFor(row) {{
     var key = row.getAttribute('data-detail-key');
     if (!key) return null;
@@ -9917,7 +10240,11 @@ def render_report(results, tenant_name, db_path, config_path,
     var done = [];
     function finish() {{
       done.forEach(function(pair) {{
-        var label = pair[0] === 'device' ? 'Device' : pair[0] === 'app' ? 'Application' : 'Service Principal';
+        if (pair[0] === 'device') {{
+          body.appendChild(deviceSection(pair[2]));
+          return;
+        }}
+        var label = pair[0] === 'app' ? 'Application' : 'Service Principal';
         body.appendChild(section(label, pair[2]));
       }});
       if (!body.children.length) body.appendChild(mutedP('No additional details captured for this object.'));
@@ -11255,6 +11582,8 @@ SERVE_FIELD_LABELS = {
     "resource": "Resource", "permission": "Permission", "spStatus": "SP Status",
     "target": "Target", "targetType": "Target Type", "id": "Object ID",
     "status": "Target Status", "pw": "Passwords", "keys": "Keys", "roleCount": "Role assignment",
+    "appId": "App ID", "spType": "SP type", "appDirRoles": "Directory roles",
+    "pwLastSet": "Password last set", "pwExpiry": "Expiration date",
     "userUpn": "UPN", "roles": "Directory roles", "eligible": "Eligible roles",
     "privApps": "Privileged apps owned",
     "capGroups": "Role-capable group memberships", "grpOwned": "Groups owned",
@@ -11298,6 +11627,7 @@ def _serve_table_id(res_id):
         "groups": "groups-table",
         "ad_sync_users": "ad-sync-users-table",
         "app_dir_roles": "app-dir-roles-table",
+        "app_inventory": "app-inventory-table",
         "ca_exposure": "table-ca_exposure",
         "azure_arc_machines": "arc-machines-table",
         "azure_arc_sps": "arc-principals-table",
@@ -11387,6 +11717,30 @@ def serve_field_map(table_id, f, owner=None):
             "status": (f.get("status") or {}).get("label") or "",
             "severity": f.get("severity", "Info"),
         })
+    elif table_id == "app-inventory-table":
+        t = f.get("target") or {}
+        owners = f.get("inventory_owners") or []
+        fields.update({
+            "app": f.get("display_name") or t.get("name") or "",
+            "targetType": f.get("inventory_type") or t.get("type") or "",
+            "appId": f.get("inventory_app_id") or "",
+            "spType": f.get("inventory_sp_type") or "",
+            "status": (f.get("status") or {}).get("label") or "",
+            "pw": str(f.get("pw")) if f.get("pw") is not None else "",
+            "keys": str(f.get("keys")) if f.get("keys") is not None else "",
+            "roleCount": str(f.get("roles")) if f.get("roles") is not None else "",
+            "appDirRoles": ", ".join(r["name"] for r in f.get("dir_role_tags", [])),
+            "owner": ", ".join(o.get("display_name") or "" for o in owners),
+            "ownerUpn": ", ".join(o.get("upn") or "" for o in owners),
+            "ownerStatus": ", ".join("Enabled" if o.get("enabled") else "Disabled"
+                                     for o in owners),
+            "ownerSource": ", ".join(o.get("source") or "" for o in owners),
+            "ownerAdDn": ", ".join(o.get("ad_dn") or "" for o in owners),
+            "ownerAdSid": ", ".join(o.get("ad_sid") or "" for o in owners),
+            "ownerImmutableId": ", ".join(o.get("immutable_id") or "" for o in owners),
+            "id": t.get("id") or "",
+            "severity": f.get("severity", "Info"),
+        })
     elif table_id == "arc-machines-table":
         fields.update({
             "arcMachine": f.get("machine_name") or "",
@@ -11403,6 +11757,7 @@ def serve_field_map(table_id, f, owner=None):
             "arcAzRoles": ", ".join(a.get("role", "") for a in f.get("arc_roles", [])),
             "pw": str(f.get("pw")) if f.get("pw") is not None else "",
             "pwLastSet": (f.get("pw_last_set") or "")[:10],
+            "pwExpiry": (f.get("pw_expiry") or "")[:10],
             "arcStatus": (f.get("arc_status") or {}).get("label") or "",
         })
     elif table_id == "arc-providers-table":
@@ -13276,7 +13631,7 @@ def start_serve(port, total=None, after_start=None):
 # when the database fingerprint is unchanged; when the database changed, the
 # new analysis is diffed against the cached one and surfaced in the report.
 
-CACHE_VERSION = 3
+CACHE_VERSION = 5
 CACHE_DIR = SCRIPT_DIR / "data" / "databases" / ".cache"
 
 CACHE_FINGERPRINT_TABLES = (

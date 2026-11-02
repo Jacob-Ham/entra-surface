@@ -2090,9 +2090,8 @@ def tokens_view_html() -> str:
     """Markup and JS for the Tokens view (add + collected token tabs)."""
     return r"""<section class="collect-panel tokens-panel">
   <h1>Tokens</h1>
-  <p class="sub">Refresh and access tokens for the collector. They are stored in
-    <span class="mono">__AUTH_FILE__</span> and never sent back to the browser
-    until explicitly revealed.</p>
+  <p class="sub">Refresh and access tokens, stored in
+    <span class="mono">__AUTH_FILE__</span></p>
   <div class="drawer-tabs token-tabs" id="token-tabs">
     <button type="button" class="drawer-tab active" data-token-view="collected">Collected tokens <span class="tab-count" id="token-count">0</span></button>
     <button type="button" class="drawer-tab" data-token-view="add">Add token</button>
