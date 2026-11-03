@@ -1319,6 +1319,27 @@ def build_resource_role_index(graph, config_resources):
     return index, resource_display_names
 
 
+def app_role_grant_severity(graph, resource_index):
+    """Highest configured app-role permission severity per service principal.
+
+    Only permissions present in `resource_index` (the Critical/High entries in
+    the config) are considered. The result drives the rating of findings that
+    describe a credential or a foreign principal: those checks should inherit
+    the underlying grant severity instead of hardcoding Critical.
+    """
+    out = {}
+    for ra in graph["role_assigns"]:
+        if ra["principal_type"] != "ServicePrincipal":
+            continue
+        role_info = (resource_index.get(ra["resource_id"]) or {}).get(ra["app_role_id"])
+        if not role_info:
+            continue
+        current = out.get(ra["principal_id"], "Info")
+        if severity_rank(role_info["severity"]) < severity_rank(current):
+            out[ra["principal_id"]] = role_info["severity"]
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Checks
 # ---------------------------------------------------------------------------
@@ -1472,6 +1493,7 @@ def check_priv_app_ownership(ctx):
 def check_sp_credentials(ctx):
     graph, include_disabled = ctx["graph"], ctx["include_disabled"]
     priv_ids, role_ids = ctx["priv_sp_ids"], ctx["role_sp_ids"]
+    grant_sev = app_role_grant_severity(graph, ctx["resource_index"])
     findings = []
 
     def emit(name, type_label, id_, sp_oids, app_oid, pw, kc, role_count):
@@ -1482,12 +1504,16 @@ def check_sp_credentials(ctx):
         sp = graph["sp"].get(sp_oids[0]) if sp_oids else None
         if not include_disabled and sp and (not sp.get("accountEnabled") or sp.get("deletionTimestamp")):
             return
-        if has_priv and sp is not None and sp.get("appRoleAssignmentRequired") == 0:
-            severity = "Critical"
-        elif has_priv:
-            severity = "High"
-        else:
-            severity = "Medium"
+        # Follow the configured grant severity. appRoleAssignmentRequired is
+        # not a severity switch: a Critical grant is still a takeover path when
+        # explicit assignment is required.
+        severity = "Info"
+        for sp_oid in sp_oids:
+            grant = grant_sev.get(sp_oid)
+            if grant and severity_rank(grant) < severity_rank(severity):
+                severity = grant
+        if severity == "Info":
+            severity = "High" if has_priv else "Medium"
         counts = f"{pw} password + {kc} key credential(s)"
         evidence = f"{counts} · {role_count} app-role assignment(s)"
         remediation = (
@@ -1672,6 +1698,7 @@ def check_public_client_privileged(ctx):
 def check_foreign_principal(ctx):
     graph, include_disabled = ctx["graph"], ctx["include_disabled"]
     priv_ids = ctx["priv_sp_ids"]
+    grant_sev = app_role_grant_severity(graph, ctx["resource_index"])
     tenant_id = graph["tenant"].get("object_id")
     findings = []
     for oid, rec in graph["sp"].items():
@@ -1697,7 +1724,7 @@ def check_foreign_principal(ctx):
                           if ra["principal_type"] == "ServicePrincipal" and ra["principal_id"] == oid])
         findings.append(make_finding(
             check_id="foreign_principal", category="apps",
-            severity="Critical",
+            severity=grant_sev.get(oid, "High"),
             title=f"Foreign privileged principal: {sp_display_name(rec)}",
             evidence=(f"appOwnerTenantId={owner_tid} · no local Application registration"
                       + (f"\n\nEvidence: {'; '.join(dict.fromkeys(reasons))}" if reasons else "")),
@@ -13631,7 +13658,7 @@ def start_serve(port, total=None, after_start=None):
 # when the database fingerprint is unchanged; when the database changed, the
 # new analysis is diffed against the cached one and surfaced in the report.
 
-CACHE_VERSION = 5
+CACHE_VERSION = 6
 CACHE_DIR = SCRIPT_DIR / "data" / "databases" / ".cache"
 
 CACHE_FINGERPRINT_TABLES = (

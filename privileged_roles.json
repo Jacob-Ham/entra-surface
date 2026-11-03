@@ -1,5 +1,5 @@
 {
-  "_readme": "Application (app-only) permissions considered highly privileged for this audit, grouped by resource appId. Edit freely: add/remove roles or whole resources. 'severity' is either 'Critical' or 'High'. Matching is done by permission value against each resource's appRoles, so entries here are tenant-agnostic and safe to reuse across environments.",
+  "_readme": "Application (app-only) permissions considered highly privileged for this audit, grouped by resource appId. Critical is reserved for a direct or 1-2 hop path to tenant takeover; service-specific or data-plane permissions that need additional prerequisites are High. 'severity' is either 'Critical' or 'High'. Edit freely: add/remove roles or whole resources. Matching is done by permission value against each resource's appRoles, so entries here are tenant-agnostic and safe to reuse across environments.",
   "checks": {
     "_readme": "Check-run configuration for the attack-surface audit. 'enabled' toggles individual checks (empty = all on), 'min_severity' drops findings below a level (Critical/High/Medium/Low/Info), 'suppress' silences findings by 'check_id:primary_object_id' (or just 'check_id' to drop a whole check).",
     "enabled": {},
@@ -7,7 +7,7 @@
     "suppress": []
   },
   "directory_roles": {
-    "_readme": "Directory role displayName -> severity (Critical/High/Medium/Low/Info) for the privileged-users check. Roles not listed here (or custom roles) render as Info until you rate them. Add/modify freely per tenant.",
+    "_readme": "Directory role displayName -> severity (Critical/High/Medium/Low/Info) for the privileged-users check. Critical is reserved for a direct or 1-2 hop path to tenant takeover; broader administrative roles are High. Roles not listed here (or custom roles) render as Info until you rate them. Add/modify freely per tenant.",
     "Global Administrator": "Critical",
     "Privileged Role Administrator": "Critical",
     "Privileged Authentication Administrator": "Critical",
@@ -15,8 +15,10 @@
     "Groups Administrator": "High",
     "Cloud Application Administrator": "Critical",
     "Hybrid Identity Administrator": "Critical",
+    "Tenant Governance Administrator": "Critical",
     "Conditional Access Administrator": "High",
     "Security Administrator": "High",
+    "Security Operator": "Medium",
     "Exchange Administrator": "High",
     "Intune Administrator": "High",
     "SharePoint Administrator": "High",
@@ -24,9 +26,11 @@
     "User Administrator": "High",
     "Authentication Administrator": "High",
     "Helpdesk Administrator": "High",
+    "Password Administrator": "High",
+    "Agent ID Administrator": "High",
     "Directory Readers": "Medium",
     "Global Reader": "Medium",
-    "Application Developer": "Medium",
+    "Application Developer": "Critical",
     "Billing Administrator": "Medium",
     "Message Center Reader": "Medium",
     "Reports Reader": "Medium",
@@ -59,17 +63,17 @@
         {"value": "DeviceManagementConfiguration.ReadWrite.All", "severity": "High", "reason": "Push Intune device configuration/compliance policies fleet-wide. Combined with DeviceManagementScripts.ReadWrite.All: code execution on managed workstations and PAWs."},
         {"value": "DeviceManagementScripts.ReadWrite.All", "severity": "High", "reason": "Deploy scripts to Intune-managed devices. Combined with DeviceManagementConfiguration.ReadWrite.All: fleet-wide code execution on managed workstations and PAWs."},
         {"value": "Group.ReadWrite.All", "severity": "High", "reason": "Can add members to any group except for role-assignable groups."},
-        {"value": "Synchronization.ReadWrite.All", "severity": "Critical", "reason": "Can manage directory synchronization jobs/credentials used for identity provisioning."},
+        {"value": "Synchronization.ReadWrite.All", "severity": "High", "reason": "Can manage directory synchronization jobs/credentials used for identity provisioning. Requires an existing sync topology and additional steps for tenant-wide control."},
         {"value": "PrivilegedAccess.ReadWrite.AzureAD", "severity": "Critical", "reason": "Can manage PIM eligible/active role assignments for Azure AD roles."},
         {"value": "PrivilegedAccess.ReadWrite.AzureADGroup", "severity": "Critical", "reason": "Can manage PIM eligible/active assignments for privileged access groups."},
         {"value": "RoleManagement.ReadWrite.All", "severity": "Critical", "reason": "Broader variant of directory role management read/write across Microsoft 365 services."},
-        {"value": "DeviceManagementManagedDevices.ReadWrite.All", "severity": "Critical", "reason": "Can push apps/scripts and issue remote actions to all Intune-managed devices — effectively fleet-wide code execution."},
+        {"value": "DeviceManagementManagedDevices.ReadWrite.All", "severity": "High", "reason": "Can push apps/scripts and issue remote actions to all Intune-managed devices — fleet-wide code execution, but not a direct tenant takeover path."},
         {"value": "DeviceManagementRBAC.ReadWrite.All", "severity": "High", "reason": "Can manage Intune role-based access control assignments."},
         {"value": "Mail.Send", "severity": "High", "reason": "Can send mail as any user in the organization — commonly abused for BEC/phishing."},
         {"value": "Mail.ReadWrite", "severity": "High", "reason": "Can read and write mail in any mailbox in the organization."},
         {"value": "MailboxSettings.ReadWrite", "severity": "High", "reason": "Can modify any mailbox's settings, including inbox rules and forwarding — common exfiltration technique."},
         {"value": "Files.ReadWrite.All", "severity": "High", "reason": "Can read/write all files across OneDrive and SharePoint."},
-        {"value": "Sites.FullControl.All", "severity": "Critical", "reason": "Full control over all SharePoint site collections."},
+        {"value": "Sites.FullControl.All", "severity": "High", "reason": "Full control over all SharePoint site collections. Data-plane access; not a direct tenant takeover path."},
         {"value": "Sites.ReadWrite.All", "severity": "High", "reason": "Read/write access to all SharePoint site collections."},
         {"value": "Chat.ReadWrite.All", "severity": "High", "reason": "Can read and write all Teams chat messages across the organization."}
       ]
@@ -77,7 +81,7 @@
     "00000002-0000-0000-c000-000000000000": {
       "name": "Windows Azure Active Directory (legacy AAD Graph)",
       "roles": [
-        {"value": "Directory.ReadWrite.All", "severity": "Critical", "reason": "Legacy AAD Graph equivalent of full directory read/write."},
+        {"value": "Directory.ReadWrite.All", "severity": "High", "reason": "Legacy AAD Graph equivalent of directory read/write. Cannot manage role assignments or role-assignable groups."},
         {"value": "Application.ReadWrite.All", "severity": "Critical", "reason": "Legacy AAD Graph equivalent of full application read/write."},
         {"value": "Domain.ReadWrite.All", "severity": "Critical", "reason": "Legacy AAD Graph equivalent of domain/federation read/write."},
         {"value": "Device.ReadWrite.All", "severity": "High", "reason": "Can read and write all device objects in the directory."}
@@ -86,10 +90,10 @@
     "00000002-0000-0ff1-ce00-000000000000": {
       "name": "Office 365 Exchange Online",
       "roles": [
-        {"value": "full_access_as_app", "severity": "Critical", "reason": "Full EWS access to every mailbox in the organization without per-user consent."},
-        {"value": "Exchange.ManageAsApp", "severity": "Critical", "reason": "Combined with an Exchange admin role, grants full control of mail flow and all mailboxes via Remote PowerShell/EWS."},
-        {"value": "Exchange.ManageAsAppV2", "severity": "Critical", "reason": "Current-generation equivalent of Exchange.ManageAsApp."},
-        {"value": "Exchange.AdminAPI.ManageAsApp", "severity": "Critical", "reason": "Full administrative control of Exchange Online via the Admin API."},
+        {"value": "full_access_as_app", "severity": "High", "reason": "Full EWS access to every mailbox in the organization without per-user consent. Mailbox data access; not directory or tenant control."},
+        {"value": "Exchange.ManageAsApp", "severity": "High", "reason": "Combined with an Exchange admin role, grants full control of mail flow and all mailboxes via Remote PowerShell/EWS. Requires Exchange admin privileges; not a direct tenant takeover path."},
+        {"value": "Exchange.ManageAsAppV2", "severity": "High", "reason": "Current-generation equivalent of Exchange.ManageAsApp. Requires Exchange admin privileges; not a direct tenant takeover path."},
+        {"value": "Exchange.AdminAPI.ManageAsApp", "severity": "High", "reason": "Full administrative control of Exchange Online via the Admin API. Requires Exchange admin privileges; not a direct tenant takeover path."},
         {"value": "Mail.Send", "severity": "High", "reason": "Can send mail as any user in the organization."},
         {"value": "Mail.ReadWrite", "severity": "High", "reason": "Can read and write mail in any mailbox in the organization."},
         {"value": "MailboxSettings.ReadWrite", "severity": "High", "reason": "Can modify any mailbox's settings, including inbox rules and forwarding."},
@@ -99,7 +103,7 @@
     "00000003-0000-0ff1-ce00-000000000000": {
       "name": "SharePoint Online",
       "roles": [
-        {"value": "Sites.FullControl.All", "severity": "Critical", "reason": "Full control over all SharePoint site collections."},
+        {"value": "Sites.FullControl.All", "severity": "High", "reason": "Full control over all SharePoint site collections. Data-plane access; not a direct tenant takeover path."},
         {"value": "Sites.ReadWrite.All", "severity": "High", "reason": "Read/write access to all SharePoint site collections."},
         {"value": "TermStore.ReadWrite.All", "severity": "High", "reason": "Can modify the organization-wide managed metadata term store."}
       ]
