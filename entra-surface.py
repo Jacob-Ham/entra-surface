@@ -63,6 +63,7 @@ import gzip
 import hashlib
 import html
 import http.server
+import itertools
 import json
 import os
 import re
@@ -3480,7 +3481,7 @@ def check_ca_exposure(ctx):
         detail = json_safe_value(rec.get("policyDetail")) if rec else None
         try:
             inner = json.loads(detail[0]) if detail and isinstance(detail[0], str) else (detail[0] if detail else None)
-            return inner if isinstance(inner, dict) else {}
+            return _normalize_ca_policy(inner) if isinstance(inner, dict) else {}
         except (json.JSONDecodeError, ValueError, TypeError, IndexError):
             return {}
 
@@ -7389,9 +7390,25 @@ def render_report(results, tenant_name, db_path, config_path,
   <section data-category="configs" data-caview="main">
     <h2>CA coverage analysis</h2>
     <div class="ca-analysis">
-      <p class="sub">Conditional Access coverage for the tenant: policy scope resolution, per-user and per-application coverage, legacy authentication, and exclusions.</p>
+      <p class="sub">Conditional Access coverage for the tenant: policy scope resolution, per-user and per-application coverage, path audit, legacy authentication, and exclusions. Fast mode samples active conditions; Full mode varies every active dimension up to the per-path scenario cap.</p>
+      <div class="ca-whatif" id="ca-audit-options">
+        <label>Population <select id="ca-pop">
+          <option value="privileged">Privileged users</option>
+          <option value="all">All users</option>
+          <option value="list">UPN list</option>
+        </select></label>
+        <label id="ca-users-wrap" class="hidden">Users <input type="text" id="ca-users-input" class="ca-small-input" placeholder="UPNs, comma-separated" autocomplete="off"></label>
+        <label>Resource <input type="text" id="ca-resource" class="ca-small-input" placeholder="all, appId, or ACR" autocomplete="off"></label>
+        <label>Client app <select id="ca-client">
+          <option value="">All</option><option>browser</option><option>mobileAppsAndDesktopClients</option><option>exchangeActiveSync</option><option>other</option>
+        </select></label>
+        <label>Mode <select id="ca-mode"><option value="fast">Fast</option><option value="full">Full</option></select></label>
+        <label>Max scenarios <input type="number" id="ca-max-scenarios" class="ca-small-input" value="24" min="0" max="500"></label>
+        <label class="ca-check"><input type="checkbox" id="ca-synced"> Synced only</label>
+        <label class="ca-check"><input type="checkbox" id="ca-include-disabled" checked> Include disabled</label>
+      </div>
       <div class="ca-controls">
-        <button type="button" class="mode-btn" id="ca-run-btn">Run full analysis</button>
+        <button type="button" class="mode-btn" id="ca-run-btn">Run analysis</button>
       </div>
       <div class="ca-status hidden" id="ca-status"><ul id="ca-steps"></ul></div>
       <div class="ca-results" id="ca-results"></div>
@@ -7406,14 +7423,17 @@ def render_report(results, tenant_name, db_path, config_path,
         <button type="button" class="mode-btn" id="ca-user-btn">Analyze user</button>
       </div>
       <div class="ca-whatif">
-        <label>Require MFA <select id="ca-wi-require"><option value="">—</option><option value="mfa">MFA</option></select></label>
+        <label>Require <select id="ca-wi-require"><option value="">—</option><option value="mfa">MFA</option><option value="compliant">Compliant device</option><option value="mfa_compliant">MFA + compliant</option></select></label>
         <label>Platform <select id="ca-wi-platform"><option value="">—</option><option>windows</option><option>macos</option><option>linux</option><option>ios</option><option>android</option></select></label>
         <label>Client app <select id="ca-wi-client"><option value="">—</option><option>browser</option><option>mobileAppsAndDesktopClients</option><option>exchangeActiveSync</option><option>other</option></select></label>
         <label>Device state <select id="ca-wi-device"><option value="">—</option><option>compliant</option><option>unmanaged</option><option>domainJoined</option></select></label>
+        <label>Device filter <select id="ca-wi-devfilter"><option value="">—</option><option value="true">match</option><option value="false">no match</option></select></label>
         <label>Trusted location <select id="ca-wi-location"><option value="">—</option><option value="true">trusted</option><option value="false">not trusted</option></select></label>
         <label>Sign-in risk <select id="ca-wi-signin"><option value="">—</option><option>none</option><option>low</option><option>medium</option><option>high</option></select></label>
         <label>User risk <select id="ca-wi-userrisk"><option value="">—</option><option>low</option><option>medium</option><option>high</option></select></label>
+        <label>Auth flow <select id="ca-wi-authflow"><option value="">—</option><option>devicecodeflow</option><option>authtransfer</option></select></label>
         <label>Resource / app <input type="text" id="ca-app-input" class="ca-small-input" placeholder="optional" autocomplete="off"></label>
+        <label>ACR / user action <input type="text" id="ca-acr-input" class="ca-small-input" placeholder="urn:user:registerdevice" autocomplete="off"></label>
         <label>Assume group(s) <input type="text" id="ca-assume-groups" class="ca-small-input" placeholder="names or IDs, comma-separated" autocomplete="off"></label>
         <label>Assume role(s) <input type="text" id="ca-assume-roles" class="ca-small-input" placeholder="names or IDs, comma-separated" autocomplete="off"></label>
       </div>
@@ -7950,6 +7970,9 @@ def render_report(results, tenant_name, db_path, config_path,
   .ca-whatif label {{
     display: grid; grid-template-columns: 130px 1fr; align-items: center; gap: 8px;
     font-size: 12.5px; color: var(--text-secondary);
+  }}
+  .ca-whatif label.ca-check {{
+    display: flex; align-items: center; gap: 6px;
   }}
   .ca-whatif select, .ca-whatif .ca-small-input {{ width: 100%; }}
   .ca-status ul {{ list-style: none; margin: 6px 0 12px; padding: 0; }}
@@ -11250,6 +11273,17 @@ def render_report(results, tenant_name, db_path, config_path,
   var caRun = document.getElementById('ca-run-btn');
   var caUserBtn = document.getElementById('ca-user-btn');
   var caUserInput = document.getElementById('ca-user-input');
+  var caPop = document.getElementById('ca-pop');
+  var caUsersWrap = document.getElementById('ca-users-wrap');
+  function caToggleUsers() {{
+    if (caUsersWrap && caPop) {{
+      caUsersWrap.classList.toggle('hidden', caPop.value !== 'list');
+    }}
+  }}
+  if (caPop) {{
+    caPop.addEventListener('change', caToggleUsers);
+    caToggleUsers();
+  }}
 
   // CA view tabs: 'Conditional Access' vs 'Single user'
   var caViewTabs = document.querySelectorAll('#ca-view-tabs .drawer-tab');
@@ -11303,7 +11337,7 @@ def render_report(results, tenant_name, db_path, config_path,
       }}
     }}
 
-    function caRenderResults(d, resultsEl) {{
+    function caRenderResults(d, resultsEl, isUser) {{
       if (d.status === 'done' && d.result) {{
         resultsEl.innerHTML = (d.result.summary_html || '') + (d.result.sections_html || '');
         // these tables are created after load: stamp fresh headers with their
@@ -11326,12 +11360,12 @@ def render_report(results, tenant_name, db_path, config_path,
             caStepState(d, caUserStepsEl);
             if (d.status === 'running') {{ caUserTimer = setTimeout(function() {{ caPoll(true); }}, 600); return; }}
             caSetBusy(false);
-            caRenderResults(d, caUserResultsEl);
+            caRenderResults(d, caUserResultsEl, true);
           }} else {{
             caStepState(d, caStepsEl);
             if (d.status === 'running') {{ caTimer = setTimeout(function() {{ caPoll(false); }}, 600); return; }}
             caSetBusy(false);
-            caRenderResults(d, caResultsEl);
+            caRenderResults(d, caResultsEl, false);
           }}
         }}).catch(function() {{ caSetBusy(false); }});
     }}
@@ -11348,15 +11382,30 @@ def render_report(results, tenant_name, db_path, config_path,
         var el = document.getElementById(id);
         return el ? el.value.trim() : '';
       }}
+      var maxScenarios = parseInt(val('ca-max-scenarios') || '0', 10);
+      var includeDisabled = document.getElementById('ca-include-disabled');
+      var syncedOnly = document.getElementById('ca-synced');
       var payload = {{
         upn: upn || '',
+        population: val('ca-pop') || 'privileged',
+        users: val('ca-users-input'),
+        synced_only: !!(syncedOnly && syncedOnly.checked),
+        include_disabled: includeDisabled ? !!includeDisabled.checked : true,
+        resource: val('ca-resource'),
+        client_app: val('ca-client'),
+        mode: val('ca-mode') || 'fast',
+        max_scenarios: isNaN(maxScenarios) ? 24 : maxScenarios,
         assume_groups: val('ca-assume-groups'),
         assume_roles: val('ca-assume-roles'),
         scenario: {{
           platform: val('ca-wi-platform'), client_app: val('ca-wi-client'),
-          device_state: val('ca-wi-device'), trusted_location: val('ca-wi-location'),
+          device_state: val('ca-wi-device'),
+          device_filter: val('ca-wi-devfilter'),
+          trusted_location: val('ca-wi-location'),
           signin_risk: val('ca-wi-signin'), user_risk: val('ca-wi-userrisk'),
-          app_id: val('ca-app-input'), require: val('ca-wi-require')
+          auth_flow: val('ca-wi-authflow'),
+          app_id: val('ca-app-input'), acr: val('ca-acr-input'),
+          require: val('ca-wi-require')
         }}
       }};
       var body = JSON.stringify(payload);
@@ -12092,6 +12141,7 @@ CA_ANALYSIS_STEPS = [
     ("apps", "Analyze application coverage"),
     ("legacy", "Analyze legacy authentication"),
     ("exclusions", "Analyze privileged-user exclusions"),
+    ("paths", "Run conditional-access path audit"),
     ("render", "Render results"),
 ]
 
@@ -12104,6 +12154,9 @@ CA_LEGACY_CLIENT_TYPES = {
     "EasSupported", "EasUnsupported", "OtherLegacy", "LegacySmtp", "LegacyPop",
     "LegacyImap", "LegacyMapi", "LegacyOffice",
 }
+
+CA_CLIENT_APP_TYPES = ["browser", "mobileAppsAndDesktopClients",
+                       "exchangeActiveSync", "other"]
 
 CA_ALL_PLATFORMS = {"android", "windows", "windows_phone", "macos", "linux", "ios"}
 
@@ -12189,10 +12242,13 @@ def load_ca_dataset(db_path):
                 data["roles"].setdefault(oid, disp or oid)
         except sqlite3.OperationalError:
             pass
-        cur.execute("SELECT objectId, userPrincipalName, displayName, userType, accountEnabled FROM Users")
-        for oid, upn, disp, utype, enabled in cur.fetchall():
+        cur.execute("SELECT objectId, userPrincipalName, displayName, userType, "
+                    "accountEnabled, dirSyncEnabled FROM Users")
+        for oid, upn, disp, utype, enabled, synced in cur.fetchall():
             data["users"][oid] = {"upn": upn or "", "name": disp or upn or oid,
-                                  "type": utype or "Member", "enabled": bool(enabled)}
+                                  "type": utype or "Member",
+                                  "enabled": bool(enabled),
+                                  "sync": bool(synced)}
         cur.execute("SELECT objectId, displayName, appId FROM ServicePrincipals")
         for oid, disp, app_id in cur.fetchall():
             data["sps"][oid] = {"name": disp or oid, "appId": app_id or ""}
@@ -12218,17 +12274,153 @@ def load_ca_dataset(db_path):
     return data
 
 
+def _ca_state_label(value):
+    state = str(value or "").strip()
+    low = state.lower()
+    if low == "enabled":
+        return "Enabled"
+    if low in ("enabledforreportingbutnotenforced", "reporting", "reportonly"):
+        return "Reporting"
+    if low == "disabled":
+        return "Disabled"
+    return state.title() if state else "Unknown"
+
+
+def _normalize_ca_policy(inner):
+    """Normalize Graph-style CA policyDetail into the roadrecon shape.
+
+    roadrecon/AAD Graph exports use upper-case keys (State, Conditions,
+    Controls); newer Graph exports use lower-case keys plus grantControls.
+    The rest of the analysis consumes one shape, so normalize the latter.
+    """
+    if not isinstance(inner, dict):
+        return {}
+    if "Conditions" in inner or "Controls" in inner or "State" in inner:
+        return inner
+
+    out = {"State": _ca_state_label(inner.get("state"))}
+    cond = inner.get("conditions") or inner.get("Conditions") or {}
+    ncond = {}
+
+    users = cond.get("users") or {}
+    if users:
+        inc, exc = [], []
+        for key, field in (("includeUsers", "Users"), ("includeGroups", "Groups"),
+                           ("includeRoles", "Roles")):
+            vals = users.get(key) or []
+            if vals:
+                inc.append({field: list(vals)})
+        if users.get("includeGuestsOrExternalUsers"):
+            inc.append({"Users": ["GuestsOrExternalUsers"]})
+        for key, field in (("excludeUsers", "Users"), ("excludeGroups", "Groups"),
+                           ("excludeRoles", "Roles")):
+            vals = users.get(key) or []
+            if vals:
+                exc.append({field: list(vals)})
+        if users.get("excludeGuestsOrExternalUsers"):
+            exc.append({"Users": ["GuestsOrExternalUsers"]})
+        ncond["Users"] = {"Include": inc, "Exclude": exc}
+
+    apps = cond.get("applications") or {}
+    if apps:
+        inc, exc = [], []
+        if apps.get("includeApplications"):
+            inc.append({"Applications": list(apps["includeApplications"])})
+        acrs = list(apps.get("includeUserActions") or [])
+        acrs += list(apps.get("includeAuthenticationContextClassReferences") or [])
+        if acrs:
+            inc.append({"Acrs": acrs})
+        if apps.get("excludeApplications"):
+            exc.append({"Applications": list(apps["excludeApplications"])})
+        ncond["Applications"] = {"Include": inc, "Exclude": exc}
+
+    client_types = cond.get("clientAppTypes") or []
+    if client_types:
+        ncond["ClientTypes"] = {"Include": [{"ClientTypes": list(client_types)}]}
+
+    platforms = cond.get("platforms") or {}
+    if platforms:
+        inc, exc = [], []
+        if platforms.get("includePlatforms"):
+            inc.append({"DevicePlatforms": list(platforms["includePlatforms"])})
+        if platforms.get("excludePlatforms"):
+            exc.append({"DevicePlatforms": list(platforms["excludePlatforms"])})
+        ncond["DevicePlatforms"] = {"Include": inc, "Exclude": exc}
+
+    locations = cond.get("locations") or {}
+    if locations:
+        inc, exc = [], []
+        if locations.get("includeLocations"):
+            inc.append({"IncludeLocations": list(locations["includeLocations"])})
+        if locations.get("excludeLocations"):
+            exc.append({"ExcludeLocations": list(locations["excludeLocations"])})
+        ncond["Locations"] = {"Include": inc, "Exclude": exc}
+
+    ncond["SignInRiskLevels"] = list(cond.get("signInRiskLevels") or [])
+    ncond["UserRiskLevels"] = list(cond.get("userRiskLevels") or [])
+
+    flows = cond.get("authenticationFlows") or {}
+    if flows:
+        vals = (flows.get("transferMethods")
+                or flows.get("includeAuthenticationFlows")
+                or flows.get("includedAuthenticationFlows") or [])
+        if vals:
+            ncond["AuthFlows"] = {"Include": [{"AuthFlows": list(vals)}]}
+
+    devices = cond.get("devices") or {}
+    if devices:
+        inc, exc = [], []
+        dfilter = devices.get("deviceFilter") or devices.get("Filter") or {}
+        rule = (dfilter.get("rule") if isinstance(dfilter, dict) else None) or \
+               (dfilter.get("Rule") if isinstance(dfilter, dict) else None)
+        if rule:
+            inc.append({"DeviceRule": rule})
+        if devices.get("includeDevices"):
+            inc.append({"Devices": list(devices["includeDevices"])})
+        if devices.get("excludeDevices"):
+            exc.append({"Devices": list(devices["excludeDevices"])})
+        ncond["Devices"] = {"Include": inc, "Exclude": exc}
+
+    out["Conditions"] = ncond
+
+    grant = inner.get("grantControls") or {}
+    built = grant.get("builtInControls") or []
+    names = []
+    for c in built:
+        low = str(c).lower()
+        if low == "mfa":
+            names.append("Mfa")
+        elif low == "compliantdevice":
+            names.append("RequireCompliantDevice")
+        elif low == "block":
+            names.append("Block")
+        else:
+            names.append(str(c))
+    auth_ids = []
+    auth = grant.get("authenticationStrength")
+    if isinstance(auth, dict) and auth.get("id"):
+        auth_ids = [auth["id"]]
+    if names or auth_ids:
+        out["Controls"] = [{"Control": names, "AuthStrengthIds": auth_ids,
+                            "Operator": grant.get("operator") or "OR"}]
+    return out
+
+
 def run_ca_analysis(db_path, progress, target_upn=None,
-                    assume_groups=None, assume_roles=None, scenario=None):
+                    assume_groups=None, assume_roles=None, scenario=None,
+                    options=None):
     """Conditional Access coverage analysis. `progress(step_id, detail)` marks
     each step complete as it finishes. When `target_upn` is given, the analysis
     is scoped to that single user; `assume_groups`/`assume_roles` simulate
     memberships (names or IDs), and `scenario` is an optional what-if sign-in
-    context (platform, client app, trusted location, risk levels, device state).
-    Returns {summary_html, sections_html, tables}."""
+    context (platform, client app, trusted location, risk levels, device state,
+    auth flow, device filter, ACR). `options` controls path-audit population,
+    resource/client filters, fast/full mode, and the scenario cap.
+    Returns {summary_html, sections_html, tables, export}."""
     assume_groups = assume_groups or []
     assume_roles = assume_roles or []
     scenario = scenario or {}
+    options = options or {}
     progress("load")
     data = load_ca_dataset(db_path)
     if target_upn:
@@ -12258,10 +12450,26 @@ def run_ca_analysis(db_path, progress, target_upn=None,
     policies = []
     group_memo = {}
     for p in data["policies"]:
-        inner = p["inner"]
-        controls = [c for block in inner.get("Controls") or []
-                    for c in (block.get("Control") or []) if isinstance(c, str)]
-        state = (inner.get("State") or "").strip() or "Unknown"
+        inner = _normalize_ca_policy(p["inner"])
+        control_blocks = []
+        for block in inner.get("Controls") or []:
+            if not isinstance(block, dict):
+                continue
+            raw = block.get("Control") or block.get("GrantControls") or []
+            if isinstance(raw, str):
+                raw = [raw]
+            names = [c for c in raw if isinstance(c, str)]
+            auth_ids = block.get("AuthStrengthIds") or []
+            if auth_ids:
+                names.append("AuthStrength")
+            if names:
+                control_blocks.append({
+                    "controls": names,
+                    "auth_strength": bool(auth_ids),
+                    "operator": block.get("Operator") or "OR",
+                })
+        controls = [c for b in control_blocks for c in b["controls"]]
+        state = _ca_state_label(inner.get("State"))
         inc_users, inc_all, inc_guest = set(), False, False
         inc_group_list, inc_role_list = [], []
         for block in _ca_blocks(inner, "Users", "Include"):
@@ -12294,11 +12502,13 @@ def run_ca_analysis(db_path, progress, target_upn=None,
                 if rid not in exc_role_list:
                     exc_role_list.append(rid)
                 exc_users |= _role_members(rid)
-        apps_inc, apps_exc = [], []
+        apps_inc, apps_exc, acrs_inc, acrs_exc = [], [], [], []
         for block in _ca_blocks(inner, "Applications", "Include"):
             apps_inc.extend(block.get("Applications") or [])
+            acrs_inc.extend(block.get("Acrs") or block.get("UserActions") or [])
         for block in _ca_blocks(inner, "Applications", "Exclude"):
             apps_exc.extend(block.get("Applications") or [])
+            acrs_exc.extend(block.get("Acrs") or block.get("UserActions") or [])
         # client types (legacy auth etc.) — modern 'ClientTypes' section,
         # with fallback to the older 'ClientApplications' shape
         client_inc, client_exc = [], []
@@ -12329,87 +12539,345 @@ def run_ca_analysis(db_path, progress, target_upn=None,
             locations_exc.extend(block.get("ExcludeLocations") or [])
             if block.get("ExcludeTrustedLocations"):
                 trusted_locations = True
-        # risk-level conditions
+        # authentication-flow conditions
+        auth_flows_inc, auth_flows_exc = [], []
+        for block in _ca_blocks(inner, "AuthFlows", "Include"):
+            auth_flows_inc.extend(block.get("AuthFlows") or block.get("AuthenticationFlows") or [])
+        for block in _ca_blocks(inner, "AuthFlows", "Exclude"):
+            auth_flows_exc.extend(block.get("AuthFlows") or block.get("AuthenticationFlows") or [])
+
+        # device filter rules (rule text is opaque; evaluate as match/no-match)
+        device_rules = []
         conds = inner.get("Conditions") or {}
+        devices = conds.get("Devices") or {}
+        dfilter = devices.get("Filter") or {}
+        if isinstance(dfilter, dict) and dfilter.get("Rule"):
+            device_rules.append(dfilter["Rule"])
+        for block in _ca_blocks(inner, "Devices", "Include"):
+            rule = block.get("DeviceRule") or block.get("Rule")
+            if rule:
+                device_rules.append(rule)
+
+        # risk-level conditions
         risk_signin = conds.get("SignInRiskLevels") or []
         risk_user = conds.get("UserRiskLevels") or []
         auth_strength = bool(sum((b.get("AuthStrengthIds") or [] for b in inner.get("Controls") or []), []))
         policies.append({
             "id": p["id"], "name": p["name"], "state": state,
             "enabled": state == "Enabled",
-            "controls": controls,
-            "mfa": "Mfa" in controls,
-            "block": "Block" in controls,
-            "compliant": "RequireCompliantDevice" in controls,
+            "controls": controls, "control_blocks": control_blocks,
+            "mfa": any(c.lower() == "mfa" for c in controls),
+            "block": any(c.lower() == "block" for c in controls),
+            "compliant": any(c.lower() in ("requirecompliantdevice", "compliantdevice") for c in controls),
             "auth_strength": auth_strength,
             "inc_users": inc_users, "inc_all": inc_all, "inc_guest": inc_guest,
             "exc_users": exc_users,
             "inc_group_list": inc_group_list, "inc_role_list": inc_role_list,
             "exc_group_list": exc_group_list, "exc_role_list": exc_role_list,
             "apps_inc": apps_inc, "apps_exc": apps_exc,
+            "acrs_inc": acrs_inc, "acrs_exc": acrs_exc,
             "client_inc": client_inc, "client_exc": client_exc,
             "platforms_inc": platforms_inc, "platforms_exc": platforms_exc,
             "device_states_inc": device_states_inc, "device_states_exc": device_states_exc,
+            "device_rules": device_rules,
             "locations_inc": locations_inc, "locations_exc": locations_exc,
             "trusted_locations": trusted_locations,
             "risk_signin": risk_signin, "risk_user": risk_user,
+            "auth_flows_inc": auth_flows_inc, "auth_flows_exc": auth_flows_exc,
         })
     enabled = [p for p in policies if p["enabled"]]
     progress("scopes", f"{len(policies)} policy(ies), {len(enabled)} enabled")
 
-    def applies_to(p, uid):
-        if not (p["inc_all"] or uid in p["inc_users"] or p["inc_guest"]):
-            return False
-        return uid not in p["exc_users"]
+    def would_include(p, uid):
+        return bool(p["inc_all"] or p["inc_guest"] or uid in p["inc_users"])
 
-    # privileged roster comes from the already-computed user findings; in
-    # single-user mode the target is analyzed regardless of privilege level
+    def applies_to(p, uid):
+        return would_include(p, uid) and uid not in p["exc_users"]
+
+    def _path_app_axis(p, sc):
+        acr = sc.get("acr")
+        if acr:
+            inc = [str(a).lower() for a in p.get("acrs_inc") or []]
+            exc = [str(a).lower() for a in p.get("acrs_exc") or []]
+            if not inc and not exc:
+                return False, "not a user-action policy"
+            if "all" in exc or acr.lower() in exc:
+                return False, "user action excluded"
+            if "all" in inc or acr.lower() in inc:
+                return True, None
+            return False, "user action not targeted"
+        if p.get("acrs_inc") and not p.get("apps_inc"):
+            return False, "user-action policy only"
+        inc = [str(a).lower() for a in p.get("apps_inc") or []]
+        exc = [str(a).lower() for a in p.get("apps_exc") or []]
+        app_id = sc.get("app_id")
+        if app_id and app_id.lower() in exc:
+            return False, "resource excluded"
+        if "all" in exc:
+            return False, "all resources excluded"
+        if not inc and not exc:
+            return True, None
+        if "all" in inc or "office365" in inc:
+            return True, None
+        if sc.get("resource_unscoped"):
+            return False, "resource not specifically targeted"
+        if not app_id:
+            return None, "resource not specified"
+        if app_id.lower() in inc:
+            return True, None
+        return False, "resource not targeted"
+
+    def _path_client_axis(p, sc):
+        if not p["client_inc"] and not p["client_exc"]:
+            return True, None
+        client = sc.get("client_app")
+        if not client:
+            return None, "client app not specified"
+        inc = [str(c).lower() for c in p["client_inc"]]
+        exc = [str(c).lower() for c in p["client_exc"]]
+        if "all" in exc or client.lower() in exc:
+            return False, "client app excluded"
+        if "all" in inc or client.lower() in inc:
+            return True, None
+        if client.lower() in ("exchangeactivesync", "other") and any(
+                str(c).lower() in CA_LEGACY_CLIENT_TYPES for c in inc):
+            return True, None
+        if inc and client.lower() in ("exchangeactivesync", "other"):
+            return None, "legacy client mapping uncertain"
+        return False, "client app not targeted"
+
+    def _path_platform_axis(p, sc):
+        if not p["platforms_inc"] and not p["platforms_exc"]:
+            return True, None
+        plat = sc.get("platform")
+        if not plat:
+            return None, "platform not specified"
+        exc = [str(x).lower() for x in p["platforms_exc"]]
+        if plat.lower() in exc:
+            return False, "platform excluded"
+        inc = [str(x).lower() for x in p["platforms_inc"]]
+        if "all" in inc or plat.lower() in inc:
+            return True, None
+        return False, "platform not targeted"
+
+    def _path_device_state_axis(p, sc):
+        if not p["device_states_inc"] and not p["device_states_exc"]:
+            return True, None
+        state = sc.get("device_state")
+        if state:
+            states = {str(state).lower()}
+        elif (sc.get("device_compliant") is not None
+              or sc.get("device_hybrid_joined") is not None):
+            states = set()
+            if sc.get("device_compliant"):
+                states.add("compliant")
+            if sc.get("device_hybrid_joined"):
+                states.add("domainjoined")
+            states.add("unmanaged") if not states else None
+        else:
+            return None, "device state not specified"
+        exc = [str(x).lower() for x in p["device_states_exc"]]
+        if states & set(exc):
+            return False, "device state excluded"
+        inc = [str(x).lower() for x in p["device_states_inc"]]
+        if "all" in inc or states & set(inc):
+            return True, None
+        return False, "device state not targeted"
+
+    def _path_location_axis(p, sc):
+        inc_l, exc_l = p["locations_inc"], p["locations_exc"]
+        if not inc_l and not exc_l and not p["trusted_locations"]:
+            return True, None
+        trusted = sc.get("trusted_location")
+        for loc in exc_l:
+            low = str(loc).lower()
+            if low == "all":
+                return False, "all locations excluded"
+            if low == "alltrusted":
+                if trusted is True:
+                    return False, "trusted locations excluded"
+                continue
+            rec = data["locations"].get(loc)
+            if rec is None:
+                return None, "named location excluded (not found)"
+            if trusted is not None and rec["trusted"] == trusted:
+                return False, f"location '{rec['name']}' excluded"
+        if p["trusted_locations"] or any(str(l).lower() == "alltrusted" for l in inc_l):
+            if trusted is None:
+                return None, "trusted location not specified"
+            return bool(trusted), None
+        for loc in inc_l:
+            low = str(loc).lower()
+            if low == "all":
+                return True, None
+            rec = data["locations"].get(loc)
+            if rec is None:
+                return None, "named location (not found)"
+            if trusted is None:
+                return None, f"location '{rec['name']}' not specified"
+            if rec["trusted"] == trusted:
+                return True, None
+            return False, f"location '{rec['name']}' does not match"
+        return True, None
+
+    def _path_risk_axis(name, policy_list, sc_value):
+        if not policy_list:
+            return True, None
+        if not sc_value:
+            return None, f"{name} not specified"
+        if any(str(r).lower() == str(sc_value).lower() for r in policy_list):
+            return True, None
+        return False, f"{name} not targeted"
+
+    def _path_auth_flow_axis(p, sc):
+        inc = [str(x).lower() for x in p.get("auth_flows_inc") or []]
+        exc = [str(x).lower() for x in p.get("auth_flows_exc") or []]
+        if not inc and not exc:
+            return True, None
+        flow = sc.get("auth_flow")
+        if not flow:
+            return None, "auth flow not specified"
+        flow = str(flow).lower()
+        if flow in exc:
+            return False, "auth flow excluded"
+        if "all" in inc or flow in inc:
+            return True, None
+        return False, "auth flow not targeted"
+
+    def _path_device_filter_axis(p, sc):
+        if not p.get("device_rules"):
+            return True, None
+        value = sc.get("device_filter")
+        if value is None:
+            return None, "device filter not specified"
+        if value:
+            return True, None
+        return False, "device filter not matched"
+
+    def condition_verdict(p, sc):
+        axes = [
+            _path_app_axis(p, sc), _path_client_axis(p, sc),
+            _path_platform_axis(p, sc), _path_device_state_axis(p, sc),
+            _path_location_axis(p, sc),
+            _path_risk_axis("sign-in risk", p["risk_signin"], sc.get("signin_risk")),
+            _path_risk_axis("user risk", p["risk_user"], sc.get("user_risk")),
+            _path_auth_flow_axis(p, sc), _path_device_filter_axis(p, sc),
+        ]
+        notes = []
+        for matched, note in axes:
+            if matched is False:
+                return "no", note
+            if matched is None:
+                notes.append(note)
+        if notes:
+            return "signal", "; ".join(notes)
+        return "yes", None
+
+    def _control_label(control):
+        low = str(control).lower()
+        return {"mfa": "MFA", "requirecompliantdevice": "Compliant device",
+                "compliantdevice": "Compliant device", "block": "Block",
+                "authstrength": "Auth strength",
+                "passwordchange": "Password change",
+                "domainjoineddevice": "Domain-joined device"}.get(low, str(control))
+
+    def _policy_control_display(p):
+        if p.get("block"):
+            return "Block"
+        parts = []
+        for block in p.get("control_blocks") or []:
+            names = [_control_label(c) for c in block.get("controls") or []
+                     if str(c).lower() != "block"]
+            if names:
+                joiner = " and " if str(block.get("operator", "OR")).upper() == "AND" else " or "
+                parts.append(joiner.join(names))
+        return " + ".join(parts)
+
+    # Selected roster. Single-user mode analyzes the target regardless of
+    # privilege; path-audit mode honors the population filters.
+    population = (options.get("population") or "privileged").lower()
+    include_disabled = bool(options.get("include_disabled", True))
+    synced_only = bool(options.get("synced_only", False))
+    requested_upns = {str(u).strip().lower()
+                      for u in (options.get("users") or []) if str(u).strip()}
+    sev_by_uid = {f.get("user_id"): f.get("severity", "Info")
+                  for f in SERVE_STATE.get("user_findings", [])
+                  if f.get("user_id")}
     priv_users = {}
+
+    def _add_user(uid, rec=None, upn=None, name=None, severity=None):
+        rec = rec or data["users"].get(uid) or {}
+        if not include_disabled and not rec.get("enabled", True):
+            return
+        if synced_only and not rec.get("sync"):
+            return
+        priv_users[uid] = {
+            "uid": uid,
+            "upn": upn or rec.get("upn") or uid,
+            "name": name or rec.get("name") or upn or uid,
+            "severity": severity or sev_by_uid.get(uid, "Info"),
+        }
+
     if target_upn:
         rec = data["users"].get(target_uid) or {}
-        sev = "Info"
-        for f in SERVE_STATE.get("user_findings", []):
-            if f.get("user_id") == target_uid:
-                sev = f.get("severity", "Info")
-                break
-        priv_users[target_uid] = {"uid": target_uid,
-                                  "upn": rec.get("upn") or target_upn,
-                                  "name": rec.get("name") or target_upn,
-                                  "severity": sev}
+        priv_users[target_uid] = {
+            "uid": target_uid,
+            "upn": rec.get("upn") or target_upn,
+            "name": rec.get("name") or target_upn,
+            "severity": sev_by_uid.get(target_uid, "Info"),
+        }
+    elif population == "all":
+        for uid, rec in data["users"].items():
+            _add_user(uid, rec)
+    elif population == "list":
+        for uid, rec in data["users"].items():
+            if (rec.get("upn") or "").strip().lower() in requested_upns:
+                _add_user(uid, rec)
     else:
         for f in SERVE_STATE.get("user_findings", []):
             if is_privileged(f.get("severity", "Info")):
                 uid = f.get("user_id")
                 if not uid:
                     continue
-                rec = data["users"].get(uid) or {}
-                priv_users[uid] = {"uid": uid,
-                                   "upn": rec.get("upn") or f.get("user_upn") or uid,
-                                   "name": rec.get("name") or f.get("user_display") or uid,
-                                   "severity": f.get("severity", "Info")}
+                _add_user(uid, data["users"].get(uid),
+                          upn=f.get("user_upn"), name=f.get("user_display"),
+                          severity=f.get("severity", "Info"))
+
+    roster_label = "User" if target_upn else {
+        "all": "All users", "list": "Listed users",
+    }.get(population, "Privileged users")
 
     progress("users")
     zero_coverage, no_mfa, no_compliant, report_only_bypass = [], [], [], []
+    excluded_bypass = []
     for uid in sorted(priv_users, key=lambda u: (severity_rank(priv_users[u]["severity"]),
                                                  priv_users[u]["upn"].lower())):
         applying = [p for p in enabled if applies_to(p, uid)]
         reporting = [p for p in policies
                      if p["state"] != "Enabled" and applies_to(p, uid)]
+        excluded = [p for p in enabled
+                    if would_include(p, uid) and uid in p["exc_users"]]
         if not applying:
             zero_coverage.append(priv_users[uid])
-            if reporting:
+            if excluded:
+                excluded_bypass.append({
+                    **priv_users[uid],
+                    "policies": ", ".join(p["name"] for p in excluded),
+                })
+            elif reporting:
                 report_only_bypass.append({
                     **priv_users[uid],
                     "policies": ", ".join(p["name"] for p in reporting),
                 })
         else:
-            if not any(p["mfa"] for p in applying):
+            if not any(p["mfa"] or p["block"] for p in applying):
                 no_mfa.append(priv_users[uid])
-            if not any(p["compliant"] for p in applying):
+            if not any(p["compliant"] or p["block"] for p in applying):
                 no_compliant.append(priv_users[uid])
     progress("users", f"{len(zero_coverage)} zero coverage, "
-                      f"{len(no_mfa)} without MFA, {len(no_compliant)} without compliant-device policy, "
-                      f"{len(report_only_bypass)} report-only bypass")
+                      f"{len(no_mfa)} without MFA/Block, {len(no_compliant)} without compliant-device/Block, "
+                      f"{len(report_only_bypass)} report-only bypass, "
+                      f"{len(excluded_bypass)} excluded bypass")
 
     progress("apps")
     priv_sp_ids = {}
@@ -12418,15 +12886,18 @@ def run_ca_analysis(db_path, progress, target_upn=None,
             sid = (rec.get("__ids") or {}).get("sp")
             if sid and sid not in priv_sp_ids:
                 priv_sp_ids[sid] = rec.get("severity", "Info")
+    def app_covered(p, app_id):
+        inc = [str(a).lower() for a in p["apps_inc"] if a]
+        exc = [str(a).lower() for a in p["apps_exc"] if a]
+        if "all" in exc or app_id in exc:
+            return False
+        return "all" in inc or "office365" in inc or app_id in inc
+
     app_gaps = []
     for sid in sorted(priv_sp_ids):
         sp = data["sps"].get(sid) or {"name": sid, "appId": ""}
         app_id = (sp.get("appId") or "").lower()
-        covered = any(
-            "All" in p["apps_inc"] or "Office365" in p["apps_inc"]
-            or any(str(a).lower() == app_id for a in p["apps_inc"] if a)
-            for p in enabled)
-        if not covered:
+        if app_id and not any(app_covered(p, app_id) for p in enabled):
             app_gaps.append({"sp_id": sid, "name": sp.get("name") or sid,
                              "severity": priv_sp_ids[sid]})
     progress("apps", f"{len(app_gaps)} privileged app(s) without coverage")
@@ -12447,7 +12918,8 @@ def run_ca_analysis(db_path, progress, target_upn=None,
     excl_rows = []
     for uid in sorted(priv_users, key=lambda u: (severity_rank(priv_users[u]["severity"]),
                                                  priv_users[u]["upn"].lower())):
-        exclusions = [p for p in enabled if uid in p["exc_users"]]
+        exclusions = [p for p in enabled
+                      if would_include(p, uid) and uid in p["exc_users"]]
         if exclusions:
             excl_rows.append({
                 **priv_users[uid],
@@ -12455,6 +12927,239 @@ def run_ca_analysis(db_path, progress, target_upn=None,
                 "policies": ", ".join(p["name"] for p in exclusions),
             })
     progress("exclusions", f"{len(excl_rows)} privileged user(s) with exclusions")
+
+    # ---- bounded path audit ------------------------------------------------
+    path_records = []
+    path_mode = (options.get("mode") or "fast").lower()
+    if path_mode not in ("fast", "full"):
+        path_mode = "fast"
+    raw_max = options.get("max_scenarios", 24)
+    try:
+        path_max = 24 if raw_max in (None, "") else max(0, min(500, int(raw_max)))
+    except (TypeError, ValueError):
+        path_max = 24
+    path_active = set()
+    for p in policies:
+        if p["locations_inc"] or p["locations_exc"] or p["trusted_locations"]:
+            path_active.add("trusted_location")
+        if p["platforms_inc"] or p["platforms_exc"]:
+            path_active.add("platform")
+        if p["risk_signin"]:
+            path_active.add("signin_risk")
+        if p["risk_user"]:
+            path_active.add("user_risk")
+        if p["auth_flows_inc"] or p["auth_flows_exc"]:
+            path_active.add("auth_flow")
+        if p["device_rules"]:
+            path_active.add("device_filter")
+        if p["device_states_inc"] or p["device_states_exc"]:
+            path_active.add("device_state")
+
+    app_name_by_id = {}
+    for sp in data["sps"].values():
+        app_id = (sp.get("appId") or "").lower()
+        if app_id:
+            app_name_by_id[app_id] = sp.get("name") or app_id
+
+    def _resource_label(resource_id):
+        if resource_id == "__unscoped__":
+            return "Apps without specific CA policies"
+        name = app_name_by_id.get(str(resource_id).lower())
+        return f"{name} ({resource_id})" if name else str(resource_id)
+
+    resource_opt = str(options.get("resource") or "").strip()
+    client_opt = str(options.get("client_app") or "").strip()
+    path_clients = ([client_opt] if client_opt in CA_CLIENT_APP_TYPES
+                    else list(CA_CLIENT_APP_TYPES))
+    path_is_acr = resource_opt.lower().startswith("urn:")
+    path_resources = []
+    if path_is_acr:
+        path_resources = [(None, resource_opt, False, resource_opt)]
+    elif resource_opt and resource_opt.lower() not in ("all", ""):
+        if resource_opt.lower() in ("unscoped", "__unscoped__"):
+            path_resources = [(None, "Apps without specific CA policies", True, None)]
+        else:
+            path_resources = [(resource_opt, _resource_label(resource_opt), False, None)]
+    else:
+        resource_ids = set()
+        for p in policies:
+            for a in (p["apps_inc"] + p["apps_exc"]):
+                low = str(a).lower()
+                if a and low not in ("all", "none", "office365"):
+                    resource_ids.add(str(a))
+        for rid in sorted(resource_ids, key=lambda x: _resource_label(x).lower()):
+            path_resources.append((rid, _resource_label(rid), False, None))
+        path_resources.append((None, "Apps without specific CA policies", True, None))
+
+    def _iter_path_scenarios():
+        if path_mode == "full":
+            platforms = (["windows", "macos", "linux", "ios", "android"]
+                         if "platform" in path_active else [None])
+            trusted = [False, True] if "trusted_location" in path_active else [False]
+            signin = (["none", "low", "medium", "high"]
+                      if "signin_risk" in path_active else [None])
+            userrisk = (["low", "medium", "high"]
+                        if "user_risk" in path_active else [None])
+            authflow = ([None, "devicecodeflow", "authtransfer"]
+                        if "auth_flow" in path_active else [None])
+            devfilter = ([None, False, True]
+                         if "device_filter" in path_active else [None])
+        else:
+            platforms = ["windows"]
+            trusted = [False, True] if "trusted_location" in path_active else [False]
+            signin = ["none"]
+            userrisk = ["low"]
+            authflow = [None]
+            devfilter = [None]
+        devcombos = ([(True, True), (True, False), (False, True), (False, False)]
+                     if "device_state" in path_active else [(True, True)])
+        for platform, trust, signin, userrisk, authflow, devfilter in itertools.product(
+                platforms, trusted, signin, userrisk, authflow, devfilter):
+            for compliant, hybrid in devcombos:
+                yield {
+                    "platform": platform,
+                    "trusted_location": trust,
+                    "signin_risk": signin,
+                    "user_risk": userrisk,
+                    "auth_flow": authflow,
+                    "device_filter": devfilter,
+                    "device_compliant": compliant,
+                    "device_hybrid_joined": hybrid,
+                }
+
+    def _summarize_path(outcomes):
+        has_gap = has_req = has_blocked = False
+        gap_type, gap_policies = None, []
+        req_outcome = None
+        for o in outcomes:
+            if o["blocked"]:
+                has_blocked = True
+                continue
+            if not o["controls"]:
+                has_gap = True
+                if gap_type is None or o["gap_type"] == "NO_POLICIES_APPLY":
+                    gap_type = o["gap_type"]
+                    gap_policies = o["policies"]
+            else:
+                has_req = True
+                if req_outcome is None or len(o["controls"]) < len(req_outcome["controls"]):
+                    req_outcome = o
+        return {
+            "has_gap": has_gap, "has_req": has_req, "has_blocked": has_blocked,
+            "gap_type": gap_type, "gap_policies": gap_policies,
+            "req_controls": req_outcome["controls"] if req_outcome else None,
+            "req_controls_display": req_outcome["controls_display"] if req_outcome else "",
+            "req_policies": req_outcome["policies"] if req_outcome else [],
+        }
+
+    def _evaluate_path(uid, app_id, resource_label, unscoped, acr, client_app):
+        outcomes = {}
+        scenarios_evaluated = 0
+        for base_sc in _iter_path_scenarios():
+            sc = dict(base_sc)
+            sc.update({"app_id": app_id, "acr": acr,
+                       "client_app": client_app,
+                       "resource_unscoped": unscoped})
+            enabled_apply, excluded_apply, reporting_apply = [], [], []
+            for p in policies:
+                if not would_include(p, uid):
+                    continue
+                verdict, _note = condition_verdict(p, sc)
+                if p["enabled"]:
+                    if uid in p["exc_users"]:
+                        if verdict == "yes":
+                            excluded_apply.append(p)
+                    elif verdict == "yes":
+                        enabled_apply.append(p)
+                elif p["state"] not in ("Disabled", "Unknown"):
+                    if uid not in p["exc_users"] and verdict == "yes":
+                        reporting_apply.append(p)
+            blocked = next((p for p in enabled_apply if p["block"]), None)
+            if blocked:
+                controls = []
+                gap_type = None
+                display = "Block"
+                responsible = [p["name"] for p in enabled_apply if p["block"]]
+            else:
+                control_pols = [p for p in enabled_apply
+                                if p["controls"] and not p["block"]]
+                if control_pols:
+                    controls = sorted({
+                        _control_label(c) for p in control_pols
+                        for c in p["controls"]
+                        if str(c).lower() not in ("block",)
+                    })
+                    gap_type = None
+                    display = " + ".join(filter(None, [
+                        _policy_control_display(p) for p in control_pols]))
+                    responsible = [p["name"] for p in control_pols]
+                elif excluded_apply:
+                    controls = []
+                    gap_type = "EXCLUDED_BYPASS"
+                    display = ""
+                    responsible = [p["name"] for p in excluded_apply]
+                elif reporting_apply:
+                    controls = []
+                    gap_type = "REPORT_ONLY_BYPASS"
+                    display = ""
+                    responsible = [p["name"] for p in reporting_apply]
+                else:
+                    controls = []
+                    gap_type = "NO_POLICIES_APPLY"
+                    display = ""
+                    responsible = []
+            key = (tuple(controls), gap_type, bool(blocked))
+            o = outcomes.get(key)
+            if o is None:
+                o = outcomes[key] = {
+                    "controls": controls, "gap_type": gap_type,
+                    "blocked": bool(blocked), "policies": [],
+                    "controls_display": display, "conditions": [],
+                    "scenario_count": 0,
+                }
+            o["scenario_count"] += 1
+            for name in responsible:
+                if name and name not in o["policies"]:
+                    o["policies"].append(name)
+            if len(o["conditions"]) < 10:
+                o["conditions"].append(dict(sc))
+            scenarios_evaluated += 1
+            if path_max and scenarios_evaluated >= path_max:
+                break
+        outcome_list = list(outcomes.values())
+        for o in outcome_list:
+            o["policies"] = sorted(o["policies"])
+        summary = _summarize_path(outcome_list)
+        return {
+            "outcomes": outcome_list, "scenarios_evaluated": scenarios_evaluated,
+            **summary,
+        }
+
+    if not target_upn and priv_users:
+        for uid in sorted(priv_users, key=lambda u: (
+                severity_rank(priv_users[u]["severity"]),
+                priv_users[u]["upn"].lower())):
+            user = priv_users[uid]
+            for app_id, resource_label, unscoped, acr in path_resources:
+                for client_app in path_clients:
+                    result = _evaluate_path(uid, app_id, resource_label,
+                                            unscoped, acr, client_app)
+                    path_records.append({
+                        "uid": uid, "user": user["name"], "upn": user["upn"],
+                        "severity": user["severity"], "resource": resource_label,
+                        "resource_id": app_id or "", "acr": acr or "",
+                        "client_app": client_app, **result,
+                    })
+        path_records.sort(key=lambda r: (
+            0 if r["has_gap"] else 1 if r["has_req"] else 2,
+            r["upn"].lower(), r["resource"].lower(), r["client_app"]))
+    path_gap_records = [r for r in path_records if r["has_gap"]]
+    path_gap_users = len({r["uid"] for r in path_gap_records})
+    path_gap_counts = Counter(r["gap_type"] for r in path_gap_records if r["gap_type"])
+    path_scenarios = sum(r["scenarios_evaluated"] for r in path_records)
+    progress("paths", "single-user what-if" if target_upn else
+             f"{len(path_records)} path(s), {len(path_gap_records)} gap path(s), "
+             f"{path_scenarios} scenario(s)")
 
     progress("render")
 
@@ -12575,21 +13280,27 @@ def run_ca_analysis(db_path, progress, target_upn=None,
         locations = ", ".join(loc_bits) or "—"
         risks = " + ".join([", ".join(p["risk_signin"]), ", ".join(p["risk_user"])]).strip(" +")
         clients = fmt(p["client_inc"]) if p["client_inc"] else "—"
+        authflows = fmt(p["auth_flows_inc"]) if p["auth_flows_inc"] else "—"
+        acrs = fmt(p["acrs_inc"]) if p["acrs_inc"] else "—"
+        devfilter = ("Filtered" if p["device_rules"] else "—")
+        controls_display = _policy_control_display(p) or "—"
         fields = {"polname": p["name"], "polstate": p["state"],
-                  "polcontrols": ", ".join(controls), "polapps": fmt(p["apps_inc"]),
+                  "polcontrols": controls_display, "polapps": fmt(p["apps_inc"]),
                   "platforms": platforms, "devicestates": device_states,
-                  "locations": locations, "risk": risks or "—", "clients": clients}
+                  "locations": locations, "risk": risks or "—", "clients": clients,
+                  "authflows": authflows, "devfilter": devfilter, "acrs": acrs}
         text = " ".join(fields.values()).lower()
         cells = (
             f'<td class="clickable" data-field="polName" data-value="{esc(p["name"])}">{esc(p["name"])}</td>'
             f'<td data-field="polState" data-value="{esc(p["state"])}">{esc(p["state"])}</td>'
-            f'<td data-field="polControls" data-value="{esc(", ".join(controls))}">{esc(", ".join(controls) or "—")}</td>'
+            f'<td data-field="polControls" data-value="{esc(controls_display)}">{esc(controls_display)}</td>'
             f'<td data-field="polApps" data-value="{esc(fmt(p["apps_inc"]))}">{esc(fmt(p["apps_inc"]))}</td>'
             f'<td>{esc(platforms)}</td><td>{esc(device_states)}</td><td>{esc(locations)}</td>'
-            f'<td>{esc(risks or "—")}</td><td>{esc(clients)}</td>')
+            f'<td>{esc(risks or "—")}</td><td>{esc(clients)}</td>'
+            f'<td>{esc(authflows)}</td><td>{esc(devfilter)}</td><td>{esc(acrs)}</td>')
         html = (f'<tr data-policy-id="{esc(p["id"])}" data-detail-key="{key}">'
                 f'<td class="expand-cell">{EXPAND_BUTTON_HTML}</td>{cells}</tr>'
-                f'{drawer_for_html(key, 10)}')
+                f'{drawer_for_html(key, 13)}')
         return {"_html": html, "_text": text, "fields": fields}
 
     conds_rows = [conds_row(p, f"ca-conds-{i}") for i, p in enumerate(enabled)]
@@ -12616,6 +13327,68 @@ def run_ca_analysis(db_path, progress, target_upn=None,
             "REPORT_ONLY_BYPASS (privileged users covered only by report-only policies)",
             [("Privileges", "100px"), ("User", "220px"), ("UPN", "240px"), ("Coverage", "110px")],
             ro_rows, {"1": "severity", "3": "upn"}))
+    if excluded_bypass:
+        eb_rows = []
+        for i, r in enumerate(excluded_bypass):
+            extra = (f'<td><span class="perm" title="{esc(r["policies"])}">excluded</span></td>')
+            row = user_row(r, f"ca-eb-{i}", extra)
+            row["fields"]["excluded"] = r["policies"]
+            eb_rows.append(row)
+        tables.append(build_table(
+            "ca-excluded-table",
+            "EXCLUDED_BYPASS (no other enabled policy applies)",
+            [("Privileges", "100px"), ("User", "220px"), ("UPN", "240px"), ("Coverage", "110px")],
+            eb_rows, {"1": "severity", "3": "upn"}))
+    if path_records:
+        path_rows = []
+        for i, r in enumerate(path_records):
+            if r["has_gap"]:
+                result_badge = '<span class="badge sev-critical">Gap</span>'
+                result_text = "Gap"
+            elif r["req_controls"]:
+                result_badge = '<span class="badge badge-enabled">Requires</span>'
+                result_text = "Requires " + r["req_controls_display"]
+            elif r["has_blocked"]:
+                result_badge = '<span class="badge badge-enabled">Blocked</span>'
+                result_text = "Blocked"
+            else:
+                result_badge = '<span class="muted">&mdash;</span>'
+                result_text = ""
+            policies_text = ", ".join(r["gap_policies"] or r["req_policies"] or [])
+            gap_text = r["gap_type"] or "—"
+            fields = {
+                "user": r["user"], "upn": r["upn"], "resource": r["resource"],
+                "clientapp": r["client_app"], "result": result_text,
+                "gaptype": r["gap_type"] or "", "policies": policies_text,
+                "scenarios": str(r["scenarios_evaluated"]),
+            }
+            cells = (
+                f'<td class="clickable" data-field="user" data-value="{esc(r["user"])}">{esc(r["user"])}</td>'
+                f'<td data-field="userUpn" data-value="{esc(r["upn"])}">{esc(r["upn"])}</td>'
+                f'<td data-field="resource" data-value="{esc(r["resource"])}">{esc(r["resource"])}</td>'
+                f'<td data-field="clientapp" data-value="{esc(r["client_app"])}">{esc(r["client_app"])}</td>'
+                f'<td data-field="result" data-value="{esc(result_text)}">{result_badge}</td>'
+                f'<td data-field="gaptype" data-value="{esc(gap_text)}">{esc(gap_text)}</td>'
+                f'<td data-field="policies" data-value="{esc(policies_text)}">{esc(policies_text or "—")}</td>'
+                f'<td data-field="scenarios" data-value="{esc(str(r["scenarios_evaluated"]))}">{r["scenarios_evaluated"]}</td>'
+            )
+            path_rows.append({
+                "_html": (f'<tr data-profile-id="{esc(r["uid"])}" data-detail-key="ca-path-{i}">'
+                          f'<td class="expand-cell">{EXPAND_BUTTON_HTML}</td>{cells}</tr>'
+                          f'{drawer_for_html("ca-path-" + str(i), 9)}'),
+                "_text": " ".join(fields.values()).lower(),
+                "fields": fields,
+            })
+        tables.append(build_table(
+            "ca-path-table", "CA path audit",
+            [("User", "180px"), ("UPN", "210px"), ("Resource", "220px"),
+             ("Client app", "140px"), ("Result", "130px"), ("Gap type", "130px"),
+             ("Policies", "280px"), ("Scenarios", "80px")],
+            path_rows, {"1": "user", "2": "upn", "3": "resource", "4": "clientapp",
+                        "5": "result", "6": "gaptype", "7": "policies", "8": "scenarios"},
+            subtitle=f'<p class="sub">Mode: {esc(path_mode)} · '
+                     f'active dims: {esc(", ".join(sorted(path_active)) or "none")} · '
+                     f'scenario cap: {path_max or "none"}</p>'))
     if app_rows:
         tables.append(build_table("ca-apps-table", "Privileged apps with no CA coverage",
                                   [("Privileges", "100px"), ("Application", "240px")],
@@ -12639,9 +13412,10 @@ def run_ca_analysis(db_path, progress, target_upn=None,
                                   excl_table_rows, {"1": "severity", "3": "upn", "4": "caexcl"}))
     if enabled:
         tables.append(build_table("ca-conditions-table", "Enabled CA policy conditions",
-                                  [("Policy", "240px"), ("State", "90px"), ("Controls", "150px"),
+                                  [("Policy", "240px"), ("State", "90px"), ("Controls", "170px"),
                                    ("Apps", "130px"), ("Platforms", "150px"), ("Device states", "130px"),
-                                   ("Locations", "150px"), ("Risk", "120px"), ("Client types", "160px")],
+                                   ("Locations", "150px"), ("Risk", "120px"), ("Client types", "160px"),
+                                   ("Auth flows", "120px"), ("Device filter", "100px"), ("ACR", "150px")],
                                   conds_rows, {"1": "polname", "2": "polstate"}))
 
     sections_html = "".join(t["section"] for t in tables if t)
@@ -12747,123 +13521,26 @@ def run_ca_analysis(db_path, progress, target_upn=None,
         excl_pols = [p for p in enabled if _excluded_sim(p)]
 
         # ---- what-if condition evaluation ----------------------------------
+        def _bool_opt(value):
+            if value in (None, ""):
+                return None
+            return str(value).strip().lower() in ("1", "true", "yes", "match")
+
         sc = {"app_id": scenario.get("app_id") or None,
+              "acr": scenario.get("acr") or None,
               "client_app": scenario.get("client_app") or None,
               "platform": scenario.get("platform") or None,
               "device_state": scenario.get("device_state") or None,
               "signin_risk": scenario.get("signin_risk") or None,
               "user_risk": scenario.get("user_risk") or None,
+              "auth_flow": scenario.get("auth_flow") or None,
+              "device_filter": _bool_opt(scenario.get("device_filter")),
+              "device_compliant": None,
+              "device_hybrid_joined": None,
+              "resource_unscoped": False,
               "require": (scenario.get("require") or "").strip().lower(),
               "trusted_location": (None if scenario.get("trusted_location") in (None, "")
                                    else str(scenario["trusted_location"]).lower() == "true")}
-
-        def _app_axis(p):
-            if not p["apps_inc"] and not p["apps_exc"]:
-                return True, None
-            app_id = sc["app_id"]
-            inc_l = [str(a).lower() for a in p["apps_inc"]]
-            exc_l = [str(a).lower() for a in p["apps_exc"]]
-            if app_id and ("all" in exc_l or app_id.lower() in exc_l):
-                return False, "resource excluded"
-            if "all" in inc_l or "office365" in inc_l:
-                return True, None
-            if not app_id:
-                return None, "resource not specified"
-            if app_id.lower() in inc_l:
-                return True, None
-            return False, "resource not targeted"
-
-        def _client_axis(p):
-            if not p["client_inc"] and not p["client_exc"]:
-                return True, None
-            client = sc["client_app"]
-            if not client:
-                return None, "client app not specified"
-            inc_l = [str(c).lower() for c in p["client_inc"]]
-            exc_l = [str(c).lower() for c in p["client_exc"]]
-            if "all" in exc_l or client.lower() in exc_l:
-                return False, "client app excluded"
-            if "all" in inc_l or client.lower() in inc_l:
-                return True, None
-            if client.lower() in ("exchangeactivesync", "other") and any(
-                    str(c).lower() in CA_LEGACY_CLIENT_TYPES for c in inc_l):
-                return True, None
-            if inc_l and client.lower() in ("exchangeactivesync", "other"):
-                return None, "legacy client mapping uncertain"
-            return False, "client app not targeted"
-
-        def _platform_axis(p):
-            if not p["platforms_inc"] and not p["platforms_exc"]:
-                return True, None
-            plat = sc["platform"]
-            if not plat:
-                return None, "platform not specified"
-            exc_l = [str(x).lower() for x in p["platforms_exc"]]
-            if plat.lower() in exc_l:
-                return False, "platform excluded"
-            inc_l = [str(x).lower() for x in p["platforms_inc"]]
-            if "all" in inc_l or plat.lower() in inc_l:
-                return True, None
-            return False, "platform not targeted"
-
-        def _device_state_axis(p):
-            if not p["device_states_inc"] and not p["device_states_exc"]:
-                return True, None
-            state = sc["device_state"]
-            if not state:
-                return None, "device state not specified"
-            exc_l = [str(x).lower() for x in p["device_states_exc"]]
-            if state.lower() in exc_l:
-                return False, "device state excluded"
-            inc_l = [str(x).lower() for x in p["device_states_inc"]]
-            if "all" in inc_l or state.lower() in inc_l:
-                return True, None
-            return False, "device state not targeted"
-
-        def _location_axis(p):
-            inc_l, exc_l = p["locations_inc"], p["locations_exc"]
-            if not inc_l and not exc_l and not p["trusted_locations"]:
-                return True, None
-            trusted = sc["trusted_location"]
-            for loc in exc_l:
-                low = str(loc).lower()
-                if low == "all":
-                    return False, "all locations excluded"
-                if low == "alltrusted":
-                    if trusted is True:
-                        return False, "trusted locations excluded"
-                    continue
-                rec = data["locations"].get(loc)
-                if rec is None:
-                    return None, "named location excluded (not found)"
-                if trusted is not None and rec["trusted"] == trusted:
-                    return False, f"location '{rec['name']}' excluded"
-            if p["trusted_locations"] or any(str(l).lower() == "alltrusted" for l in inc_l):
-                if trusted is None:
-                    return None, "trusted location not specified"
-                return trusted, None
-            for loc in inc_l:
-                low = str(loc).lower()
-                if low == "all":
-                    return True, None
-                rec = data["locations"].get(loc)
-                if rec is None:
-                    return None, "named location (not found)"
-                if trusted is None:
-                    return None, f"location '{rec['name']}' not specified"
-                if rec["trusted"] == trusted:
-                    return True, None
-                return False, f"location '{rec['name']}' does not match"
-            return True, None
-
-        def _risk_axis(name, policy_list, sc_value):
-            if not policy_list:
-                return True, None
-            if not sc_value:
-                return None, f"{name} not specified"
-            if any(str(r).lower() == sc_value.lower() for r in policy_list):
-                return True, None
-            return False, f"{name} not targeted"
 
         def _effect(p):
             if p["block"]:
@@ -12871,22 +13548,13 @@ def run_ca_analysis(db_path, progress, target_upn=None,
             return "Grant" if p["controls"] else "Unknown"
 
         def whatif_eval(p):
-            axes = [_app_axis(p), _client_axis(p), _platform_axis(p),
-                    _device_state_axis(p), _location_axis(p),
-                    _risk_axis("sign-in risk", p["risk_signin"], sc["signin_risk"]),
-                    _risk_axis("user risk", p["risk_user"], sc["user_risk"])]
-            notes = []
-            for matched, note in axes:
-                if matched is False:
-                    return {"applies": "no", "note": note}
-                if matched is None:
-                    notes.append(note)
-            if notes:
-                return {"applies": "signal", "note": "; ".join(notes)}
-            return {"applies": "yes", "note": None}
+            verdict, note = condition_verdict(p, sc)
+            return {"applies": verdict, "note": note}
 
         whatif_rows = []
-        for p in enabled:
+        for p in policies:
+            if p["state"] == "Disabled":
+                continue
             if not _included_sim(p) or _excluded_sim(p):
                 continue
             verdict = whatif_eval(p)
@@ -12898,10 +13566,25 @@ def run_ca_analysis(db_path, progress, target_upn=None,
                    if r["verdict"]["applies"] == "yes" and r["state"] != "Enabled"]
         gap = None
         require = sc["require"]
-        require_label = {"mfa": "MFA"}.get(require)
-        if require == "mfa" and not any(r["mfa"] for r in def_en):
+        require_label = {"mfa": "MFA", "compliant": "compliant device",
+                         "mfa_compliant": "MFA + compliant device"}.get(require)
+        blocked = any(r["block"] for r in def_en)
+        if blocked:
+            gap = None
+        elif require == "mfa" and not any(r["mfa"] for r in def_en):
             gap = ("NO_MFA_ENFORCED",
                    "No definitively applying enabled policy requires MFA in this scenario.")
+        elif require == "compliant" and not any(r["compliant"] for r in def_en):
+            gap = ("NO_COMPLIANT_DEVICE_ENFORCED",
+                   "No definitively applying enabled policy requires a compliant device in this scenario.")
+        elif require == "mfa_compliant" and not (
+                any(r["mfa"] for r in def_en)
+                and any(r["compliant"] for r in def_en)):
+            gap = ("NO_MFA_COMPLIANT_ENFORCED",
+                   "No definitively applying enabled policy enforces both MFA and a compliant device in this scenario.")
+        elif excl_pols and not def_en:
+            gap = ("EXCLUDED_BYPASS",
+                   "An enabled policy would otherwise apply, but this user is excluded.")
         elif not def_en and not def_rep:
             gap = ("NO_POLICIES_APPLY",
                    "No policy definitively applies in this scenario.")
@@ -12909,9 +13592,9 @@ def run_ca_analysis(db_path, progress, target_upn=None,
             gap = ("REPORT_ONLY_BYPASS",
                    "Only report-only policies definitively apply; no enforcement.")
         elif sc["trusted_location"] is True and not any(
-                r["mfa"] or r["block"] for r in def_en):
+                r["mfa"] or r["block"] or r["compliant"] for r in def_en):
             gap = ("TRUSTED_LOCATION_BYPASS",
-                   "Definitive policies apply from the trusted location, but none enforce MFA or Block.")
+                   "Definitive policies apply from the trusted location, but none enforce MFA, compliant device, or Block.")
 
         # ---- render: applying table with reasons ---------------------------
         apply_rows = []
@@ -12926,12 +13609,13 @@ def run_ca_analysis(db_path, progress, target_upn=None,
             if p["auth_strength"]:
                 controls.append("Auth strength")
             why = _include_reason(p)
-            fields = {"polname": p["name"], "controls": ", ".join(controls),
+            controls_display = _policy_control_display(p) or ", ".join(controls) or "—"
+            fields = {"polname": p["name"], "controls": controls_display,
                       "mfa": "Yes" if p["mfa"] else "—",
                       "compliant": "Yes" if p["compliant"] else "—",
                       "why": why}
             cells = (f'<td class="clickable" data-field="polName" data-value="{esc(p["name"])}">{esc(p["name"])}</td>'
-                     f'<td>{esc(", ".join(controls) or "—")}</td>'
+                     f'<td>{esc(controls_display)}</td>'
                      f'<td>{esc("Yes" if p["mfa"] else "—")}</td>'
                      f'<td>{esc("Yes" if p["compliant"] else "—")}</td>'
                      f'<td class="muted">{esc(why)}</td>')
@@ -12977,6 +13661,10 @@ def run_ca_analysis(db_path, progress, target_upn=None,
                 rows.append(f"<tr><th>Platform</th><td>{esc(plat)}</td></tr>")
             axis("Client types", r["client_inc"], r["client_exc"])
             axis("Device states", r["device_states_inc"], r["device_states_exc"])
+            axis("Auth flows", r["auth_flows_inc"], r["auth_flows_exc"])
+            if r["device_rules"]:
+                rows.append("<tr><th>Device filter</th><td>present</td></tr>")
+            axis("ACR / user actions", r["acrs_inc"], r["acrs_exc"])
             loc_bits = []
             if r["trusted_locations"]:
                 loc_bits.append("Trusted locations")
@@ -13009,17 +13697,20 @@ def run_ca_analysis(db_path, progress, target_upn=None,
             v = r["verdict"]
             verdict_label = {"yes": "Applies", "no": "Does not apply",
                              "signal": "Applies (signal-dependent)"}[v["applies"]]
+            controls_display = _policy_control_display(r) or "—"
             fields = {"polname": r["name"], "state": r["state"],
-                      "effect": _effect(r), "verdict": verdict_label,
-                      "note": v["note"] or ""}
+                      "controls": controls_display, "effect": _effect(r),
+                      "verdict": verdict_label, "note": v["note"] or ""}
             cells = (f'<td class="clickable" data-field="polName" data-value="{esc(r["name"])}">{esc(r["name"])}</td>'
                      f'<td>{esc(r["state"])}</td>'
+                     f'<td>{esc(controls_display)}</td>'
                      f'<td>{esc(_effect(r))}</td>'
                      f'<td>{esc(verdict_label)}</td>'
                      f'<td class="muted">{esc(v["note"] or "—")}</td>')
             summary = (f'<table class="kv-table">'
                        f'<tr><th>Policy</th><td>{esc(r["name"])}</td></tr>'
                        f'<tr><th>State</th><td>{esc(r["state"])}</td></tr>'
+                       f'<tr><th>Controls</th><td>{esc(controls_display)}</td></tr>'
                        f'<tr><th>Effect</th><td>{esc(_effect(r))}</td></tr>'
                        f'<tr><th>Verdict</th><td>{esc(verdict_label)}</td></tr>'
                        + (f'<tr><th>Signal note</th><td>{esc(v["note"])}</td></tr>' if v.get("note") else "")
@@ -13028,7 +13719,7 @@ def run_ca_analysis(db_path, progress, target_upn=None,
                            + '<div class="detail-section"><h4>Dependent signals</h4>'
                            + signals_html(r) + "</div>")
             drawer = (f'<tr class="drawer" data-detail-for="ca-whatif-{i}">'
-                      f'<td colspan="6"><div class="drawer-body">{drawer_body}</div></td></tr>')
+                      f'<td colspan="7"><div class="drawer-body">{drawer_body}</div></td></tr>')
             wi_rows.append({
                 "_html": (f'<tr data-detail-key="ca-whatif-{i}">'
                           f'<td class="expand-cell">{EXPAND_BUTTON_HTML}</td>{cells}</tr>'
@@ -13040,18 +13731,22 @@ def run_ca_analysis(db_path, progress, target_upn=None,
                                    sc["platform"] and f"platform={sc['platform']}",
                                    sc["client_app"] and f"client={sc['client_app']}",
                                    sc["device_state"] and f"device={sc['device_state']}",
+                                   sc["device_filter"] is not None
+                                       and f"device-filter={sc['device_filter']}",
                                    sc["trusted_location"] is not None
                                        and f"trusted={sc['trusted_location']}",
                                    sc["signin_risk"] and f"signin-risk={sc['signin_risk']}",
                                    sc["user_risk"] and f"user-risk={sc['user_risk']}",
+                                   sc["auth_flow"] and f"auth-flow={sc['auth_flow']}",
+                                   sc["acr"] and f"acr={sc['acr']}",
                                    sc["app_id"] and f"resource={sc['app_id']}"] if x]
         gap_html = (f'<p class="sub"><b>Gap: {esc(gap[0])}</b> — {esc(gap[1])}</p>' if gap else
                     f'<p class="sub">Coverage holds: a definitive enabled policy'
                     f'{f" enforces {esc(require_label)}" if require_label else ""} in this scenario.</p>')
         tables.append(build_table(
             "ca-whatif-table", "What-if evaluation",
-            [("Policy", "240px"), ("State", "90px"), ("Effect", "70px"),
-             ("Verdict", "150px"), ("Note", "240px")],
+            [("Policy", "240px"), ("State", "90px"), ("Controls", "170px"),
+             ("Effect", "70px"), ("Verdict", "150px"), ("Note", "240px")],
             wi_rows, {"1": "polname"},
             subtitle=f'<p class="sub">Scenario: {esc(" · ".join(wi_scenario)) if wi_scenario else "unspecified (all signal-dependent axes flagged)"}</p>'
                      + gap_html))
@@ -13059,6 +13754,8 @@ def run_ca_analysis(db_path, progress, target_upn=None,
         flags = []
         if not applying:
             flags.append("no CA policy applies")
+        elif any(p["block"] for p in applying):
+            flags.append("blocked by CA")
         else:
             if not any(p["mfa"] for p in applying):
                 flags.append("no MFA policy")
@@ -13079,10 +13776,12 @@ def run_ca_analysis(db_path, progress, target_upn=None,
     <div class="engine-card"><table class="kv-table">
       <tr><th>User</th><td>{esc(target['name'])} <span class="muted">({esc(target['upn'])})</span></td></tr>
       <tr><th>Privileges</th><td>{severity_badge(target['severity'])}</td></tr>
-      <tr><th>Enabled CA policies applying</th><td>{len(applying)}</td></tr>
-      <tr><th>MFA policies applying</th><td>{sum(1 for p in applying if p['mfa'])}</td></tr>
-      <tr><th>Compliant-device policies applying</th><td>{sum(1 for p in applying if p['compliant'])}</td></tr>
+      <tr><th>Enabled CA policies targeting user</th><td>{len(applying)}</td></tr>
+      <tr><th>Block policies targeting user</th><td>{sum(1 for p in applying if p['block'])}</td></tr>
+      <tr><th>MFA policies targeting user</th><td>{sum(1 for p in applying if p['mfa'])}</td></tr>
+      <tr><th>Compliant-device policies targeting user</th><td>{sum(1 for p in applying if p['compliant'])}</td></tr>
       <tr><th>Exclusions</th><td>{len(excl_pols)}</td></tr>
+      <tr><th>Required control</th><td>{esc(require_label or 'not specified')}</td></tr>
       <tr><th>Assessment</th><td>{esc(' · '.join(flags)) if flags else 'all coverage controls apply'}</td></tr>
     </table></div>
   </section>
@@ -13099,7 +13798,22 @@ def run_ca_analysis(db_path, progress, target_upn=None,
         sections_html = "".join(t["section"] for t in tables) + excl_html
         progress("render", f"{len(applying)} applying policy(ies), {len(excl_pols)} exclusion(s), "
                            f"{len(whatif_rows)} what-if evaluation(s)")
-        return {"summary_html": summary_html, "sections_html": sections_html, "tables": tables}
+        return {"summary_html": summary_html, "sections_html": sections_html,
+                "tables": tables}
+
+    path_summary_rows = ""
+    if path_records:
+        gap_types = ", ".join(f"{k}: {v}" for k, v in sorted(path_gap_counts.items()))
+        path_summary_rows = (
+            f"<tr><th>Path audit population</th><td>{esc(roster_label)}</td></tr>"
+            f"<tr><th>Path audit mode</th><td>{esc(path_mode)} · "
+            f"active dims: {esc(', '.join(sorted(path_active)) or 'none')} · "
+            f"cap: {path_max or 'none'}</td></tr>"
+            f"<tr><th>Paths evaluated</th><td>{len(path_records)}</td></tr>"
+            f"<tr><th>Gap paths</th><td>{len(path_gap_records)} ({path_gap_users} user(s))</td></tr>"
+            f"<tr><th>Path scenarios evaluated</th><td>{path_scenarios}</td></tr>"
+            f"<tr><th>Gap type counts</th><td>{esc(gap_types or 'none')}</td></tr>"
+        )
 
     summary_html = f"""
   <section data-category="configs">
@@ -13111,19 +13825,22 @@ def run_ca_analysis(db_path, progress, target_upn=None,
       <tr><th>Block policies</th><td>{sum(1 for p in policies if p['block'])}</td></tr>
       <tr><th>Location-based policies</th><td>{sum(1 for p in policies if p['locations_inc'] or p['trusted_locations'])}</td></tr>
       <tr><th>Risk-based policies</th><td>{sum(1 for p in policies if p['risk_signin'] or p['risk_user'])}</td></tr>
-      <tr><th>Privileged users analyzed</th><td>{len(priv_users)}</td></tr>
+      <tr><th>{esc(roster_label)} analyzed</th><td>{len(priv_users)}</td></tr>
       <tr><th>Zero CA coverage</th><td>{len(zero_coverage)}</td></tr>
       <tr><th>Report-only bypass</th><td>{len(report_only_bypass)}</td></tr>
-      <tr><th>No MFA policy coverage</th><td>{len(no_mfa)}</td></tr>
-      <tr><th>No compliant-device policy coverage</th><td>{len(no_compliant)}</td></tr>
+      <tr><th>EXCLUDED_BYPASS</th><td>{len(excluded_bypass)}</td></tr>
+      <tr><th>No MFA/Block policy coverage</th><td>{len(no_mfa)}</td></tr>
+      <tr><th>No compliant-device/Block policy coverage</th><td>{len(no_compliant)}</td></tr>
       <tr><th>Privileged apps without coverage</th><td>{len(app_gaps)}</td></tr>
       <tr><th>Legacy-auth block policies</th><td>{len(legacy_blockers)}</td></tr>
-      <tr><th>Privileged users with CA exclusions</th><td>{len(excl_rows)}</td></tr>
+      <tr><th>{esc(roster_label)} with CA exclusions</th><td>{len(excl_rows)}</td></tr>
+      {path_summary_rows}
     </table></div>
   </section>
 """
     progress("render", f"{len(zero_coverage) + len(no_mfa) + len(no_compliant) + len(report_only_bypass) + len(app_gaps) + len(legacy_gap) + len(excl_rows)} finding row(s)")
-    return {"summary_html": summary_html, "sections_html": sections_html, "tables": tables}
+    return {"summary_html": summary_html, "sections_html": sections_html,
+            "tables": tables}
 
 
 def make_ca_rows_fn():
@@ -13167,7 +13884,8 @@ def register_ca_tables(tables):
     SERVE_STATE["ca_table_ids"] = ids
 
 
-def start_ca_analysis(upn=None, assume_groups=None, assume_roles=None, scenario=None):
+def start_ca_analysis(upn=None, assume_groups=None, assume_roles=None,
+                      scenario=None, options=None):
     """Kick off the analysis in a background thread; returns the status dict."""
     state = SERVE_STATE["ca_analysis"]
     if state and state.get("status") == "running":
@@ -13189,10 +13907,13 @@ def start_ca_analysis(upn=None, assume_groups=None, assume_roles=None, scenario=
                                      target_upn=upn,
                                      assume_groups=assume_groups,
                                      assume_roles=assume_roles,
-                                     scenario=scenario)
+                                     scenario=scenario,
+                                     options=options)
             register_ca_tables(result.get("tables") or [])
-            state["result"] = {"summary_html": result.get("summary_html", ""),
-                               "sections_html": result.get("sections_html", "")}
+            state["result"] = {
+                "summary_html": result.get("summary_html", ""),
+                "sections_html": result.get("sections_html", ""),
+            }
             state["status"] = "done"
         except Exception as exc:  # noqa: BLE001 - surfaced to the UI
             state["status"] = "error"
@@ -13614,11 +14335,26 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                         return [x.strip() for x in raw.split(",") if x.strip()]
                     return []
 
+                try:
+                    max_scenarios = int(payload.get("max_scenarios") or 24)
+                except (TypeError, ValueError):
+                    max_scenarios = 24
+                options = {
+                    "population": (payload.get("population") or "privileged").strip().lower(),
+                    "users": _csv("users"),
+                    "synced_only": bool(payload.get("synced_only")),
+                    "include_disabled": bool(payload.get("include_disabled", True)),
+                    "resource": (payload.get("resource") or "").strip(),
+                    "client_app": (payload.get("client_app") or "").strip(),
+                    "mode": (payload.get("mode") or "fast").strip().lower(),
+                    "max_scenarios": max_scenarios,
+                }
                 state = start_ca_analysis(
                     upn=(payload.get("upn") or "").strip(),
                     assume_groups=_csv("assume_groups"),
                     assume_roles=_csv("assume_roles"),
-                    scenario=scenario)
+                    scenario=scenario,
+                    options=options)
                 self._send(json.dumps({"status": state["status"]}).encode("utf-8"),
                            "application/json; charset=utf-8")
             else:
@@ -13658,7 +14394,7 @@ def start_serve(port, total=None, after_start=None):
 # when the database fingerprint is unchanged; when the database changed, the
 # new analysis is diffed against the cached one and surfaced in the report.
 
-CACHE_VERSION = 6
+CACHE_VERSION = 7
 CACHE_DIR = SCRIPT_DIR / "data" / "databases" / ".cache"
 
 CACHE_FINGERPRINT_TABLES = (
