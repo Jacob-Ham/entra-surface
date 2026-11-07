@@ -99,49 +99,6 @@ DEFAULT_CHECK_CFG = {
 SYSTEM_DEFAULT_ROLE_ID = "00000000-0000-0000-0000-000000000000"
 SYSTEM_DEFAULT_ROLE = {"value": "Default", "description": "Default Role"}
 
-# Short human labels for well-known catalog permissions (the DB only stores the
-# long descriptions, e.g. the Microsoft Graph catalog). Override via
-# privileged_roles.json -> "role_labels".
-DEFAULT_ROLE_LABELS = {
-    # Microsoft Graph
-    "Application.ReadWrite.All": "Read and write all applications",
-    "AppRoleAssignment.ReadWrite.All": "Read and write all app role assignments",
-    "RoleManagement.ReadWrite.Directory": "Manage directory role assignments",
-    "RoleAssignmentSchedule.ReadWrite.Directory": "Read and write the role assignment schedule (PIM)",
-    "Directory.ReadWrite.All": "Read and write directory attributes.",
-    "User.ReadWrite.All": "Read and write all users' full profiles",
-    "Group.ReadWrite.All": "Read and write all groups except role-assignable",
-    "GroupMember.ReadWrite.All": "Read and write all group memberships except role-assignable",
-    "UserAuthenticationMethod.ReadWrite.All": "Read and write user authentication methods except for privileged users",
-    "Domain.ReadWrite.All": "Read and write custom domains",
-    "Synchronization.ReadWrite.All": "Manage directory synchronization",
-    "Policy.ReadWrite.ConditionalAccess": "Edit conditional access policies",
-    "PrivilegedAccess.ReadWrite.AzureAD": "Manage PIM assignments for Azure AD roles",
-    "PrivilegedAccess.ReadWrite.AzureADGroup": "Manage PIM assignments for privileged groups",
-    "RoleManagement.ReadWrite.All": "Manage roles for Microsoft 365 services",
-    "DeviceManagementConfiguration.ReadWrite.All": "Manage Intune device configuration",
-    "DeviceManagementScripts.ReadWrite.All": "Deploy scripts to Intune-managed devices",
-    "DeviceManagementManagedDevices.ReadWrite.All": "Manage Intune-managed devices",
-    "DeviceManagementRBAC.ReadWrite.All": "Manage Intune role-based access control",
-    "Mail.Send": "Send mail",
-    "Mail.ReadWrite": "Read and write mail",
-    "MailboxSettings.ReadWrite": "Read and write mailbox settings",
-    "Files.ReadWrite.All": "Read and write all files",
-    "Sites.FullControl.All": "Full control on all site collections",
-    "Sites.ReadWrite.All": "Read and write all site collections",
-    "Chat.ReadWrite.All": "Read and write all chat messages",
-    # Legacy AAD Graph
-    "Device.ReadWrite.All": "Read and write all devices",
-    # Office 365 Exchange Online
-    "full_access_as_app": "Full mailbox access",
-    "Exchange.ManageAsApp": "Manage Exchange as application",
-    "Exchange.ManageAsAppV2": "Manage Exchange as application (V2)",
-    "Exchange.AdminAPI.ManageAsApp": "Full control of Exchange Online via the admin API",
-    "Mailbox.Migration": "Migrate mailboxes",
-    # SharePoint Online
-    "TermStore.ReadWrite.All": "Edit the managed term store",
-}
-
 CATEGORY_ORDER = ["apps", "users", "ad", "groups", "configs", "arc"]
 # Which role class can fabricate membership in a dynamic group by editing the
 # referenced user attribute (Entra's rule grammar: `user.<attribute>`). A group
@@ -1235,11 +1192,17 @@ def load_config(config_path):
             directory_roles[name] = "Info"
     check_cfg["directory_roles"] = directory_roles
 
-    role_labels = dict(DEFAULT_ROLE_LABELS)
+    role_labels = {}
     for value, label in (data.get("role_labels") or {}).items():
         if isinstance(value, str) and isinstance(label, str) and not value.startswith("_"):
             role_labels[value] = label
     check_cfg["role_labels"] = role_labels
+
+    directory_role_descriptions = {}
+    for name, desc in (data.get("directory_role_descriptions") or {}).items():
+        if isinstance(name, str) and isinstance(desc, str) and not name.startswith("_"):
+            directory_role_descriptions[name] = desc
+    check_cfg["directory_role_descriptions"] = directory_role_descriptions
     return resources, check_cfg
 
 
@@ -4379,6 +4342,7 @@ def make_profile_builder(graph, check_cfg, group_roles=None, group_eligible_role
     memoized."""
     role_sev = check_cfg["directory_roles"]
     role_labels = check_cfg.get("role_labels") or {}
+    dir_role_desc = check_cfg.get("directory_role_descriptions") or {}
     if group_roles is None:
         group_roles = compute_group_roles(graph, check_cfg)
     if group_eligible_roles is None:
@@ -4441,7 +4405,8 @@ def make_profile_builder(graph, check_cfg, group_roles=None, group_eligible_role
         return sp_label(pid)
 
     def dir_roles_for(sp_oid):
-        return sp_dir_resolver(sp_oid)
+        return [{**role, "description": dir_role_desc.get(role["name"], "")}
+                for role in sp_dir_resolver(sp_oid)]
 
     def groups_for(sp_oid):
         return [{"name": graph["group"][g].get("displayName") or g}
@@ -7382,6 +7347,7 @@ def render_report(results, tenant_name, db_path, config_path,
     <div class="drawer-tabs" id="ca-view-tabs">
       <button type="button" class="drawer-tab active" data-caview="main">Conditional Access</button>
       <button type="button" class="drawer-tab" data-caview="single">Single user</button>
+      <button type="button" class="drawer-tab" data-caview="compare">Compare users</button>
     </div>
   </section>
 """)
@@ -7439,6 +7405,36 @@ def render_report(results, tenant_name, db_path, config_path,
       </div>
       <div class="ca-status hidden" id="ca-user-status"><ul id="ca-user-steps"></ul></div>
       <div class="ca-results" id="ca-user-results"></div>
+    </div>
+  </section>
+  <section data-category="configs" data-caview="compare" class="hidden">
+    <h2>Compare users</h2>
+    <div class="ca-analysis">
+      <p class="sub">Compare the Conditional Access policies that apply to two users under the same sign-in scenario.</p>
+      <div class="ca-controls">
+        <input type="text" id="ca-compare-a" class="ca-user-input" placeholder="User A UPN" autocomplete="off">
+        <input type="text" id="ca-compare-b" class="ca-user-input" placeholder="User B UPN" autocomplete="off">
+        <button type="button" class="mode-btn" id="ca-compare-btn">Compare users</button>
+      </div>
+      <div class="ca-whatif">
+        <label>Require <select id="ca-cmp-require"><option value="">—</option><option value="mfa">MFA</option><option value="compliant">Compliant device</option><option value="mfa_compliant">MFA + compliant</option></select></label>
+        <label>Platform <select id="ca-cmp-platform"><option value="">—</option><option>windows</option><option>macos</option><option>linux</option><option>ios</option><option>android</option></select></label>
+        <label>Client app <select id="ca-cmp-client"><option value="">—</option><option>browser</option><option>mobileAppsAndDesktopClients</option><option>exchangeActiveSync</option><option>other</option></select></label>
+        <label>Device state <select id="ca-cmp-device"><option value="">—</option><option>compliant</option><option>unmanaged</option><option>domainJoined</option></select></label>
+        <label>Device filter <select id="ca-cmp-devfilter"><option value="">—</option><option value="true">match</option><option value="false">no match</option></select></label>
+        <label>Trusted location <select id="ca-cmp-location"><option value="">—</option><option value="true">trusted</option><option value="false">not trusted</option></select></label>
+        <label>Sign-in risk <select id="ca-cmp-signin"><option value="">—</option><option>none</option><option>low</option><option>medium</option><option>high</option></select></label>
+        <label>User risk <select id="ca-cmp-userrisk"><option value="">—</option><option>low</option><option>medium</option><option>high</option></select></label>
+        <label>Auth flow <select id="ca-cmp-authflow"><option value="">—</option><option>devicecodeflow</option><option>authtransfer</option></select></label>
+        <label>Resource / app <input type="text" id="ca-cmp-app" class="ca-small-input" placeholder="optional" autocomplete="off"></label>
+        <label>ACR / user action <input type="text" id="ca-cmp-acr" class="ca-small-input" placeholder="urn:user:registerdevice" autocomplete="off"></label>
+        <label>Assume group(s) A <input type="text" id="ca-cmp-assume-groups-a" class="ca-small-input" placeholder="names or IDs, comma-separated" autocomplete="off"></label>
+        <label>Assume role(s) A <input type="text" id="ca-cmp-assume-roles-a" class="ca-small-input" placeholder="names or IDs, comma-separated" autocomplete="off"></label>
+        <label>Assume group(s) B <input type="text" id="ca-cmp-assume-groups-b" class="ca-small-input" placeholder="names or IDs, comma-separated" autocomplete="off"></label>
+        <label>Assume role(s) B <input type="text" id="ca-cmp-assume-roles-b" class="ca-small-input" placeholder="names or IDs, comma-separated" autocomplete="off"></label>
+      </div>
+      <div class="ca-status hidden" id="ca-compare-status"><ul id="ca-compare-steps"></ul></div>
+      <div class="ca-results" id="ca-compare-results"></div>
     </div>
   </section>
 """)
@@ -8163,7 +8159,7 @@ def render_report(results, tenant_name, db_path, config_path,
   .drawer-tab.active {{ background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); font-weight: 600; border-color: color-mix(in srgb, var(--accent) 35%, transparent); }}
   .dtab-pane {{ display: none; }}
   .dtab-pane.active {{ display: block; }}
-  .minor-table {{ width: 100%; border-collapse: collapse; font-size: 12px; margin: 4px 0 10px; }}
+  .minor-table {{ width: 100%; border-collapse: collapse; font-size: 12px; margin: 4px 0 10px; table-layout: fixed; }}
   .minor-table th {{
     text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--gridline);
     color: var(--text-muted); font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.02em;
@@ -8192,6 +8188,10 @@ def render_report(results, tenant_name, db_path, config_path,
   .drawer-body {{
     border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px;
     background: var(--surface-1);
+    max-width: min(100%, 1320px, calc(100vw - 80px));
+  }}
+  body.sidebar-open .drawer-body {{
+    max-width: min(100%, 1320px, calc(100vw - 340px));
   }}
   {collect_backend.styles_html()}
   {analysis.styles_html()}
@@ -8199,6 +8199,9 @@ def render_report(results, tenant_name, db_path, config_path,
     body.sidebar-open .app-main {{ margin-left: 0; }}
     .sidebar {{ width: min(84vw, 320px); }}
     body.sidebar-open .sidebar-toggle {{ left: min(84vw, 320px); }}
+    body.sidebar-open .drawer-body {{
+      max-width: min(100%, calc(100vw - 80px));
+    }}
   }}
 </style>
 </head>
@@ -9302,12 +9305,13 @@ def render_report(results, tenant_name, db_path, config_path,
           }}).join('') + '</ul>'
         : '<p class="muted">No owners recorded.</p>';
     var dirRolesHtml = (prof.dir_roles && prof.dir_roles.length)
-        ? '<p>' + prof.dir_roles.map(function(r) {{
+        ? '<ul class="profile-list">' + prof.dir_roles.map(function(r) {{
             var tag = pSev(r.severity) + ' ' + pEsc(r.name);
             if (r.eligible) tag += ' <span class="muted">(eligible)</span>';
             if (r.path) tag += ' <span class="muted">via ' + pEsc(r.path.join(' \u2192 ')) + '</span>';
-            return tag;
-          }}).join(' &nbsp;&middot;&nbsp; ') + '</p>'
+            if (r.description) tag += '<br><span class="muted">' + pEsc(r.description) + '</span>';
+            return '<li>' + tag + '</li>';
+          }}).join('') + '</ul>'
         : '<p class="muted">No directory roles assigned.</p>';
     var groupsHtml = (prof.groups && prof.groups.length)
         ? '<p>' + prof.groups.map(function(g) {{ return pEsc(g.name); }}).join(', ') + '</p>'
@@ -11273,6 +11277,7 @@ def render_report(results, tenant_name, db_path, config_path,
   var caRun = document.getElementById('ca-run-btn');
   var caUserBtn = document.getElementById('ca-user-btn');
   var caUserInput = document.getElementById('ca-user-input');
+  var caCompareBtn = document.getElementById('ca-compare-btn');
   var caPop = document.getElementById('ca-pop');
   var caUsersWrap = document.getElementById('ca-users-wrap');
   function caToggleUsers() {{
@@ -11285,7 +11290,7 @@ def render_report(results, tenant_name, db_path, config_path,
     caToggleUsers();
   }}
 
-  // CA view tabs: 'Conditional Access' vs 'Single user'
+  // CA view tabs: tenant overview, single user, or two-user comparison
   var caViewTabs = document.querySelectorAll('#ca-view-tabs .drawer-tab');
   if (caViewTabs.length) {{
     Array.prototype.forEach.call(caViewTabs, function(tab) {{
@@ -11307,9 +11312,13 @@ def render_report(results, tenant_name, db_path, config_path,
     var caUserStatusEl = document.getElementById('ca-user-status');
     var caUserStepsEl = document.getElementById('ca-user-steps');
     var caUserResultsEl = document.getElementById('ca-user-results');
+    var caCompareStatusEl = document.getElementById('ca-compare-status');
+    var caCompareStepsEl = document.getElementById('ca-compare-steps');
+    var caCompareResultsEl = document.getElementById('ca-compare-results');
     var caTimer = null;
     var caUserTimer = null;
-    var caButtons = [caRun, caUserBtn].filter(function(b) {{ return !!b; }});
+    var caCompareTimer = null;
+    var caButtons = [caRun, caUserBtn, caCompareBtn].filter(function(b) {{ return !!b; }});
 
     function caSetBusy(busy) {{
       caButtons.forEach(function(b) {{ b.disabled = busy; }});
@@ -11352,18 +11361,23 @@ def render_report(results, tenant_name, db_path, config_path,
       }}
     }}
 
-    function caPoll(isUser) {{
+    function caPoll(mode) {{
       fetch('/api/ca-analysis/status').then(function(r) {{ return r.json(); }})
         .then(function(d) {{
           if (!d || !d.steps) return;
-          if (isUser) {{
+          if (mode === 'single') {{
             caStepState(d, caUserStepsEl);
-            if (d.status === 'running') {{ caUserTimer = setTimeout(function() {{ caPoll(true); }}, 600); return; }}
+            if (d.status === 'running') {{ caUserTimer = setTimeout(function() {{ caPoll('single'); }}, 600); return; }}
             caSetBusy(false);
             caRenderResults(d, caUserResultsEl, true);
+          }} else if (mode === 'compare') {{
+            caStepState(d, caCompareStepsEl);
+            if (d.status === 'running') {{ caCompareTimer = setTimeout(function() {{ caPoll('compare'); }}, 600); return; }}
+            caSetBusy(false);
+            caRenderResults(d, caCompareResultsEl, false);
           }} else {{
             caStepState(d, caStepsEl);
-            if (d.status === 'running') {{ caTimer = setTimeout(function() {{ caPoll(false); }}, 600); return; }}
+            if (d.status === 'running') {{ caTimer = setTimeout(function() {{ caPoll('main'); }}, 600); return; }}
             caSetBusy(false);
             caRenderResults(d, caResultsEl, false);
           }}
@@ -11415,8 +11429,55 @@ def render_report(results, tenant_name, db_path, config_path,
         .then(function(r) {{ return r.json(); }})
         .then(function(d) {{
           if (d && d.status === 'running') {{
-            if (isUser) caUserTimer = setTimeout(function() {{ caPoll(true); }}, 600);
-            else caTimer = setTimeout(function() {{ caPoll(false); }}, 600);
+            if (isUser) caUserTimer = setTimeout(function() {{ caPoll('single'); }}, 600);
+            else caTimer = setTimeout(function() {{ caPoll('main'); }}, 600);
+          }} else {{
+            caSetBusy(false);
+          }}
+        }}).catch(function() {{ caSetBusy(false); }});
+    }}
+
+    function startCaCompare() {{
+      function val(id) {{
+        var el = document.getElementById(id);
+        return el ? el.value.trim() : '';
+      }}
+      var a = val('ca-compare-a');
+      var b = val('ca-compare-b');
+      if (!a || !b) {{
+        caCompareStatusEl.classList.remove('hidden');
+        caCompareStepsEl.innerHTML = '<li class="error">Enter both user UPNs.</li>';
+        return;
+      }}
+      caSetBusy(true);
+      caCompareResultsEl.innerHTML = '';
+      caCompareStatusEl.classList.remove('hidden');
+      caCompareStepsEl.innerHTML = '';
+      var payload = {{
+        compare_upns: [a, b],
+        assume_groups: val('ca-cmp-assume-groups-a'),
+        assume_roles: val('ca-cmp-assume-roles-a'),
+        assume_groups_b: val('ca-cmp-assume-groups-b'),
+        assume_roles_b: val('ca-cmp-assume-roles-b'),
+        scenario: {{
+          platform: val('ca-cmp-platform'), client_app: val('ca-cmp-client'),
+          device_state: val('ca-cmp-device'),
+          device_filter: val('ca-cmp-devfilter'),
+          trusted_location: val('ca-cmp-location'),
+          signin_risk: val('ca-cmp-signin'), user_risk: val('ca-cmp-userrisk'),
+          auth_flow: val('ca-cmp-authflow'),
+          app_id: val('ca-cmp-app'), acr: val('ca-cmp-acr'),
+          require: val('ca-cmp-require')
+        }}
+      }};
+      fetch('/api/ca-analysis', {{
+        method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(payload)
+      }})
+        .then(function(r) {{ return r.json(); }})
+        .then(function(d) {{
+          if (d && d.status === 'running') {{
+            caCompareTimer = setTimeout(function() {{ caPoll('compare'); }}, 600);
           }} else {{
             caSetBusy(false);
           }}
@@ -11430,6 +11491,13 @@ def render_report(results, tenant_name, db_path, config_path,
     if (caUserInput) {{
       caUserInput.addEventListener('keydown', function(e) {{
         if (e.key === 'Enter' && caUserBtn) caUserBtn.click();
+      }});
+    }}
+    if (caCompareBtn) caCompareBtn.addEventListener('click', startCaCompare);
+    var caCompareB = document.getElementById('ca-compare-b');
+    if (caCompareB) {{
+      caCompareB.addEventListener('keydown', function(e) {{
+        if (e.key === 'Enter' && caCompareBtn) caCompareBtn.click();
       }});
     }}
   }}
@@ -12406,19 +12474,23 @@ def _normalize_ca_policy(inner):
     return out
 
 
-def run_ca_analysis(db_path, progress, target_upn=None,
-                    assume_groups=None, assume_roles=None, scenario=None,
-                    options=None):
+def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
+                    assume_groups=None, assume_roles=None,
+                    assume_groups_b=None, assume_roles_b=None,
+                    scenario=None, options=None):
     """Conditional Access coverage analysis. `progress(step_id, detail)` marks
     each step complete as it finishes. When `target_upn` is given, the analysis
-    is scoped to that single user; `assume_groups`/`assume_roles` simulate
-    memberships (names or IDs), and `scenario` is an optional what-if sign-in
-    context (platform, client app, trusted location, risk levels, device state,
-    auth flow, device filter, ACR). `options` controls path-audit population,
-    resource/client filters, fast/full mode, and the scenario cap.
-    Returns {summary_html, sections_html, tables, export}."""
+    is scoped to that single user. `compare_upns` switches to two-user policy
+    comparison; assume_groups/roles apply to the first user and the _b variants
+    to the second. `scenario` is an optional what-if sign-in context (platform,
+    client app, trusted location, risk levels, device state, auth flow, device
+    filter, ACR). `options` controls path-audit population, resource/client
+    filters, fast/full mode, and the scenario cap.
+    Returns {summary_html, sections_html, tables}."""
     assume_groups = assume_groups or []
     assume_roles = assume_roles or []
+    assume_groups_b = assume_groups_b or []
+    assume_roles_b = assume_roles_b or []
     scenario = scenario or {}
     options = options or {}
     progress("load")
@@ -12442,6 +12514,26 @@ def run_ca_analysis(db_path, progress, target_upn=None,
         for child in data["group_member_group"].get(gid, ()):
             out |= _expand_group(child, memo)
         memo[gid] = out
+        return out
+
+    def _group_ancestors(gids):
+        """A group set plus every parent group that contains one of them."""
+        out = set(gids)
+        changed = True
+        while changed:
+            changed = False
+            for parent, children in data["group_member_group"].items():
+                if parent not in out and out & set(children):
+                    out.add(parent)
+                    changed = True
+        return out
+
+    def _role_ids_with_templates(rids):
+        out = set(rids)
+        for rid in rids:
+            template_id = data["role_template_by_oid"].get(rid)
+            if template_id:
+                out.add(template_id)
         return out
 
     def _role_members(rid):
@@ -12773,6 +12865,29 @@ def run_ca_analysis(db_path, progress, target_upn=None,
             return "signal", "; ".join(notes)
         return "yes", None
 
+    def build_scenario(payload):
+        def _bool_opt(value):
+            if value in (None, ""):
+                return None
+            return str(value).strip().lower() in ("1", "true", "yes", "match")
+        return {
+            "app_id": payload.get("app_id") or None,
+            "acr": payload.get("acr") or None,
+            "client_app": payload.get("client_app") or None,
+            "platform": payload.get("platform") or None,
+            "device_state": payload.get("device_state") or None,
+            "signin_risk": payload.get("signin_risk") or None,
+            "user_risk": payload.get("user_risk") or None,
+            "auth_flow": payload.get("auth_flow") or None,
+            "device_filter": _bool_opt(payload.get("device_filter")),
+            "device_compliant": None,
+            "device_hybrid_joined": None,
+            "resource_unscoped": False,
+            "require": (payload.get("require") or "").strip().lower(),
+            "trusted_location": (None if payload.get("trusted_location") in (None, "")
+                                 else str(payload["trusted_location"]).lower() == "true"),
+        }
+
     def _control_label(control):
         low = str(control).lower()
         return {"mfa": "MFA", "requirecompliantdevice": "Compliant device",
@@ -12792,6 +12907,35 @@ def run_ca_analysis(db_path, progress, target_upn=None,
                 joiner = " and " if str(block.get("operator", "OR")).upper() == "AND" else " or "
                 parts.append(joiner.join(names))
         return " + ".join(parts)
+
+    def ca_gap(def_en, def_rep, excl_pols, sc, require):
+        if any(p["block"] for p in def_en):
+            return None
+        if require == "mfa" and not any(p["mfa"] for p in def_en):
+            return ("NO_MFA_ENFORCED",
+                    "No definitively applying enabled policy requires MFA in this scenario.")
+        if require == "compliant" and not any(p["compliant"] for p in def_en):
+            return ("NO_COMPLIANT_DEVICE_ENFORCED",
+                    "No definitively applying enabled policy requires a compliant device in this scenario.")
+        if require == "mfa_compliant" and not (
+                any(p["mfa"] for p in def_en)
+                and any(p["compliant"] for p in def_en)):
+            return ("NO_MFA_COMPLIANT_ENFORCED",
+                    "No definitively applying enabled policy enforces both MFA and a compliant device in this scenario.")
+        if excl_pols and not def_en:
+            return ("EXCLUDED_BYPASS",
+                    "An enabled policy would otherwise apply, but this user is excluded.")
+        if not def_en and not def_rep:
+            return ("NO_POLICIES_APPLY",
+                    "No policy definitively applies in this scenario.")
+        if not def_en:
+            return ("REPORT_ONLY_BYPASS",
+                    "Only report-only policies definitively apply; no enforcement.")
+        if sc["trusted_location"] is True and not any(
+                p["mfa"] or p["block"] or p["compliant"] for p in def_en):
+            return ("TRUSTED_LOCATION_BYPASS",
+                    "Definitive policies apply from the trusted location, but none enforce MFA, compliant device, or Block.")
+        return None
 
     # Selected roster. Single-user mode analyzes the target regardless of
     # privilege; path-audit mode honors the population filters.
@@ -13135,7 +13279,7 @@ def run_ca_analysis(db_path, progress, target_upn=None,
             **summary,
         }
 
-    if not target_upn and priv_users:
+    if not target_upn and not compare_upns and priv_users:
         for uid in sorted(priv_users, key=lambda u: (
                 severity_rank(priv_users[u]["severity"]),
                 priv_users[u]["upn"].lower())):
@@ -13439,6 +13583,11 @@ def run_ca_analysis(db_path, progress, target_upn=None,
                     if oid.lower() == needle or (label or "").lower() == needle:
                         hit = oid
                         break
+                if hit is None and table is data["roles"]:
+                    for oid, template_id in data["role_template_by_oid"].items():
+                        if (template_id or "").lower() == needle:
+                            hit = oid
+                            break
                 if hit:
                     ids.append(hit)
                 else:
@@ -13464,10 +13613,10 @@ def run_ca_analysis(db_path, progress, target_upn=None,
         for p in policies:
             referenced_gids.update(p["inc_group_list"])
             referenced_gids.update(p["exc_group_list"])
-        containing = user_groups | {
+        containing = _group_ancestors(user_groups | set(assumed_gids)) | {
             gid for gid in referenced_gids if target_uid in _expand_group(gid, group_memo)}
         all_groups = user_groups | set(assumed_gids)
-        all_roles = user_roles | set(assumed_rids)
+        all_roles = user_roles | _role_ids_with_templates(assumed_rids)
 
         def _gname(gid):
             label = data["groups"].get(gid, gid)
@@ -13521,26 +13670,7 @@ def run_ca_analysis(db_path, progress, target_upn=None,
         excl_pols = [p for p in enabled if _excluded_sim(p)]
 
         # ---- what-if condition evaluation ----------------------------------
-        def _bool_opt(value):
-            if value in (None, ""):
-                return None
-            return str(value).strip().lower() in ("1", "true", "yes", "match")
-
-        sc = {"app_id": scenario.get("app_id") or None,
-              "acr": scenario.get("acr") or None,
-              "client_app": scenario.get("client_app") or None,
-              "platform": scenario.get("platform") or None,
-              "device_state": scenario.get("device_state") or None,
-              "signin_risk": scenario.get("signin_risk") or None,
-              "user_risk": scenario.get("user_risk") or None,
-              "auth_flow": scenario.get("auth_flow") or None,
-              "device_filter": _bool_opt(scenario.get("device_filter")),
-              "device_compliant": None,
-              "device_hybrid_joined": None,
-              "resource_unscoped": False,
-              "require": (scenario.get("require") or "").strip().lower(),
-              "trusted_location": (None if scenario.get("trusted_location") in (None, "")
-                                   else str(scenario["trusted_location"]).lower() == "true")}
+        sc = build_scenario(scenario)
 
         def _effect(p):
             if p["block"]:
@@ -13564,37 +13694,10 @@ def run_ca_analysis(db_path, progress, target_upn=None,
                   if r["verdict"]["applies"] == "yes" and r["state"] == "Enabled"]
         def_rep = [r for r in whatif_rows
                    if r["verdict"]["applies"] == "yes" and r["state"] != "Enabled"]
-        gap = None
         require = sc["require"]
         require_label = {"mfa": "MFA", "compliant": "compliant device",
                          "mfa_compliant": "MFA + compliant device"}.get(require)
-        blocked = any(r["block"] for r in def_en)
-        if blocked:
-            gap = None
-        elif require == "mfa" and not any(r["mfa"] for r in def_en):
-            gap = ("NO_MFA_ENFORCED",
-                   "No definitively applying enabled policy requires MFA in this scenario.")
-        elif require == "compliant" and not any(r["compliant"] for r in def_en):
-            gap = ("NO_COMPLIANT_DEVICE_ENFORCED",
-                   "No definitively applying enabled policy requires a compliant device in this scenario.")
-        elif require == "mfa_compliant" and not (
-                any(r["mfa"] for r in def_en)
-                and any(r["compliant"] for r in def_en)):
-            gap = ("NO_MFA_COMPLIANT_ENFORCED",
-                   "No definitively applying enabled policy enforces both MFA and a compliant device in this scenario.")
-        elif excl_pols and not def_en:
-            gap = ("EXCLUDED_BYPASS",
-                   "An enabled policy would otherwise apply, but this user is excluded.")
-        elif not def_en and not def_rep:
-            gap = ("NO_POLICIES_APPLY",
-                   "No policy definitively applies in this scenario.")
-        elif not def_en:
-            gap = ("REPORT_ONLY_BYPASS",
-                   "Only report-only policies definitively apply; no enforcement.")
-        elif sc["trusted_location"] is True and not any(
-                r["mfa"] or r["block"] or r["compliant"] for r in def_en):
-            gap = ("TRUSTED_LOCATION_BYPASS",
-                   "Definitive policies apply from the trusted location, but none enforce MFA, compliant device, or Block.")
+        gap = ca_gap(def_en, def_rep, excl_pols, sc, require)
 
         # ---- render: applying table with reasons ---------------------------
         apply_rows = []
@@ -13801,6 +13904,249 @@ def run_ca_analysis(db_path, progress, target_upn=None,
         return {"summary_html": summary_html, "sections_html": sections_html,
                 "tables": tables}
 
+    if compare_upns:
+        if len(compare_upns) != 2:
+            raise ValueError("compare mode requires exactly two user UPNs")
+        sc = build_scenario(scenario)
+        require = sc["require"]
+        require_label = {"mfa": "MFA", "compliant": "compliant device",
+                         "mfa_compliant": "MFA + compliant device"}.get(require)
+
+        def resolve_upn(upn):
+            needle = (upn or "").strip().lower()
+            for uid, rec in data["users"].items():
+                if (rec.get("upn") or "").strip().lower() == needle:
+                    return uid, rec
+            raise ValueError(f"user '{upn}' not found in the collected users")
+
+        uid_a, rec_a = resolve_upn(compare_upns[0])
+        uid_b, rec_b = resolve_upn(compare_upns[1])
+
+        def resolve_assumed(names, table):
+            ids, missing = [], []
+            for raw in names:
+                raw = (raw or "").strip()
+                if not raw:
+                    continue
+                needle = raw.lower()
+                hit = None
+                for oid, label in table.items():
+                    if oid.lower() == needle or (label or "").lower() == needle:
+                        hit = oid
+                        break
+                if hit is None and table is data["roles"]:
+                    for oid, template_id in data["role_template_by_oid"].items():
+                        if (template_id or "").lower() == needle:
+                            hit = oid
+                            break
+                if hit:
+                    ids.append(hit)
+                else:
+                    missing.append(raw)
+            return ids, missing
+
+        def build_scope(uid, rec, assumed_groups, assumed_roles):
+            assumed_gids, missing_g = resolve_assumed(assumed_groups, data["groups"])
+            assumed_rids, missing_r = resolve_assumed(assumed_roles, data["roles"])
+            if missing_g or missing_r:
+                raise ValueError(
+                    ("unresolved assumed group(s): " + ", ".join(missing_g) + " · "
+                     if missing_g else "")
+                    + ("unresolved assumed role(s): " + ", ".join(missing_r)
+                       if missing_r else ""))
+            user_roles = {rid for rid, members in data["role_member_user"].items()
+                          if uid in members}
+            for template_id, members in data["role_template_members"].items():
+                if uid in members:
+                    user_roles.add(template_id)
+            user_groups = {gid for gid, members in data["group_member_user"].items()
+                           if uid in members}
+            referenced_gids = set()
+            for p in policies:
+                referenced_gids.update(p["inc_group_list"])
+                referenced_gids.update(p["exc_group_list"])
+            containing = _group_ancestors(user_groups | set(assumed_gids)) | {
+                gid for gid in referenced_gids if uid in _expand_group(gid, group_memo)}
+            all_groups = user_groups | set(assumed_gids)
+            all_roles = user_roles | _role_ids_with_templates(assumed_rids)
+
+            def included(p):
+                if p["inc_all"] or p["inc_guest"]:
+                    return True
+                if uid in p["inc_users"]:
+                    return True
+                if any(g in containing for g in p["inc_group_list"]):
+                    return True
+                return any(r in all_roles for r in p["inc_role_list"])
+
+            def excluded(p):
+                if uid in p["exc_users"]:
+                    return True
+                if any(g in containing for g in p["exc_group_list"]):
+                    return True
+                return any(r in all_roles for r in p["exc_role_list"])
+
+            return {"uid": uid, "upn": rec.get("upn") or uid,
+                    "name": rec.get("name") or rec.get("upn") or uid,
+                    "severity": sev_by_uid.get(uid, "Info"),
+                    "containing": containing, "all_groups": all_groups,
+                    "all_roles": all_roles, "included": included,
+                    "excluded": excluded}
+
+        scope_a = build_scope(uid_a, rec_a, assume_groups, assume_roles)
+        scope_b = build_scope(uid_b, rec_b, assume_groups_b, assume_roles_b)
+        status_labels = {"yes": "Applies", "no": "Does not apply",
+                         "signal": "Signal-dependent",
+                         "excluded": "Excluded", "not_targeted": "Not targeted"}
+
+        def status_for(scope, p):
+            if p["state"] == "Disabled":
+                return "disabled", ""
+            if not scope["included"](p):
+                return "not_targeted", "not targeted by user scope"
+            if scope["excluded"](p):
+                return "excluded", "excluded by policy"
+            verdict, note = condition_verdict(p, sc)
+            return verdict, note or ""
+
+        def_en_a, def_rep_a, excl_a = [], [], []
+        def_en_b, def_rep_b, excl_b = [], [], []
+        compare_rows = []
+        for p in policies:
+            if p["state"] == "Disabled":
+                continue
+            va, na = status_for(scope_a, p)
+            vb, nb = status_for(scope_b, p)
+            if va == "yes":
+                (def_en_a if p["enabled"] else def_rep_a).append(p)
+            if vb == "yes":
+                (def_en_b if p["enabled"] else def_rep_b).append(p)
+            if va == "excluded" and p["enabled"]:
+                excl_a.append(p)
+            if vb == "excluded" and p["enabled"]:
+                excl_b.append(p)
+            if va == "yes" and vb == "yes":
+                category = "Shared"
+            elif va == "yes":
+                category = "Only A"
+            elif vb == "yes":
+                category = "Only B"
+            elif va == "signal" or vb == "signal":
+                category = "Signal-dependent"
+            else:
+                continue
+            notes = []
+            if na:
+                notes.append("A: " + na)
+            if nb:
+                notes.append("B: " + nb)
+            compare_rows.append({
+                "p": p, "a": status_labels.get(va, va),
+                "b": status_labels.get(vb, vb), "category": category,
+                "notes": " · ".join(notes),
+            })
+
+        gap_a = ca_gap(def_en_a, def_rep_a, excl_a, sc, require)
+        gap_b = ca_gap(def_en_b, def_rep_b, excl_b, sc, require)
+
+        def coverage_label(gap, def_en):
+            if gap:
+                return f"{gap[0]} — {gap[1]}"
+            if any(p["block"] for p in def_en):
+                return "Blocked by CA"
+            return "Coverage holds"
+
+        counts = {k: sum(1 for r in compare_rows if r["category"] == k)
+                  for k in ("Shared", "Only A", "Only B", "Signal-dependent")}
+        scenario_bits = []
+        if require_label:
+            scenario_bits.append("require=" + require_label)
+        for key, label in (("platform", "platform"), ("client_app", "client"),
+                           ("device_state", "device"), ("auth_flow", "auth-flow"),
+                           ("signin_risk", "signin-risk"), ("user_risk", "user-risk"),
+                           ("app_id", "resource"), ("acr", "acr")):
+            if sc.get(key):
+                scenario_bits.append(f"{label}={sc[key]}")
+        if sc["device_filter"] is not None:
+            scenario_bits.append(f"device-filter={sc['device_filter']}")
+        if sc["trusted_location"] is not None:
+            scenario_bits.append(f"trusted={sc['trusted_location']}")
+
+        def compare_mark(status):
+            if status == "Applies":
+                return '<span class="badge badge-enabled" title="Applies">&#10003;</span>'
+            if status == "Signal-dependent":
+                return '<span class="muted" title="Signal-dependent">?</span>'
+            if status == "Excluded":
+                return '<span class="muted" title="Excluded">&#8212;</span>'
+            if status == "Not targeted":
+                return '<span class="muted" title="Not targeted">&#8212;</span>'
+            return '<span class="muted" title="Does not apply">&#8212;</span>'
+
+        compare_table_rows = []
+        for i, r in enumerate(compare_rows):
+            p = r["p"]
+            key = f"ca-compare-{i}"
+            controls_display = _policy_control_display(p) or "—"
+            fields = {
+                "polname": p["name"], "polstate": p["state"],
+                "polcontrols": controls_display, "a": r["a"], "b": r["b"],
+                "category": r["category"], "notes": r["notes"],
+            }
+            cells = (
+                f'<td class="clickable" data-field="polName" data-value="{esc(p["name"])}">{esc(p["name"])}</td>'
+                f'<td data-field="a" data-value="{esc(r["a"])}">{compare_mark(r["a"])}</td>'
+                f'<td data-field="b" data-value="{esc(r["b"])}">{compare_mark(r["b"])}</td>'
+                f'<td data-field="polState" data-value="{esc(p["state"])}">{esc(p["state"])}</td>'
+                f'<td data-field="polControls" data-value="{esc(controls_display)}">{esc(controls_display)}</td>'
+                f'<td data-field="category" data-value="{esc(r["category"])}">{esc(r["category"])}</td>'
+                f'<td class="muted" data-field="notes" data-value="{esc(r["notes"])}">{esc(r["notes"] or "—")}</td>'
+            )
+            compare_table_rows.append({
+                "_html": (f'<tr data-policy-id="{esc(p["id"])}" data-detail-key="{key}">'
+                          f'<td class="expand-cell">{EXPAND_BUTTON_HTML}</td>{cells}</tr>'
+                          f'{drawer_for_html(key, 8)}'),
+                "_text": " ".join(fields.values()).lower(),
+                "fields": fields,
+            })
+
+        table = build_table(
+            "ca-compare-table", "CA user comparison",
+            [("Policy", "240px"), (scope_a["upn"], "220px"),
+             (scope_b["upn"], "220px"), ("State", "90px"),
+             ("Controls", "170px"), ("Category", "130px"), ("Notes", "260px")],
+            compare_table_rows,
+            {"1": "polname", "2": "a", "3": "b", "4": "polstate",
+             "5": "polcontrols", "6": "category", "7": "notes"},
+            subtitle=f'<p class="sub">Scenario: '
+                     f'{esc(" · ".join(scenario_bits)) if scenario_bits else "unspecified"}</p>')
+        summary_html = f"""
+  <section data-category="configs">
+    <h2>CA user comparison</h2>
+    <div class="engine-card"><table class="kv-table">
+      <tr><th>User A</th><td>{esc(scope_a['name'])} <span class="muted">({esc(scope_a['upn'])})</span></td></tr>
+      <tr><th>User B</th><td>{esc(scope_b['name'])} <span class="muted">({esc(scope_b['upn'])})</span></td></tr>
+      <tr><th>Scenario</th><td>{esc(" · ".join(scenario_bits)) if scenario_bits else "unspecified"}</td></tr>
+      <tr><th>Shared policies</th><td>{counts['Shared']}</td></tr>
+      <tr><th>Only User A</th><td>{counts['Only A']}</td></tr>
+      <tr><th>Only User B</th><td>{counts['Only B']}</td></tr>
+      <tr><th>Signal-dependent</th><td>{counts['Signal-dependent']}</td></tr>
+      <tr><th>User A coverage</th><td>{esc(coverage_label(gap_a, def_en_a))}</td></tr>
+      <tr><th>User B coverage</th><td>{esc(coverage_label(gap_b, def_en_b))}</td></tr>
+      <tr><th>User A exclusions</th><td>{len(excl_a)}</td></tr>
+      <tr><th>User B exclusions</th><td>{len(excl_b)}</td></tr>
+    </table></div>
+  </section>
+"""
+        progress("users", "comparison mode")
+        progress("apps", "comparison mode")
+        progress("legacy", "comparison mode")
+        progress("exclusions", "comparison mode")
+        progress("paths", "comparison mode")
+        progress("render", f"{len(compare_rows)} policy comparison(s)")
+        return {"summary_html": summary_html, "sections_html": table["section"],
+                "tables": [table]}
+
     path_summary_rows = ""
     if path_records:
         gap_types = ", ".join(f"{k}: {v}" for k, v in sorted(path_gap_counts.items()))
@@ -13884,8 +14230,9 @@ def register_ca_tables(tables):
     SERVE_STATE["ca_table_ids"] = ids
 
 
-def start_ca_analysis(upn=None, assume_groups=None, assume_roles=None,
-                      scenario=None, options=None):
+def start_ca_analysis(upn=None, compare_upns=None, assume_groups=None,
+                      assume_roles=None, assume_groups_b=None,
+                      assume_roles_b=None, scenario=None, options=None):
     """Kick off the analysis in a background thread; returns the status dict."""
     state = SERVE_STATE["ca_analysis"]
     if state and state.get("status") == "running":
@@ -13905,8 +14252,11 @@ def start_ca_analysis(upn=None, assume_groups=None, assume_roles=None,
         try:
             result = run_ca_analysis(SERVE_STATE["db_path"], progress,
                                      target_upn=upn,
+                                     compare_upns=compare_upns,
                                      assume_groups=assume_groups,
                                      assume_roles=assume_roles,
+                                     assume_groups_b=assume_groups_b,
+                                     assume_roles_b=assume_roles_b,
                                      scenario=scenario,
                                      options=options)
             register_ca_tables(result.get("tables") or [])
@@ -14351,8 +14701,11 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                 }
                 state = start_ca_analysis(
                     upn=(payload.get("upn") or "").strip(),
+                    compare_upns=_csv("compare_upns"),
                     assume_groups=_csv("assume_groups"),
                     assume_roles=_csv("assume_roles"),
+                    assume_groups_b=_csv("assume_groups_b"),
+                    assume_roles_b=_csv("assume_roles_b"),
                     scenario=scenario,
                     options=options)
                 self._send(json.dumps({"status": state["status"]}).encode("utf-8"),
@@ -14579,7 +14932,14 @@ def main():
         tenant_summary = build_tenant_summary(graph, results)
         check_cfg = dict(DEFAULT_CHECK_CFG)
         check_cfg["directory_roles"] = {}
-        check_cfg["role_labels"] = dict(DEFAULT_ROLE_LABELS)
+        try:
+            _, loaded_cfg = load_config(config_path)
+            check_cfg["role_labels"] = loaded_cfg.get("role_labels") or {}
+            check_cfg["directory_role_descriptions"] = (
+                loaded_cfg.get("directory_role_descriptions") or {})
+        except (OSError, ValueError):
+            check_cfg["role_labels"] = {}
+            check_cfg["directory_role_descriptions"] = {}
         check_cfg["azure_roles"] = {}
         serve_tables = {}
         report_html = render_report(
