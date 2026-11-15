@@ -9639,6 +9639,7 @@ def render_report(results, tenant_name, db_path, config_path,
     var descEl = wrap.querySelector('.user-desc');
     if (descEl) {{
       var pairs = [
+        ['Object ID', uid],
         ['Job title', rec ? rec.jobTitle : null],
         ['Department', rec ? rec.department : null],
         ['Company', rec ? rec.companyName : null],
