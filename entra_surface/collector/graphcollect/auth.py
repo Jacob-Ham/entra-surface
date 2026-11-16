@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import threading
 import time
 
@@ -101,6 +102,7 @@ def _token_http_client(proxies: dict | None, verify: bool,
 GRAPH_RES = "https://graph.microsoft.com"
 ARM_RES = "https://management.azure.com"
 BROKER_CLIENT_ID = "29d9ed98-a469-4536-ade2-f981bc1d605e"
+_TENANT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
 
 
 class AuthError(Exception):
@@ -116,11 +118,18 @@ def _decode_jwt(token: str) -> dict:
 class TokenProvider:
     def __init__(self, refresh_token: str, client_id: str | None = None,
                  proxies: dict | None = None, verify: bool = True,
-                 user_agent: str = ""):
+                 user_agent: str = "", tenant: str = ""):
         self._rt = refresh_token
         self._client_id = client_id or BROKER_CLIENT_ID
+        # Single-tenant app client IDs fail against /common (AADSTS50194) and
+        # sovereign tokens need their own authority.  Use the tenant recorded
+        # with the token when known; /common remains the portable default.
+        tenant = str(tenant or "").strip()
+        if tenant and not _TENANT_RE.fullmatch(tenant):
+            tenant = ""
+        authority = f"https://login.microsoftonline.com/{tenant or 'common'}"
         app_kwargs = {
-            "authority": "https://login.microsoftonline.com/common",
+            "authority": authority,
             # The authority is the public cloud endpoint; skip MSAL's extra
             # instance-discovery request before every worker redemption.
             "instance_discovery": False,

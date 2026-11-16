@@ -139,18 +139,30 @@ def validate_proxy(proxy: dict) -> dict:
 
 
 def save_settings(data: dict) -> dict:
+    """Persist settings, merging sections omitted from a partial payload.
+
+    ``proxy`` may be omitted to keep the configured proxy.  ``user_agents`` is
+    authoritative when present: an explicit empty object clears every area, and
+    omitted areas are cleared rather than inherited.  Rename a section key if a
+    caller ever needs a true partial user-agent update.
+    """
     if not isinstance(data, dict):
         raise ValueError("settings payload must be an object")
-    proxy = validate_proxy(data.get("proxy") or {})
-    raw_agents = data.get("user_agents")
-    if raw_agents is None:
-        user_agents = load_settings()["user_agents"]
-    elif not isinstance(raw_agents, dict):
-        raise ValueError("user_agents must be an object")
+    current = load_settings()
+    if "proxy" in data:
+        proxy = validate_proxy(data.get("proxy") or {})
     else:
-        merged = dict(load_settings()["user_agents"])
-        merged.update(raw_agents)
-        user_agents = _user_agents_from(merged, strict=True)
+        proxy = current["proxy"]
+    if "user_agents" not in data:
+        user_agents = current["user_agents"]
+    else:
+        raw_agents = data.get("user_agents")
+        if raw_agents is None:
+            user_agents = dict(DEFAULT_USER_AGENTS)
+        elif not isinstance(raw_agents, dict):
+            raise ValueError("user_agents must be an object")
+        else:
+            user_agents = _user_agents_from(raw_agents, strict=True)
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(
         prefix=".entra-surface-settings-", dir=str(SETTINGS_FILE.parent))

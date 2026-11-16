@@ -7,6 +7,8 @@ collection reuses TLS connections. Graph JSON batching is available through
 """
 from __future__ import annotations
 
+import datetime as dt
+import email.utils
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -103,12 +105,23 @@ class GraphClient:
 
     @staticmethod
     def _retry_after(headers, default: int = 5) -> int:
+        """Parse delta-seconds or HTTP-date Retry-After values."""
         headers = headers or {}
+        raw = (headers.get("Retry-After") or headers.get("retry-after")
+               or default)
+        value = default
         try:
-            value = int(headers.get("Retry-After")
-                        or headers.get("retry-after") or default)
+            value = int(raw)
         except (TypeError, ValueError):
-            value = default
+            try:
+                when = email.utils.parsedate_to_datetime(str(raw))
+                if when is not None:
+                    if when.tzinfo is None:
+                        when = when.replace(tzinfo=dt.timezone.utc)
+                    value = int(
+                        (when - dt.datetime.now(dt.timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                value = default
         return max(0, min(value, 60))
 
     def request(self, method: str, url: str, retries: int = 5,
@@ -295,6 +308,9 @@ class GraphClient:
                         headers = item.get("headers") or {}
                         body = item.get("body")
                         if status == 200:
+                            # A successful page starts a fresh retry budget;
+                            # the budget is per URL, not per collection.
+                            state["attempts"] = 0
                             if isinstance(body, dict):
                                 if isinstance(body.get("value"), list):
                                     result.items.extend(body.get("value") or [])
@@ -324,6 +340,7 @@ class GraphClient:
                                 result.status = status
                                 result.error = f"429 {entry['url']}"
                                 result.body = str(body)[:500]
+                                state["urls"] = []
                             else:
                                 state["urls"].append(entry["url"])
                         elif status in (500, 502, 503, 504):
@@ -332,6 +349,7 @@ class GraphClient:
                                 result.status = status
                                 result.error = f"{status} {entry['url']}"
                                 result.body = str(body)[:500]
+                                state["urls"] = []
                             else:
                                 wait = max(wait, min(1 + state["attempts"], 30))
                                 state["urls"].append(entry["url"])
@@ -339,6 +357,7 @@ class GraphClient:
                             result.status = status
                             result.error = f"{status} {entry['url']}"
                             result.body = str(body)[:500] if body else ""
+                            state["urls"] = []
             if wait:
                 if round_throttled:
                     noun = "subrequest" if round_throttled == 1 else "subrequests"
@@ -392,6 +411,8 @@ class ArmClient:
             return {}
         return self.proxies
 
+    _retry_after = staticmethod(GraphClient._retry_after)
+
     def get(self, url: str, retries: int = 4) -> requests.Response:
         for attempt in range(retries):
             headers = {"Authorization": f"Bearer {self._token_getter()}"}
@@ -401,9 +422,11 @@ class ArmClient:
                 r = self._session().get(
                     url, headers=headers, timeout=90,
                     proxies=self._proxy_for(url), verify=self.verify)
-            except requests.RequestException:
+            except requests.RequestException as exc:
                 if attempt == retries - 1:
-                    raise
+                    # ARM is optional; a network failure must not escape and
+                    # abort the already collected Graph data.
+                    raise Degraded(0, url, f"request failed: {exc}")
                 time.sleep(1 + attempt)
                 continue
             with self._count_lock:
@@ -412,7 +435,7 @@ class ArmClient:
                 with self._count_lock:
                     self.throttled += 1
                     total = self.throttled
-                wait = int(r.headers.get("Retry-After", "5") or 5)
+                wait = self._retry_after(r.headers)
                 pause = min(wait, 60) + 1
                 log_throttle("arm", pause, f"total {total}")
                 time.sleep(pause)

@@ -176,7 +176,9 @@ CREATE TABLE "Applications" (
 	"recordConsentConditions" TEXT, 
 	"replyUrls" TEXT, 
 	"requiredResourceAccess" TEXT, 
+	"requestedAccessTokenVersion" BIGINT,
 	"samlMetadataUrl" TEXT, 
+	"signInAudience" TEXT,
 	"supportsConvergence" BOOLEAN, 
 	"tokenEncryptionKeyId" TEXT, 
 	"trustedCertificateSubjects" TEXT, 
@@ -268,6 +270,7 @@ CREATE TABLE "Devices" (
 	"enrollmentProfileName" TEXT, 
 	"enrollmentType" TEXT, 
 	"exchangeActiveSyncId" TEXT, 
+	"extensionAttributes" TEXT,
 	"externalSourceName" TEXT, 
 	hostnames TEXT, 
 	"isCompliant" BOOLEAN, 
@@ -364,11 +367,13 @@ CREATE TABLE "Groups" (
 	"resourceBehaviorOptions" TEXT, 
 	"resourceProvisioningOptions" TEXT, 
 	"securityEnabled" BOOLEAN, 
+	"serviceProvisioningErrors" TEXT,
 	"sharepointResources" TEXT, 
 	"targetAddress" TEXT, 
 	theme TEXT, 
 	visibility TEXT, 
 	"wellKnownObject" TEXT, 
+	"writebackConfiguration" TEXT,
 	PRIMARY KEY ("objectId")
 );
 CREATE TABLE "IGaccessPackageAssignmentPolicys" (
@@ -481,6 +486,16 @@ CREATE TABLE "IGaccessPackageCatalogs" (
 	"privilegeLevel" TEXT, 
 	PRIMARY KEY (id)
 );
+CREATE TABLE "IGconnectedOrganizations" (
+	id TEXT NOT NULL,
+	"displayName" TEXT,
+	description TEXT,
+	state TEXT,
+	"identitySources" TEXT,
+	"createdDateTime" DATETIME,
+	"modifiedDateTime" DATETIME,
+	PRIMARY KEY (id)
+);
 CREATE TABLE "IGaccessPackageResourceRequests" (
 	id TEXT NOT NULL, 
 	"requestType" TEXT, 
@@ -548,7 +563,7 @@ CREATE TABLE "IGaccessPackageResources" (
 CREATE TABLE "IGaccessPackageSubjects" (
 	"connectedOrganizationId" TEXT, 
 	id TEXT NOT NULL, 
-	"objectId" TEXT NOT NULL, 
+	"objectId" TEXT,
 	"altSecId" TEXT, 
 	"displayName" TEXT, 
 	"principalName" TEXT, 
@@ -784,9 +799,11 @@ CREATE TABLE "ServicePrincipals" (
 	"preferredTokenSigningKeyThumbprint" TEXT, 
 	"publisherName" TEXT, 
 	"replyUrls" TEXT, 
+	"resourceSpecificApplicationPermissions" TEXT,
 	"samlMetadataUrl" TEXT, 
 	"samlSingleSignOnSettings" TEXT, 
 	"servicePrincipalNames" TEXT, 
+	"certification" TEXT,
 	tags TEXT, 
 	"tokenEncryptionKeyId" TEXT, 
 	"servicePrincipalType" TEXT, 
@@ -853,6 +870,7 @@ CREATE TABLE "Users" (
 	"cloudMSRtcPolicyAssignments" TEXT, 
 	"cloudMSRtcPool" TEXT, 
 	"cloudMSRtcServiceAttributes" TEXT, 
+	"cloudRealtimeCommunicationInfo" TEXT,
 	"cloudRtcUserPolicies" TEXT, 
 	"cloudSecurityIdentifier" TEXT, 
 	"cloudSipLine" TEXT, 
@@ -863,6 +881,7 @@ CREATE TABLE "Users" (
 	"createdDateTime" DATETIME, 
 	"creationType" TEXT, 
 	department TEXT, 
+	"deviceKeys" TEXT,
 	"dirSyncEnabled" BOOLEAN, 
 	"displayName" TEXT, 
 	"employeeId" TEXT, 
@@ -929,6 +948,7 @@ CREATE TABLE "Users" (
 	"releaseTrack" TEXT, 
 	"searchableDeviceKey" TEXT, 
 	"selfServePasswordResetData" TEXT, 
+	"serviceProvisioningErrors" TEXT,
 	"shadowAlias" TEXT, 
 	"shadowDisplayName" TEXT, 
 	"shadowLegacyExchangeDN" TEXT, 

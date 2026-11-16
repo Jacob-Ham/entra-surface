@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import html
 import json
 import os
@@ -27,8 +28,14 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX hosts
+    fcntl = None
 
 from . import settings as surface_settings
 from . import token_resources
@@ -74,8 +81,14 @@ _JOB = {
     "returncode": None,
     "error": "",
     "stop_requested": False,
+    "generation": 0,
 }
 _STORE = None
+_STORE_MTIME = None
+_STORE_ERROR = ""
+_REDEEM_LOCKS = {}
+_REDEEM_LOCKS_LOCK = threading.Lock()
+_AUTH_LOCK_FILE = AUTH_FILE.with_name(AUTH_FILE.name + ".lock")
 
 
 def collector_dir() -> Path:
@@ -101,40 +114,168 @@ def _empty_store() -> dict:
     return {"version": 1, "active_id": "", "tokens": []}
 
 
-def _load_store() -> dict:
-    global _STORE
-    if _STORE is not None:
-        return _STORE
-    data = None
+def _auth_mtime():
     try:
-        data = json.loads(AUTH_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = None
-    if not isinstance(data, dict) or not isinstance(data.get("tokens"), list):
-        data = _empty_store()
-    else:
-        data.setdefault("version", 1)
-        data.setdefault("active_id", "")
-        data["tokens"] = [
-            t for t in data["tokens"]
-            if isinstance(t, dict) and (t.get("refresh_token") or t.get("access_token"))]
-        ids = {t.get("id") for t in data["tokens"]}
-        if data["active_id"] not in ids:
-            data["active_id"] = data["tokens"][0]["id"] if data["tokens"] else ""
+        return AUTH_FILE.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _backup_corrupt_auth(reason: str) -> str:
+    """Move a malformed auth file aside instead of silently overwriting it."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = AUTH_FILE.with_name(
+        f"{AUTH_FILE.name}.corrupt-{stamp}-{secrets.token_hex(2)}")
+    try:
+        os.replace(AUTH_FILE, backup)
+        return str(backup)
+    except OSError:
+        return ""
+
+
+def _normalize_store(data) -> dict:
+    """Migrate a loaded store and make active/id handling defensive."""
+    global _STORE_ERROR
+    if not isinstance(data, dict):
+        raise ValueError("auth store is not an object")
+    tokens = data.get("tokens")
+    if not isinstance(tokens, list):
+        raise ValueError("auth store tokens is not a list")
+    clean = [
+        t for t in tokens
+        if isinstance(t, dict) and (t.get("refresh_token") or t.get("access_token"))
+    ]
+    seen_ids = set()
+    for rec in clean:
+        token_id = rec.get("id")
+        if not isinstance(token_id, str) or not token_id or token_id in seen_ids:
+            token_id = secrets.token_hex(8)
+            while token_id in seen_ids:
+                token_id = secrets.token_hex(8)
+            rec["id"] = token_id
+        seen_ids.add(token_id)
+    active_id = data.get("active_id")
+    if not isinstance(active_id, str):
+        active_id = ""
+    if active_id not in seen_ids:
+        active_id = clean[0]["id"] if clean else ""
+    _STORE_ERROR = ""
+    return {
+        "version": int(data.get("version") or 1),
+        "active_id": active_id,
+        "tokens": clean,
+    }
+
+
+def _read_store_file() -> dict:
+    global _STORE_ERROR
+    try:
+        raw = AUTH_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _empty_store()
+    except OSError as exc:
+        # A permissions/IO error is not the same as a missing file; refusing to
+        # continue prevents the next save from wiping every saved token.
+        raise RuntimeError(f"could not read auth file: {exc}") from exc
+    try:
+        data = json.loads(raw)
+        return _normalize_store(data)
+    except (ValueError, TypeError) as exc:
+        backup = _backup_corrupt_auth(str(exc))
+        _STORE_ERROR = f"auth file was corrupt and was backed up to {backup}"
+        print(f"[auth] {_STORE_ERROR}", file=sys.stderr)
+        return _empty_store()
+
+
+def _load_store(force: bool = False) -> dict:
+    """Return the cached store, reloading when another process wrote it."""
+    global _STORE, _STORE_MTIME
+    mtime = _auth_mtime()
+    if _STORE is not None and not force:
+        if mtime is None or mtime == _STORE_MTIME:
+            return _STORE
+    data = _read_store_file()
     _STORE = data
+    _STORE_MTIME = _auth_mtime()
     return _STORE
 
 
-def _save_store() -> None:
+def _write_store() -> None:
+    """Write the in-memory store with a unique temp file and atomic replace."""
+    global _STORE_MTIME, _STORE_ERROR
     store = _load_store()
     try:
         AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = AUTH_FILE.with_name(AUTH_FILE.name + ".tmp")
-        tmp.write_text(json.dumps(store, indent=2), encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, AUTH_FILE)
+        fd, name = tempfile.mkstemp(
+            prefix=f".{AUTH_FILE.name}.", suffix=".tmp",
+            dir=str(AUTH_FILE.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(store, handle, indent=2)
+                handle.write("\n")
+            try:
+                os.chmod(name, 0o600)
+            except OSError:
+                pass
+            os.replace(name, AUTH_FILE)
+        finally:
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+        _STORE_MTIME = _auth_mtime()
+        _STORE_ERROR = ""
     except OSError as exc:
-        raise RuntimeError(f"could not write auth file: {exc}")
+        raise RuntimeError(f"could not write auth file: {exc}") from exc
+
+
+def _save_store() -> None:
+    """Compatibility wrapper; callers normally use _store_session()."""
+    _write_store()
+
+
+@contextlib.contextmanager
+def _store_session(write: bool = False):
+    """Serialize read-modify-write access with other threads/processes."""
+    with _LOCK:
+        lock_handle = None
+        try:
+            if fcntl is not None:
+                try:
+                    AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    lock_handle = open(_AUTH_LOCK_FILE, "a+", encoding="utf-8")
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                except OSError:
+                    lock_handle = None
+            store = _load_store()
+            yield store
+            if write:
+                _write_store()
+        finally:
+            if lock_handle is not None:
+                try:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    lock_handle.close()
+                except OSError:
+                    pass
+
+
+def _job_running() -> bool:
+    with _LOCK:
+        return _JOB.get("status") == "running"
+
+
+def _redemption_lock(token_id: str) -> threading.Lock:
+    """One redemption at a time per saved refresh token."""
+    with _REDEEM_LOCKS_LOCK:
+        lock = _REDEEM_LOCKS.get(token_id)
+        if lock is None:
+            lock = threading.Lock()
+            _REDEEM_LOCKS[token_id] = lock
+        return lock
 
 
 def _amr_values(raw) -> list[str]:
@@ -235,8 +376,7 @@ def get_auth_status(enrich: bool = True) -> dict:
     which avoids a data download for callers that only need the active-token
     flags (for example, the sidebar and Collect tab).
     """
-    with _LOCK:
-        store = _load_store()
+    with _store_session() as store:
         active_id = store.get("active_id") or ""
         active = next((t for t in store["tokens"]
                        if t.get("id") == active_id), None)
@@ -257,6 +397,7 @@ def get_auth_status(enrich: bool = True) -> dict:
             "active_id": active_id,
             "tokens": summaries,
             "auth_file": str(AUTH_FILE),
+            "auth_warning": _STORE_ERROR,
         }
     if enrich:
         _enrich_token_info(summaries)
@@ -265,8 +406,7 @@ def get_auth_status(enrich: bool = True) -> dict:
 
 def get_token_secrets(token_id: str) -> dict:
     """Return the saved secrets for one token; only the local UI should call this."""
-    with _LOCK:
-        store = _load_store()
+    with _store_session() as store:
         rec = next((t for t in store["tokens"] if t.get("id") == token_id), None)
         if rec is None:
             raise ValueError("token not found")
@@ -288,34 +428,49 @@ def get_token_secrets(token_id: str) -> dict:
 
 
 def clear_auth() -> dict:
-    with _LOCK:
-        store = _load_store()
+    if _job_running():
+        raise RuntimeError("stop the running collection before clearing tokens")
+    with _store_session(write=True) as store:
         store["tokens"] = []
         store["active_id"] = ""
-        _save_store()
     return get_auth_status()
 
 
 def select_token(token_id: str) -> dict:
-    with _LOCK:
-        store = _load_store()
+    with _store_session(write=True) as store:
         if not any(t.get("id") == token_id for t in store["tokens"]):
             raise ValueError("token not found")
         store["active_id"] = token_id
-        _save_store()
     return get_auth_status()
 
 
 def delete_token(token_id: str) -> dict:
-    with _LOCK:
-        store = _load_store()
+    if _job_running():
+        raise RuntimeError("stop the running collection before deleting tokens")
+    with _store_session(write=True) as store:
         before = len(store["tokens"])
-        store["tokens"] = [t for t in store["tokens"] if t.get("id") != token_id]
+        remove = {token_id}
+        # Cascade to access children and any deeper dependants; leaving them
+        # parented to a deleted refresh record produces orphan rows.
+        changed = True
+        while changed:
+            changed = False
+            for rec in store["tokens"]:
+                parent = rec.get("parent_id") or ""
+                if parent and parent in remove and rec.get("id") not in remove:
+                    remove.add(rec.get("id"))
+                    changed = True
+        store["tokens"] = [
+            t for t in store["tokens"] if t.get("id") not in remove]
         if len(store["tokens"]) == before:
             raise ValueError("token not found")
-        if store.get("active_id") == token_id:
-            store["active_id"] = store["tokens"][0]["id"] if store["tokens"] else ""
-        _save_store()
+        if store.get("active_id") in remove:
+            # Prefer the most recently updated refresh-capable record; never
+            # silently select an arbitrary old or access-only token.
+            candidates = [t for t in store["tokens"] if t.get("refresh_token")]
+            candidates.sort(
+                key=lambda t: t.get("updated_at") or "", reverse=True)
+            store["active_id"] = candidates[0]["id"] if candidates else ""
     return get_auth_status()
 
 
@@ -359,8 +514,7 @@ def update_token_metadata(token_id: str, principal: dict | None = None,
             raise ValueError(
                 f"note is too long (max {MAX_TOKEN_NOTE_LENGTH} characters)")
 
-    with _LOCK:
-        store = _load_store()
+    with _store_session(write=True) as store:
         rec = next((t for t in store["tokens"] if t.get("id") == token_id),
                    None)
         if rec is None:
@@ -387,38 +541,136 @@ def update_token_metadata(token_id: str, principal: dict | None = None,
                 rec["note"] = note_value
             else:
                 rec.pop("note", None)
-        _save_store()
     return get_auth_status()
 
 
-def _update_token_secret(token_id: str, refresh_token: str = "",
-                         access_token: str = "") -> None:
-    if not token_id or not (refresh_token or access_token):
+def _propagate_refresh_rotation(store: dict, old: str, new: str,
+                                now: str) -> None:
+    """Keep one refresh-token family value across sibling records.
+
+    FOCI sibling redemptions rotate the shared refresh token.  Updating every
+    record that still holds the consumed value prevents a stale record from
+    being selected later.
+    """
+    if not old or not new or old == new:
         return
-    with _LOCK:
-        store = _load_store()
-        for rec in store["tokens"]:
-            if rec.get("id") == token_id:
-                if refresh_token:
-                    rec["refresh_token"] = refresh_token
-                if access_token:
-                    rec["access_token"] = access_token
-                rec["updated_at"] = _timestamp()
-                _save_store()
-                return
+    for rec in store["tokens"]:
+        if rec.get("refresh_token") == old:
+            rec["refresh_token"] = new
+            rec["updated_at"] = now
+
+
+def _update_token_secret(token_id: str, refresh_token: str = "",
+                         access_token: str = "",
+                         expected_refresh: str = "",
+                         client_id: str = "") -> bool:
+    """Persist a rotated refresh/access token.
+
+    When ``expected_refresh`` is supplied the update only applies if the stored
+    record still holds that value.  This prevents a long-running worker from
+    overwriting a newer token saved by another redemption.  A refresh-token run
+    with no saved record creates one, so CLI and ``start_collection`` callers
+    do not lose the rotated value.
+
+    Returns True when the store was updated, False for a stale/mismatched
+    writer.
+    """
+    if not (refresh_token or access_token):
+        return False
+    now = _timestamp()
+    with _store_session(write=True) as store:
+        created = False
+        rec = next((t for t in store["tokens"] if t.get("id") == token_id),
+                   None)
+        if rec is None and expected_refresh:
+            rec = next(
+                (t for t in store["tokens"]
+                 if t.get("refresh_token") == expected_refresh
+                 and (not client_id
+                      or str(t.get("client_id") or "").lower()
+                      == client_id.lower())), None)
+        if rec is None and not token_id and refresh_token:
+            rec = {
+                "id": secrets.token_hex(8),
+                "added_at": now,
+                "refresh_token": "",
+                "access_token": "",
+                "parent_id": "",
+                "client_id": client_id,
+                "principal": {},
+            }
+            store["tokens"].append(rec)
+            created = True
+        if rec is None:
+            return False
+        if expected_refresh and not created:
+            current = rec.get("refresh_token") or ""
+            if current != expected_refresh and current != refresh_token:
+                return False
+        if refresh_token:
+            old_refresh = rec.get("refresh_token") or ""
+            if refresh_token != old_refresh:
+                _propagate_refresh_rotation(
+                    store, old_refresh, refresh_token, now)
+                rec["refresh_token"] = refresh_token
+        if access_token:
+            # Refresh records stay refresh-only; access tokens live in
+            # principal+audience child records.  Migrate an older inline token
+            # first so it is not silently discarded.
+            old_access = rec.get("access_token") or ""
+            if old_access and old_access != access_token:
+                try:
+                    old_principal = _principal_from_claims(
+                        _decode_access_claims(old_access))
+                    _store_access_token(
+                        store, old_access, old_principal, now,
+                        client_id=rec.get("client_id") or client_id,
+                        parent_id=rec.get("id") or "",
+                        exclude_id=rec.get("id") or "")
+                except ValueError:
+                    pass
+            claims = None
+            try:
+                claims = _decode_access_claims(access_token)
+            except ValueError:
+                # Keep the refresh rotation even if the worker wrote a
+                # malformed access token; the rotation is the critical value.
+                claims = None
+            if claims is not None:
+                principal = _principal_from_claims(claims)
+                if not principal.get("client_id"):
+                    principal["client_id"] = rec.get("client_id") or client_id
+                # Give a raw refresh-only record the identity from its access
+                # token, but keep audience/expiry on the child record.
+                merged = dict(rec.get("principal") or {})
+                merged.update({
+                    key: value for key, value in principal.items()
+                    if value and key not in ("audience", "access_expires_at")})
+                rec["principal"] = merged
+                if not rec.get("client_id"):
+                    rec["client_id"] = principal.get("client_id") or ""
+                _store_access_token(
+                    store, access_token, principal, now,
+                    client_id=principal.get("client_id") or "",
+                    parent_id=rec.get("id") or "",
+                    exclude_id=rec.get("id") or "")
+            rec["access_token"] = ""
+        rec["updated_at"] = now
+        if (not store.get("active_id")
+                or store.get("active_id") == rec.get("id")):
+            store["active_id"] = rec.get("id") or ""
+    return True
 
 
 def _mark_token_used(token_id: str, output: str, mode: str) -> None:
     if not token_id:
         return
-    with _LOCK:
-        store = _load_store()
+    with _store_session(write=True) as store:
         for rec in store["tokens"]:
             if rec.get("id") == token_id:
                 rec["last_used_at"] = _timestamp()
                 rec["last_used_for"] = str(output)
                 rec["last_used_mode"] = mode
-                _save_store()
                 return
 
 
@@ -439,7 +691,7 @@ def _worker_command(mode: str, refresh_token: str, client_id: str,
                     user_agent: str = "", access_out: str = "",
                     access_token: str = "", evade: bool = False,
                     gather_all: bool = False, autotoken: bool = False,
-                    mfa: bool = False) -> list[str]:
+                    mfa: bool = False, tenant: str = "") -> list[str]:
     directory = collector_dir()
     if not (directory / "graphcollect").is_dir():
         raise RuntimeError(
@@ -461,6 +713,8 @@ def _worker_command(mode: str, refresh_token: str, client_id: str,
             cmd += ["-ua", user_agent]
         if token_out:
             cmd += ["--token-out", token_out]
+        if tenant:
+            cmd += ["-t", tenant]
         if autotoken:
             cmd += ["--autotoken"]
         if evade:
@@ -485,12 +739,16 @@ def _worker_command(mode: str, refresh_token: str, client_id: str,
            "-rt", refresh_token, "-c", client]
     if token_out:
         cmd += ["--token-out", token_out]
+    if tenant:
+        cmd += ["--tenant", tenant]
     if mode == "run":
         cmd += ["-o", str(out_path)]
         if user_agent:
             cmd += ["-ua", user_agent]
         if access_out:
             cmd += ["--access-out", access_out]
+        if access_token:
+            cmd += ["--access-token", access_token]
         if evade:
             cmd += ["--evade"]
     return cmd
@@ -502,16 +760,25 @@ def _temp_token_path() -> Path:
     return Path(name)
 
 
-def _read_token_out(path: Path) -> str:
+def _read_token_file(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8").strip()
     except OSError:
         return ""
-    finally:
-        try:
-            path.unlink()
-        except OSError:
-            pass
+
+
+def _unlink_token_file(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _read_token_out(path: Path) -> str:
+    """Read and remove a token file (probe/redemption convenience)."""
+    value = _read_token_file(path)
+    _unlink_token_file(path)
+    return value
 
 
 def test_proxy(proxy: dict, url: str = "") -> dict:
@@ -573,7 +840,8 @@ def test_proxy(proxy: dict, url: str = "") -> dict:
 
 
 def redeem_token(refresh_token: str, client_id: str,
-                 resource: str = "https://graph.microsoft.com") -> tuple[str, dict, str]:
+                 resource: str = "https://graph.microsoft.com",
+                 tenant: str = "") -> tuple[str, dict, str]:
     """Exchange a refresh token once and return (rotated, principal, access)."""
     token = (refresh_token or "").strip()
     client = (client_id or "").strip()
@@ -585,7 +853,7 @@ def redeem_token(refresh_token: str, client_id: str,
     if not resource:
         raise ValueError("redemption resource is required")
     token_out = _temp_token_path()
-    cmd = _worker_command("probe", token, client, str(token_out))
+    cmd = _worker_command("probe", token, client, str(token_out), tenant=tenant)
     cmd += ["--resource-uri", resource]
     try:
         proc = subprocess.run(
@@ -789,8 +1057,7 @@ def set_access_token(access_token: str) -> dict:
         raise ValueError("access token is required")
     principal = _principal_from_claims(_decode_access_claims(token))
     now = _timestamp()
-    with _LOCK:
-        store = _load_store()
+    with _store_session(write=True) as store:
         match = _find_access_record(store, principal)
         if match is None:
             match = {
@@ -812,10 +1079,8 @@ def set_access_token(access_token: str) -> dict:
                 match["client_id"] = principal.get("client_id") or ""
         match["access_token"] = token
         match["updated_at"] = now
-        active_id = store.get("active_id") or ""
-        if not active_id or active_id == match["id"]:
-            store["active_id"] = match["id"]
-        _save_store()
+        # Adding a token makes it the active one, matching set_auth().
+        store["active_id"] = match["id"]
     return get_auth_status()
 
 
@@ -829,8 +1094,7 @@ def set_auth(refresh_token: str, client_id: str) -> dict:
         raise ValueError("client id is required when a refresh token is provided")
 
     now = _timestamp()
-    with _LOCK:
-        store = _load_store()
+    with _store_session(write=True) as store:
         match = next(
             (rec for rec in store["tokens"]
              if rec.get("refresh_token") == token
@@ -849,7 +1113,6 @@ def set_auth(refresh_token: str, client_id: str) -> dict:
             "updated_at": now,
         })
         store["active_id"] = match["id"]
-        _save_store()
     return get_auth_status()
 
 
@@ -859,8 +1122,7 @@ def get_token_resources(token_id: str, client_id: str = "") -> dict:
     When `client_id` names another FOCI client, the list is for that client;
     this is how the FOCI submenu builds its resource picker.
     """
-    with _LOCK:
-        store = _load_store()
+    with _store_session() as store:
         rec = next((t for t in store["tokens"] if t.get("id") == token_id),
                    None)
         if rec is None:
@@ -911,127 +1173,253 @@ def _resolve_redeem_resource(client_id: str, target: str,
     return custom, custom
 
 
+def _find_foci_sibling(store: dict, client_id: str,
+                       group_key: tuple[str, str],
+                       exclude_id: str = "") -> dict | None:
+    candidates = [
+        t for t in store["tokens"]
+        if t.get("refresh_token")
+        and str(t.get("client_id") or "").lower() == client_id.lower()
+        and _principal_key(t.get("principal") or {}) == group_key
+        and t.get("id") != exclude_id
+    ]
+    candidates.sort(key=lambda t: t.get("updated_at") or "", reverse=True)
+    return candidates[0] if candidates else None
+
+
 def redeem_saved_token(token_id: str, target: str = "graph",
                        resource: str = "", client_id: str = "") -> dict:
     """Redeem one saved refresh token for a mapped or custom resource.
 
     `client_id` may name a sibling FOCI client; when omitted, the token's own
-    saved client is used.
+    saved client is used.  Redemptions are serialized per token and a rotated
+    refresh token is only saved if the record still holds the value that was
+    redeemed.
     """
-    with _LOCK:
-        store = _load_store()
-        rec = next((t for t in store["tokens"] if t.get("id") == token_id), None)
-        if rec is None:
-            raise ValueError("token not found")
-        refresh_token = rec.get("refresh_token") or ""
-        source_client = rec.get("client_id") or ""
-    if not refresh_token:
-        raise ValueError("this token has no refresh token to redeem")
-    if not source_client:
-        raise ValueError("client id is required when a refresh token is provided")
+    if _job_running():
+        raise RuntimeError(
+            "stop the running collection before redeeming tokens")
+    with _redemption_lock(token_id):
+        with _store_session() as store:
+            rec = next((t for t in store["tokens"]
+                        if t.get("id") == token_id), None)
+            if rec is None:
+                raise ValueError("token not found")
+            refresh_token = rec.get("refresh_token") or ""
+            source_client = rec.get("client_id") or ""
+            tenant = _record_tenant(rec)
+        if not refresh_token:
+            raise ValueError("this token has no refresh token to redeem")
+        if not source_client:
+            raise ValueError(
+                "client id is required when a refresh token is provided")
 
-    target_client = (client_id or "").strip() or source_client
-    if target_client.lower() != source_client.lower():
-        info = token_resources.client_info(source_client)
-        if not info.get("foci"):
-            raise ValueError("this token's client is not FOCI; it cannot "
-                             "redeem with another client")
-        target_info = token_resources.client_info(target_client)
-        if target_info.get("found") and not target_info.get("foci"):
-            raise ValueError("selected client is not in the FOCI family")
+        target_client = (client_id or "").strip() or source_client
+        if target_client.lower() != source_client.lower():
+            info = token_resources.client_info(source_client)
+            if not info.get("foci"):
+                raise ValueError("this token's client is not FOCI; it cannot "
+                                 "redeem with another client")
+            target_info = token_resources.client_info(target_client)
+            if target_info.get("found") and not target_info.get("foci"):
+                raise ValueError("selected client is not in the FOCI family")
 
-    redeem_resource, _ = _resolve_redeem_resource(target_client, target, resource)
-    rotated, principal, access_token = redeem_token(
-        refresh_token, target_client, redeem_resource)
-    now = _timestamp()
-    with _LOCK:
-        store = _load_store()
-        rec = next((t for t in store["tokens"] if t.get("id") == token_id), None)
-        if rec is None:
-            raise ValueError("token not found")
+        redeem_resource, _ = _resolve_redeem_resource(
+            target_client, target, resource)
+        rotated, principal, access_token = redeem_token(
+            refresh_token, target_client, redeem_resource, tenant=tenant)
+        now = _timestamp()
+        with _store_session(write=True) as store:
+            rec = next((t for t in store["tokens"]
+                        if t.get("id") == token_id), None)
+            if rec is None:
+                raise ValueError("token not found")
+            current_refresh = rec.get("refresh_token") or ""
+            if current_refresh != refresh_token and current_refresh != rotated:
+                raise ValueError(
+                    "the token changed during redemption; the rotated token "
+                    "was not saved")
 
-        # Keep the refresh entry refresh-only and put redeemed access tokens in
-        # their own principal+audience entries.
-        old_principal = dict(rec.get("principal") or {})
-        old_access = rec.get("access_token") or ""
-        if old_access and not old_principal.get("audience"):
-            try:
-                old_principal["audience"] = _principal_from_claims(
-                    _decode_access_claims(old_access)).get("audience") or ""
-            except ValueError:
-                pass
-        if old_access and old_principal.get("audience"):
-            _store_access_token(store, old_access, old_principal, now,
-                                client_id=source_client, exclude_id=rec["id"],
-                                parent_id=rec["id"])
-        if old_access:
-            rec["access_token"] = ""
+            # Keep the refresh entry refresh-only and put redeemed access
+            # tokens in their own principal+audience entries.
+            old_principal = dict(rec.get("principal") or {})
+            old_access = rec.get("access_token") or ""
+            if old_access and not old_principal.get("audience"):
+                try:
+                    old_principal["audience"] = _principal_from_claims(
+                        _decode_access_claims(old_access)).get("audience") or ""
+                except ValueError:
+                    pass
+            if old_access and old_principal.get("audience"):
+                _store_access_token(store, old_access, old_principal, now,
+                                    client_id=source_client,
+                                    exclude_id=rec["id"],
+                                    parent_id=rec["id"])
+            if old_access:
+                rec["access_token"] = ""
 
-        merged = dict(old_principal)
-        merged.update({k: v for k, v in principal.items() if v})
-        merged["audience"] = ""
-        merged["access_expires_at"] = ""
+            merged = dict(old_principal)
+            merged.update({k: v for k, v in principal.items() if v})
+            merged["audience"] = ""
+            merged["access_expires_at"] = ""
+            group_key = _principal_key(merged)
 
-        if target_client.lower() == source_client.lower():
+            # FOCI clients share one rotating refresh token.  Update the source
+            # and every sibling that still holds the consumed value.
+            _propagate_refresh_rotation(store, refresh_token, rotated, now)
             rec.update({
                 "refresh_token": rotated,
                 "access_token": "",
                 "principal": merged,
                 "updated_at": now,
             })
-            refresh_parent_id = rec["id"]
-        else:
-            # A FOCI sibling redemption gets its own refresh entry, with the
-            # rotated refresh token and the new access token beneath it.
-            new_rec = {
-                "id": secrets.token_hex(8),
-                "added_at": now,
-                "refresh_token": rotated,
-                "access_token": "",
-                "client_id": target_client,
-                "principal": merged,
-                "updated_at": now,
-            }
-            store["tokens"].append(new_rec)
-            refresh_parent_id = new_rec["id"]
 
-        access_principal = dict(merged)
-        access_principal["audience"] = principal.get("audience") or ""
-        access_principal["access_expires_at"] = (
-            principal.get("access_expires_at") or "")
-        access_principal["scopes"] = principal.get("scopes") or []
-        access_principal["roles"] = principal.get("roles") or []
-        try:
-            access_principal["amr"] = _amr_values(
-                _decode_access_claims(access_token).get("amr"))
-        except ValueError:
-            access_principal.pop("amr", None)
-        _store_access_token(store, access_token, access_principal, now,
-                            client_id=target_client,
-                            exclude_id=refresh_parent_id,
-                            parent_id=refresh_parent_id)
-        if not store.get("active_id") or store.get("active_id") == rec["id"]:
-            store["active_id"] = refresh_parent_id
-        _save_store()
+            if target_client.lower() == source_client.lower():
+                refresh_parent_id = rec["id"]
+            else:
+                # Deduplicate FOCI siblings by client + principal instead of
+                # appending a new record on every redemption.
+                sibling = _find_foci_sibling(
+                    store, target_client, group_key, exclude_id=rec["id"])
+                if sibling is None:
+                    sibling = {
+                        "id": secrets.token_hex(8),
+                        "added_at": now,
+                        "refresh_token": rotated,
+                        "access_token": "",
+                        "client_id": target_client,
+                        "principal": merged,
+                        "updated_at": now,
+                    }
+                    store["tokens"].append(sibling)
+                else:
+                    sibling_principal = dict(sibling.get("principal") or {})
+                    sibling_principal.update(merged)
+                    sibling.update({
+                        "refresh_token": rotated,
+                        "access_token": "",
+                        "client_id": target_client,
+                        "principal": sibling_principal,
+                        "updated_at": now,
+                    })
+                refresh_parent_id = sibling["id"]
+                # Reparent/remove any other duplicate siblings for this key.
+                duplicates = [
+                    t for t in store["tokens"]
+                    if t.get("id") != refresh_parent_id
+                    and t.get("id") != rec["id"]
+                    and t.get("refresh_token")
+                    and str(t.get("client_id") or "").lower()
+                    == target_client.lower()
+                    and _principal_key(t.get("principal") or {}) == group_key
+                ]
+                for dup in duplicates:
+                    for child in store["tokens"]:
+                        if child.get("parent_id") == dup.get("id"):
+                            child["parent_id"] = refresh_parent_id
+                    store["tokens"] = [
+                        t for t in store["tokens"] if t is not dup]
+
+            access_principal = dict(merged)
+            access_principal["audience"] = principal.get("audience") or ""
+            access_principal["access_expires_at"] = (
+                principal.get("access_expires_at") or "")
+            access_principal["scopes"] = principal.get("scopes") or []
+            access_principal["roles"] = principal.get("roles") or []
+            try:
+                access_principal["amr"] = _amr_values(
+                    _decode_access_claims(access_token).get("amr"))
+            except ValueError:
+                access_principal.pop("amr", None)
+            _store_access_token(store, access_token, access_principal, now,
+                                client_id=target_client,
+                                exclude_id=refresh_parent_id,
+                                parent_id=refresh_parent_id)
+            if (not store.get("active_id")
+                    or store.get("active_id") == rec["id"]):
+                store["active_id"] = refresh_parent_id
     return get_auth_status()
 
 
 # ---------------------------------------------------------------------------
 # collection job
 
+def _record_tenant(rec: dict) -> str:
+    principal = rec.get("principal") or {}
+    tenant = str(principal.get("tenant_id") or "").strip()
+    if tenant:
+        return tenant
+    token = rec.get("access_token") or ""
+    if token:
+        try:
+            return str(_decode_access_claims(token).get("tid") or "").strip()
+        except ValueError:
+            pass
+    return ""
+
+
+def _saved_access_for(store: dict, parent_id: str, backend: str) -> str:
+    """Find a valid unexpired access child for a refresh record."""
+    if not parent_id:
+        return ""
+    candidates = []
+    for rec in store["tokens"]:
+        if (rec.get("parent_id") or "") != parent_id:
+            continue
+        token = rec.get("access_token") or ""
+        if not token:
+            continue
+        try:
+            claims = _decode_access_claims(token)
+        except ValueError:
+            continue
+        if backend == "aadgraph":
+            if not _is_aadgraph_audience(claims):
+                continue
+        elif not _is_graph_audience(claims):
+            continue
+        expires = claims.get("exp")
+        if expires:
+            try:
+                if int(expires) <= time.time():
+                    continue
+            except (TypeError, ValueError):
+                continue
+        candidates.append(rec)
+    candidates.sort(key=lambda t: t.get("updated_at") or "", reverse=True)
+    return (candidates[0].get("access_token") or "") if candidates else ""
+
+
 def _resolve_credentials(refresh_token: str = "",
                          client_id: str = "", backend: str = "graph",
-                         autotoken: bool = True) -> dict:
+                         autotoken: bool = True, tenant: str = "") -> dict:
     """Resolve the token(s) a collection backend should use."""
     token = (refresh_token or "").strip()
     client = (client_id or "").strip()
     if token:
         if not client:
             raise ValueError("client id is required when a refresh token is provided")
+        # Match a saved record so a rotation can be persisted and a known
+        # tenant can be used for single-tenant/FOCI redemptions.
+        token_id = ""
+        saved_tenant = ""
+        saved_access = ""
+        with _store_session() as store:
+            saved = next(
+                (t for t in store["tokens"]
+                 if t.get("refresh_token") == token
+                 and str(t.get("client_id") or "").lower() == client.lower()),
+                None)
+            if saved is not None:
+                token_id = saved.get("id") or ""
+                saved_tenant = _record_tenant(saved)
+                saved_access = (saved.get("access_token") or ""
+                                or _saved_access_for(store, token_id, backend))
         return {"mode": "refresh", "refresh_token": token,
-                "access_token": "", "client_id": client, "token_id": ""}
-    with _LOCK:
-        store = _load_store()
+                "access_token": saved_access, "client_id": client,
+                "token_id": token_id,
+                "tenant": str(tenant or saved_tenant or "").strip()}
+    with _store_session() as store:
         active = next((t for t in store["tokens"]
                        if t.get("id") == store.get("active_id")), None)
         if active is None:
@@ -1039,33 +1427,37 @@ def _resolve_credentials(refresh_token: str = "",
         active_id = active.get("id") or ""
         rec_refresh = active.get("refresh_token") or ""
         rec_access = active.get("access_token") or ""
+        if not rec_access and rec_refresh:
+            rec_access = _saved_access_for(store, active_id, backend)
         rec_client = active.get("client_id") or ""
+        rec_tenant = _record_tenant(active)
+    rec_tenant = str(tenant or rec_tenant or "").strip()
     if backend == "aadgraph":
         if rec_refresh and rec_client:
             if autotoken:
                 return {"mode": "refresh", "refresh_token": rec_refresh,
                         "access_token": rec_access, "client_id": rec_client,
-                        "token_id": active_id}
+                        "token_id": active_id, "tenant": rec_tenant}
             if rec_access and _record_is_aadgraph_access(active):
                 return {"mode": "access", "refresh_token": rec_refresh,
                         "access_token": rec_access, "client_id": rec_client,
-                        "token_id": active_id}
+                        "token_id": active_id, "tenant": rec_tenant}
             raise ValueError(
                 "enable autotoken or select an AAD Graph access token")
         if rec_access and _record_is_aadgraph_access(active):
             return {"mode": "access", "refresh_token": "",
                     "access_token": rec_access, "client_id": rec_client,
-                    "token_id": active_id}
+                    "token_id": active_id, "tenant": rec_tenant}
         raise ValueError(
             "select a token with a refresh token or AAD Graph access token")
     if rec_refresh and rec_client:
         return {"mode": "refresh", "refresh_token": rec_refresh,
                 "access_token": rec_access, "client_id": rec_client,
-                "token_id": active_id}
+                "token_id": active_id, "tenant": rec_tenant}
     if rec_access and _record_is_graph_access(active):
         return {"mode": "access", "refresh_token": "",
                 "access_token": rec_access, "client_id": rec_client,
-                "token_id": active_id}
+                "token_id": active_id, "tenant": rec_tenant}
     raise ValueError(
         "select a token with a refresh token or a Microsoft Graph access token")
 
@@ -1097,13 +1489,17 @@ def start_collection(refresh_token: str = "", out: str = "",
                      client_id: str = "", user_agent: str = "",
                      backend: str = "graph", evade: bool = False,
                      gather_all: bool = False, autotoken: bool = True,
-                     mfa: bool = False) -> dict:
+                     mfa: bool = False, tenant: str = "") -> dict:
     """Start one background collection job; only one can run at a time."""
     global _PROCESS
     backend = (backend or "graph").strip().lower()
     if backend not in ("graph", "aadgraph"):
         raise ValueError("unknown collection backend")
-    creds = _resolve_credentials(refresh_token, client_id, backend, autotoken)
+    with _LOCK:
+        if _JOB["status"] == "running":
+            raise RuntimeError("a collection is already running")
+    creds = _resolve_credentials(
+        refresh_token, client_id, backend, autotoken, tenant)
     default_out = (DEFAULT_AADGRAPH_OUTPUT if backend == "aadgraph"
                    else DEFAULT_OUTPUT)
     out_path = Path(out or default_out).expanduser()
@@ -1120,7 +1516,8 @@ def start_collection(refresh_token: str = "", out: str = "",
             out_path=out_path, user_agent=user_agent,
             access_token=creds["access_token"], evade=evade,
             gather_all=gather_all,
-            autotoken=bool(autotoken and creds["refresh_token"]), mfa=mfa)
+            autotoken=bool(autotoken and creds["refresh_token"]), mfa=mfa,
+            tenant=creds.get("tenant") or "")
         initial_log = "Starting AAD Graph collector..."
     elif creds["mode"] == "refresh":
         token_out = _temp_token_path()
@@ -1128,7 +1525,9 @@ def start_collection(refresh_token: str = "", out: str = "",
         cmd = _worker_command("run", creds["refresh_token"],
                               creds["client_id"], str(token_out),
                               out_path=out_path, user_agent=user_agent,
-                              access_out=str(access_out), evade=evade)
+                              access_out=str(access_out), evade=evade,
+                              access_token=creds["access_token"],
+                              tenant=creds.get("tenant") or "")
         initial_log = "Starting collector..."
     else:
         cmd = _worker_command("run-access", creds["access_token"], "",
@@ -1139,7 +1538,11 @@ def start_collection(refresh_token: str = "", out: str = "",
 
     with _LOCK:
         if _JOB["status"] == "running":
+            for path in (token_out, access_out):
+                if path is not None:
+                    _unlink_token_file(path)
             raise RuntimeError("a collection is already running")
+        generation = int(_JOB.get("generation") or 0) + 1
         _JOB.update({
             "status": "running",
             "kind": backend,
@@ -1150,15 +1553,33 @@ def start_collection(refresh_token: str = "", out: str = "",
             "returncode": None,
             "error": "",
             "stop_requested": False,
+            "generation": generation,
         })
 
-    _mark_token_used(creds["token_id"], out_path,
-                     "aadgraph" if backend == "aadgraph" else creds["mode"])
-    thread = threading.Thread(target=_run_job,
-                              args=(cmd, token_out, access_out,
-                                    creds["token_id"]),
-                              daemon=True)
-    thread.start()
+    try:
+        _mark_token_used(creds["token_id"], out_path,
+                         "aadgraph" if backend == "aadgraph" else creds["mode"])
+        thread = threading.Thread(
+            target=_run_job,
+            args=(cmd, token_out, access_out, creds["token_id"],
+                  generation, creds["refresh_token"], creds["client_id"]),
+            daemon=True)
+        thread.start()
+    except Exception as exc:
+        # No worker exists to move the job out of "running"; reset it and
+        # discard the unused token files.
+        with _LOCK:
+            if int(_JOB.get("generation") or 0) == generation:
+                _JOB.update({
+                    "status": "error",
+                    "finished_at": _timestamp(),
+                    "error": f"could not start collection: {exc}",
+                })
+                _JOB["log"].append(f"error: {exc}")
+        for path in (token_out, access_out):
+            if path is not None:
+                _unlink_token_file(path)
+        raise
     return get_status()
 
 
@@ -1196,10 +1617,63 @@ def stop_collection() -> dict:
     return get_status()
 
 
+def _file_mtime(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _persist_token_files(token_out: Path | None, access_out: Path | None,
+                         token_id: str, client_id: str,
+                         state: dict) -> str:
+    """Read worker token files and persist changes.
+
+    Returns ``"ok"``, ``"stale"`` or an error string.  Files are never removed
+    here; the caller keeps them until persistence succeeds.
+    """
+    rotated = _read_token_file(token_out) if token_out else ""
+    access_token = _read_token_file(access_out) if access_out else ""
+    changed_refresh = bool(rotated and rotated != state["last_refresh"])
+    changed_access = bool(
+        access_token and access_token != state["last_access"])
+    if not changed_refresh and not changed_access:
+        return "ok"
+    try:
+        updated = _update_token_secret(
+            token_id,
+            rotated if changed_refresh else "",
+            access_token if changed_access else "",
+            expected_refresh=state["expected"],
+            client_id=client_id)
+    except Exception as exc:
+        return f"could not persist the rotated token: {exc}"
+    if not updated:
+        return "stale"
+    if changed_refresh:
+        state["last_refresh"] = rotated
+        state["expected"] = rotated
+    if changed_access:
+        state["last_access"] = access_token
+    return "ok"
+
+
 def _run_job(cmd: list[str], token_out: Path | None,
-             access_out: Path | None, token_id: str) -> None:
+             access_out: Path | None, token_id: str, generation: int,
+             expected_refresh: str = "", client_id: str = "") -> None:
     global _PROCESS
     proc = None
+    returncode = None
+    stopped = False
+    job_error = ""
+    persistence_error = ""
+    state = {
+        "last_refresh": "",
+        "last_access": "",
+        "expected": expected_refresh or "",
+        "stale_logged": False,
+    }
+    seen_mtimes = {"refresh": None, "access": None}
     try:
         proc = subprocess.Popen(
             cmd, cwd=str(BASE_DIR), env=_worker_env(),
@@ -1216,36 +1690,103 @@ def _run_job(cmd: list[str], token_out: Path | None,
         assert proc.stdout is not None
         for line in proc.stdout:
             _append_log(line)
+            if persistence_error or state.get("stale"):
+                continue
+            # Persist each rotation as soon as the worker writes it instead of
+            # waiting for the job to finish.
+            refresh_mtime = _file_mtime(token_out) if token_out else None
+            access_mtime = _file_mtime(access_out) if access_out else None
+            if (refresh_mtime == seen_mtimes["refresh"]
+                    and access_mtime == seen_mtimes["access"]):
+                continue
+            seen_mtimes["refresh"] = refresh_mtime
+            seen_mtimes["access"] = access_mtime
+            outcome = _persist_token_files(
+                token_out, access_out, token_id, client_id, state)
+            if outcome == "stale":
+                state["stale"] = True
+                if not state["stale_logged"]:
+                    state["stale_logged"] = True
+                    _append_log(
+                        "warning: the saved token changed during collection; "
+                        "the worker's rotated token was not written")
+            elif outcome != "ok":
+                persistence_error = outcome
         returncode = proc.wait()
         with _LOCK:
             stopped = bool(_JOB.get("stop_requested"))
-            _JOB["returncode"] = returncode
-            if stopped:
-                _JOB["status"] = "stopped"
-                _JOB["error"] = ""
-                _JOB["log"].append("Collection stopped.")
-            elif returncode == 0:
-                _JOB["status"] = "done"
-            else:
-                _JOB["status"] = "error"
-                _JOB["error"] = f"collector exited with status {returncode}"
-            _JOB["finished_at"] = _timestamp()
     except Exception as exc:  # surfaced in the Collect tab
-        with _LOCK:
-            _JOB["status"] = "error"
-            _JOB["finished_at"] = _timestamp()
-            _JOB["error"] = str(exc)
-            _JOB["log"].append(f"error: {exc}")
+        job_error = str(exc)
+        _append_log(f"error: {exc}")
     finally:
-        rotated = _read_token_out(token_out) if token_out else ""
-        access_token = _read_token_out(access_out) if access_out else ""
-        if rotated or access_token:
-            try:
-                _update_token_secret(token_id, rotated, access_token)
-            except Exception:
-                pass
+        # Final read: do not remove the token files until the update succeeds.
+        if not state.get("stale"):
+            outcome = _persist_token_files(
+                token_out, access_out, token_id, client_id, state)
+            if outcome == "stale":
+                state["stale"] = True
+                _append_log(
+                    "warning: the saved token changed during collection; "
+                    "the worker's rotated token was not written")
+                persistence_error = ""
+            elif outcome != "ok":
+                # One retry for a transient auth-file write failure.
+                retry = _persist_token_files(
+                    token_out, access_out, token_id, client_id, state)
+                if retry == "ok":
+                    persistence_error = ""
+                elif retry == "stale":
+                    state["stale"] = True
+                    persistence_error = ""
+                    _append_log(
+                        "warning: the saved token changed during collection; "
+                        "the worker's rotated token was not written")
+                else:
+                    persistence_error = retry or outcome
+            else:
+                persistence_error = ""
+        if persistence_error:
+            locations = ", ".join(
+                str(path) for path in (token_out, access_out) if path)
+            persistence_error += f" (kept {locations})"
+        else:
+            for path in (token_out, access_out):
+                if path is not None:
+                    _unlink_token_file(path)
+
         with _LOCK:
-            _PROCESS = None
+            if _PROCESS is proc:
+                _PROCESS = None
+            if int(_JOB.get("generation") or 0) == generation:
+                _JOB["returncode"] = returncode
+                if persistence_error:
+                    _JOB["status"] = "error"
+                    _JOB["error"] = persistence_error
+                    _JOB["log"].append(f"error: {persistence_error}")
+                elif job_error:
+                    _JOB["status"] = "error"
+                    _JOB["error"] = job_error
+                elif stopped:
+                    _JOB["status"] = "stopped"
+                    _JOB["error"] = ""
+                    _JOB["log"].append("Collection stopped.")
+                elif returncode == 0:
+                    _JOB["status"] = "done"
+                    _JOB["error"] = ""
+                elif returncode == 2:
+                    _JOB["status"] = "error"
+                    _JOB["error"] = (
+                        "collector exited with status 2; no directory data "
+                        "was collected (check the token permissions)")
+                elif returncode == 3:
+                    _JOB["status"] = "partial"
+                    _JOB["error"] = (
+                        "collection completed with partial data; the core "
+                        "database was saved")
+                else:
+                    _JOB["status"] = "error"
+                    _JOB["error"] = f"collector exited with status {returncode}"
+                _JOB["finished_at"] = _timestamp()
 
 
 # ---------------------------------------------------------------------------
@@ -1267,6 +1808,7 @@ def styles_html() -> str:
     display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px;
     color: var(--text-secondary); font-size: 12px;
   }
+  .collect-field.hidden { display: none; }
   .collect-field input, .collect-field select, .collect-field textarea {
     background: var(--page-plane); color: var(--text-primary);
     border: 1px solid var(--border); border-radius: 6px;
@@ -1846,8 +2388,36 @@ def view_html() -> str:
       var toggle = document.getElementById('reanalyze-btn');
       if (toggle) toggle.click();
     }
+    var selected = outputEl ? (outputEl.textContent || '').trim() : '';
     var select = document.getElementById('analysis-db-select');
-    if (select) select.focus();
+    if (!selected) {
+      if (select) select.focus();
+      return;
+    }
+    // loadDatabases() runs asynchronously after the view switch.  Wait for
+    // its options, then select the collected path (or use the custom input).
+    var attempts = 0;
+    function apply() {
+      var selectNow = document.getElementById('analysis-db-select');
+      var inputNow = document.getElementById('analysis-db');
+      if (!selectNow) return;
+      var match = Array.prototype.some.call(
+        selectNow.options, function(o) { return o.value === selected; });
+      if (match) {
+        selectNow.value = selected;
+        if (inputNow) inputNow.value = '';
+      } else if (selectNow.options.length > 1 || attempts >= 20) {
+        selectNow.value = '__custom__';
+        if (inputNow) inputNow.value = selected;
+      } else {
+        attempts += 1;
+        setTimeout(apply, 100);
+        return;
+      }
+      selectNow.dispatchEvent(new Event('change'));
+      selectNow.focus();
+    }
+    setTimeout(apply, 0);
   }
 
   function kindLabel(kind) {
@@ -1870,14 +2440,17 @@ def view_html() -> str:
     statusEl.classList.toggle('hidden', data.status === 'idle' && !(data.log || []).length);
     stateEl.textContent = {
       idle: 'Idle', running: 'Collecting...', done: 'Collection complete',
+      partial: 'Collection complete (partial data)',
       stopped: 'Collection stopped', error: 'Collection failed'
     }[data.status] || data.status;
     kindEl.textContent = data.status === 'idle' ? '' : kindLabel(kind);
     outputEl.textContent = data.output ? data.output : '';
     logEl.textContent = (data.log || []).join('\n');
     logEl.scrollTop = logEl.scrollHeight;
-    if (data.status === 'done') {
-      setKindNote(kind, 'Done. Use Go to analysis to load it.');
+    if (data.status === 'done' || data.status === 'partial') {
+      setKindNote(kind, data.status === 'partial'
+        ? (data.error || 'Done with partial data.') + ' Use Go to analysis to load it.'
+        : 'Done. Use Go to analysis to load it.');
       if (kind === 'aadgraph') idleNote(); else aadIdleNote();
     } else if (data.status === 'stopped') {
       setKindNote(kind, 'Stopped. The output database may be incomplete.');
@@ -1966,7 +2539,8 @@ def view_html() -> str:
           if (data.status === 'running') {
             render(data);
             poll();
-          } else if (data.status === 'done' || data.status === 'error'
+          } else if (data.status === 'done' || data.status === 'partial'
+                     || data.status === 'error'
                      || data.status === 'stopped') {
             render(data);
           } else {
@@ -4229,26 +4803,38 @@ def main(argv=None) -> int:
                     help="also collect IG, PIM, and Azure data")
     ap.add_argument("--mfa", action="store_true",
                     help="include MFA details (requires privileged access)")
+    ap.add_argument("-t", "--tenant", default="",
+                    help="tenant ID/domain for single-tenant token redemption")
     ap.add_argument("--collector-dir", default=None,
                     help="collector checkout (default: bundled entra_surface/collector)")
     args = ap.parse_args(argv)
 
+    if args.backend == "graph" and (args.gather_all or args.mfa):
+        ap.error("--gather-all and --mfa are only supported with "
+                 "--backend aadgraph")
+    if args.backend == "graph" and args.autotoken:
+        ap.error("--autotoken is only supported with --backend aadgraph")
     if args.collector_dir:
         os.environ["ENTRA_COLLECTOR_DIR"] = args.collector_dir
     default_out = (DEFAULT_AADGRAPH_OUTPUT if args.backend == "aadgraph"
                    else DEFAULT_OUTPUT)
     out_path = Path(args.out or default_out).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    token_out = None
+    access_out = None
     try:
         if args.backend == "aadgraph":
             if not args.refresh_token and not args.access_token:
                 raise ValueError("a refresh or access token is required")
+            if args.refresh_token:
+                token_out = _temp_token_path()
             cmd = _worker_command(
                 "run-aadgraph", args.refresh_token, args.client_id,
+                token_out=str(token_out) if token_out else "",
                 out_path=out_path, user_agent=args.user_agent,
                 access_token=args.access_token, evade=args.evade,
                 gather_all=args.gather_all, autotoken=args.autotoken,
-                mfa=args.mfa)
+                mfa=args.mfa, tenant=args.tenant)
         elif args.access_token and not args.refresh_token:
             cmd = _worker_command("run-access", args.access_token, "",
                                   out_path=out_path,
@@ -4258,14 +4844,54 @@ def main(argv=None) -> int:
             if not args.refresh_token or not args.client_id:
                 raise ValueError(
                     "refresh token and client id are required for Graph")
+            token_out = _temp_token_path()
+            access_out = _temp_token_path()
             cmd = _worker_command("run", args.refresh_token, args.client_id,
-                                  out_path=out_path,
+                                  str(token_out), out_path=out_path,
                                   user_agent=args.user_agent,
-                                  evade=args.evade)
+                                  access_out=str(access_out),
+                                  access_token=args.access_token,
+                                  evade=args.evade, tenant=args.tenant)
     except (RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
+        for path in (token_out, access_out):
+            if path is not None:
+                _unlink_token_file(path)
         return 1
-    return subprocess.call(cmd, cwd=str(BASE_DIR), env=_worker_env())
+
+    returncode = subprocess.call(cmd, cwd=str(BASE_DIR), env=_worker_env())
+    persistence_error = ""
+    rotated = _read_token_file(token_out) if token_out else ""
+    access_token = _read_token_file(access_out) if access_out else ""
+    if rotated or access_token:
+        try:
+            saved = _update_token_secret(
+                "", rotated, access_token,
+                expected_refresh=args.refresh_token,
+                client_id=args.client_id)
+        except Exception as exc:
+            saved = False
+            persistence_error = f"could not persist the rotated token: {exc}"
+        if not saved and not persistence_error:
+            persistence_error = (
+                "the saved token changed during collection; the rotated "
+                "token was not written")
+    if persistence_error:
+        # Keep the temp files so the operator can recover the token manually.
+        print(f"error: {persistence_error}", file=sys.stderr)
+        if token_out is not None:
+            print(f"[token] rotated refresh token kept at {token_out}",
+                  file=sys.stderr)
+        if access_out is not None:
+            print(f"[token] access token kept at {access_out}",
+                  file=sys.stderr)
+        if returncode == 0:
+            return 1
+    else:
+        for path in (token_out, access_out):
+            if path is not None:
+                _unlink_token_file(path)
+    return returncode
 
 
 if __name__ == "__main__":

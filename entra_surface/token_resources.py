@@ -12,11 +12,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
 import threading
 import time
 import urllib.request
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import settings as surface_settings
 
@@ -93,9 +95,74 @@ NOISY_HOST_PARTS = (
 
 _LOCK = threading.Lock()
 _DATA = {}
+_LOADED_AT = 0.0
 _ERROR = ""
 _ERROR_AT = 0.0
 ERROR_TTL = 60
+
+
+def _no_proxy_match(host: str, no_proxy: str) -> bool:
+    host = str(host or "").strip().lower().strip("[]")
+    if not host:
+        return False
+    for entry in re.split(r"[,\s]+", str(no_proxy or "")):
+        entry = entry.strip().lower()
+        if not entry:
+            continue
+        if entry == "*":
+            return True
+        entry = entry.split("/", 1)[0]
+        if entry.startswith("."):
+            if host == entry[1:] or host.endswith(entry):
+                return True
+            continue
+        if entry.startswith("[") and "]" in entry:
+            entry = entry[1:entry.index("]")]
+        elif entry.count(":") == 1:
+            entry = entry.split(":", 1)[0]
+        if entry and (host == entry or host.endswith("." + entry)):
+            return True
+    return False
+
+
+def _opener(url: str):
+    """Build a urllib opener that honors the app proxy/TLS settings."""
+    settings = surface_settings.load_settings()
+    proxy = settings.get("proxy") or {}
+    handlers = []
+    if proxy.get("enabled"):
+        proxy_map = surface_settings.proxy_dict(proxy)
+        host = urlsplit(url).hostname or ""
+        if proxy_map and not _no_proxy_match(host, proxy.get("no_proxy") or ""):
+            handlers.append(urllib.request.ProxyHandler(proxy_map))
+        else:
+            # Explicitly bypass every proxy for this host.
+            handlers.append(urllib.request.ProxyHandler({}))
+    if proxy.get("insecure_tls"):
+        handlers.append(urllib.request.HTTPSHandler(
+            context=ssl._create_unverified_context()))
+    return urllib.request.build_opener(*handlers)
+
+
+def _fetch_via_requests(url: str, request, proxy: dict) -> bytes:
+    """Fetch through requests when urllib cannot handle the proxy type."""
+    try:
+        import requests
+        from requests.utils import should_bypass_proxies
+    except ImportError as exc:  # pragma: no cover - dependency present in releases
+        raise RuntimeError(
+            "SOCKS proxies require the requests and PySocks packages") from exc
+    proxies = surface_settings.proxy_dict(proxy)
+    if proxy.get("no_proxy") and should_bypass_proxies(
+            url, str(proxy.get("no_proxy") or "")):
+        proxies = None
+    session = requests.Session()
+    session.trust_env = False
+    response = session.get(
+        url, headers=dict(request.header_items()), proxies=proxies,
+        verify=not bool(proxy.get("insecure_tls")), timeout=30)
+    response.raise_for_status()
+    return response.content
 
 
 def _fetch(name: str):
@@ -104,8 +171,13 @@ def _fetch(name: str):
                   or "entra-surface-token-resources/1.0")
     request = urllib.request.Request(
         url, headers={"User-Agent": user_agent})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        raw = response.read()
+    settings = surface_settings.load_settings()
+    proxy = settings.get("proxy") or {}
+    if proxy.get("enabled") and surface_settings.is_socks(proxy):
+        raw = _fetch_via_requests(url, request, proxy)
+    else:
+        with _opener(url).open(request, timeout=30) as response:
+            raw = response.read()
     data = json.loads(raw)
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -142,22 +214,30 @@ def _load(name: str):
 
 
 def datasets():
-    global _ERROR, _ERROR_AT
+    global _ERROR, _ERROR_AT, _LOADED_AT
     with _LOCK:
-        if not _DATA:
-            if _ERROR and time.time() - _ERROR_AT < ERROR_TTL:
-                raise RuntimeError(_ERROR)
-            loaded = {}
-            try:
-                for name in SOURCES:
-                    loaded[name] = _load(name)
-            except RuntimeError as exc:
-                _ERROR = str(exc)
-                _ERROR_AT = time.time()
-                raise
-            _DATA.update(loaded)
-            _ERROR = ""
-            _ERROR_AT = 0.0
+        now = time.time()
+        stale = (not _DATA) or (now - _LOADED_AT >= CACHE_TTL)
+        if not stale:
+            return _DATA
+        if not _DATA and _ERROR and now - _ERROR_AT < ERROR_TTL:
+            raise RuntimeError(_ERROR)
+        loaded = {}
+        try:
+            for name in SOURCES:
+                loaded[name] = _load(name)
+        except RuntimeError as exc:
+            _ERROR = str(exc)
+            _ERROR_AT = now
+            if _DATA:
+                # Keep serving the existing dataset if a refresh fails.
+                return _DATA
+            raise
+        _DATA.clear()
+        _DATA.update(loaded)
+        _LOADED_AT = now
+        _ERROR = ""
+        _ERROR_AT = 0.0
         return _DATA
 
 

@@ -36,9 +36,10 @@ Checks (config: privileged_roles.json -> "checks"):
   groups                  - full group roster: one row per group with the directory
                             roles it carries, role-capability, dynamic rules, owners,
                             and privileged / SP members
-  ca_exposure             - Conditional Access exposure: policy states/scopes and
-                            users excluded from sign-on / MFA policies (elevated
-                            when the excluded user is privileged)
+  ca_exposure             - Conditional Access policy inventory: states, scopes,
+                            conditions and exclusions
+  ca_gaps                 - Conditional Access gaps: privileged users excluded
+                            from enabled sign-on / MFA policies that target them
   ad_sync_summary         - sync summary card: engine in use (Entra Connect on-prem
                             vs likely Cloud Sync), connector host, password-writeback
                             channel, Desktop SSO status
@@ -91,6 +92,7 @@ DEFAULT_CHECK_CFG = {
     "enabled": {},                 # {check_id: bool} - empty means all enabled
     "min_severity": "Info",        # drop findings below this
     "suppress": [],                # ["check_id:primary_id"] keys to silence
+    "include_disabled": True,      # include disabled/deleted principals
 }
 
 # Microsoft system application role: every application implicitly exposes this
@@ -212,15 +214,72 @@ def json_list(value):
     return []
 
 
+def policy_detail_inner(detail):
+    """Return the decoded policy object for every collected policyDetail shape.
+
+    ROADrecon stores a list of JSON-encoded strings (sometimes double-encoded);
+    other exports store a JSON object or a plain string. Never raises for a
+    valid JSON scalar/object in the wrong shape.
+    """
+    parsed = json_safe_value(detail)
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, list):
+        if not parsed:
+            return {}
+        inner = parsed[0]
+    elif isinstance(parsed, str):
+        inner = parsed
+    else:
+        return {}
+    if isinstance(inner, str):
+        try:
+            inner = json.loads(inner)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return {}
+    return inner if isinstance(inner, dict) else {}
+
+
+def policy_detail_normalized(detail):
+    return _normalize_ca_policy(policy_detail_inner(detail))
+
+
+def policy_state_from_record(record):
+    """CA state for a Policys row, normalized for Graph and ROADrecon shapes."""
+    inner = policy_detail_normalized((record or {}).get("policyDetail"))
+    return (str(inner.get("State") or "").strip() or "Unknown")
+
+
 def parse_datetime(value):
+    """Parse the timestamp formats produced by ROADrecon and Graph.
+
+    Graph returns ISO-8601 values such as ``2026-04-17T12:17:00Z`` while older
+    exports use space-separated values. Both are normalized to UTC.
+    """
     if not value:
         return None
-    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-        try:
-            return datetime.datetime.strptime(str(value), fmt).replace(tzinfo=datetime.timezone.utc)
-        except ValueError:
-            pass
-    return None
+    text = str(value).strip()
+    if not text:
+        return None
+    iso = text
+    if iso.endswith(("Z", "z")):
+        iso = iso[:-1] + "+00:00"
+    # fromisoformat accepts at most six fractional digits on older Pythons.
+    iso = re.sub(r"(\.\d{6})\d+", r"\1", iso)
+    try:
+        parsed = datetime.datetime.fromisoformat(iso)
+    except ValueError:
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                parsed = datetime.datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
 
 
 def truncate(text, width=110):
@@ -257,9 +316,139 @@ def eligible_severity(severity):
 
 
 # ---------------------------------------------------------------------------
+# Directory-role scopes / state
+# ---------------------------------------------------------------------------
+# A role assignment scoped to an administrative unit (AU) only grants the
+# role over that AU. It must stay visible, but it is not a tenant-wide
+# privileged role and must never escalate a finding's rating.
+
+def normalize_role_scopes(raw):
+    """Normalize resourceScopes/scopedResourceId into a list of scope IDs."""
+    parsed = json_safe_value(raw)
+    if isinstance(parsed, list):
+        scopes = [str(v).strip() for v in parsed if isinstance(v, str) and v.strip()]
+    elif isinstance(parsed, str) and parsed.strip():
+        scopes = [parsed.strip()]
+    else:
+        scopes = []
+    return scopes or ["/"]
+
+
+def role_scope_ids(graph, scopes):
+    """Administrative Unit object IDs among the raw role scope values.
+
+    Directory role assignments are either tenant-wide or scoped to an
+    Administrative Unit. ROADrecon/AAD Graph exports may store the scope as a
+    bare object ID instead of a path, so only values that match an AU path or
+    resolve to a collected AU are treated as limited. Everything else — ``/``,
+    the tenant object ID, a principal/object ID such as the service principal
+    the role was assigned to — is tenant-wide. Treating those as scoped would
+    downgrade legitimate tenant-wide roles to Info.
+    """
+    aus = (graph or {}).get("administrative_unit") or {}
+    out = []
+    for scope in normalize_role_scopes(scopes):
+        norm = str(scope).strip()
+        if norm.rstrip("/") == "":
+            continue
+        match = re.search(r"/administrativeUnits/([^/]+)", norm, re.IGNORECASE)
+        if match:
+            out.append(match.group(1))
+            continue
+        candidate = norm.rstrip("/").rsplit("/", 1)[-1]
+        if candidate in aus:
+            out.append(candidate)
+    return out
+
+
+def role_scopes_tenant_wide(graph, scopes):
+    return not role_scope_ids(graph, scopes)
+
+
+def role_scope_label(graph, scopes):
+    aus = (graph or {}).get("administrative_unit") or {}
+    labels = []
+    for au_id in role_scope_ids(graph, scopes):
+        rec = aus.get(au_id) or {}
+        labels.append(f"AU: {rec.get('displayName') or au_id}")
+    return ", ".join(dict.fromkeys(labels)) or "Tenant-wide"
+
+
+def make_directory_role_entry(graph, name, severity, scopes=None, source=None,
+                              path=None, path_ids=None, disabled=False,
+                              eligible=False):
+    """Build one role entry carrying display severity plus rating metadata."""
+    normalized = normalize_role_scopes(scopes)
+    entry = {"name": name, "severity": severity}
+    if source:
+        entry["source"] = source
+    entry["path"] = list(path) if path is not None else None
+    if path_ids is not None:
+        entry["path_ids"] = list(path_ids)
+    if eligible:
+        entry["eligible"] = True
+    entry["scope"] = role_scope_label(graph, normalized)
+    entry["scope_ids"] = normalized
+    entry["scope_limited"] = not role_scopes_tenant_wide(graph, normalized)
+    if disabled:
+        entry["disabled"] = True
+    return entry
+
+
+def role_rating_severity(role):
+    """Severity used for ratings. AU-scoped and disabled roles never rate."""
+    if not role or role.get("disabled") or role.get("scope_limited"):
+        return "Info"
+    return role.get("severity", "Info")
+
+
+def role_display_name(role):
+    """Display label with the non-tenant-wide scope / disabled marker."""
+    name = role.get("name") or ""
+    if role.get("disabled"):
+        name += " (disabled role)"
+    elif role.get("scope_limited") and role.get("scope"):
+        name += f" [{role['scope']}]"
+    return name
+
+
+def merge_role_entry(existing, incoming):
+    """Merge a duplicate role entry, keeping the widest/enabled variant."""
+    if incoming.get("source"):
+        srcs = [s.strip() for s in (existing.get("source") or "").split("\u00b7")]
+        for src in incoming["source"].split("\u00b7"):
+            src = src.strip()
+            if src and src not in srcs:
+                srcs.append(src)
+        existing["source"] = " \u00b7 ".join(s for s in srcs if s)
+    if existing.get("scope_limited") and not incoming.get("scope_limited"):
+        for key in ("scope", "scope_ids", "scope_limited"):
+            if key in incoming:
+                existing[key] = incoming[key]
+            else:
+                existing.pop(key, None)
+    if existing.get("disabled") and not incoming.get("disabled"):
+        existing.pop("disabled", None)
+    if "path" not in existing and incoming.get("path"):
+        existing["path"] = incoming["path"]
+        existing["path_ids"] = incoming.get("path_ids") or []
+    if severity_rank(incoming.get("severity", "Info")) < severity_rank(existing.get("severity", "Info")):
+        existing["severity"] = incoming["severity"]
+    return existing
+
+
+def _role_def_disabled(role_definition):
+    return role_definition.get("isEnabled") in (0, False)
+
+
+def _directory_role_disabled(role_record):
+    return role_record.get("roleDisabled") in (1, True)
+
+
+# ---------------------------------------------------------------------------
 # Advanced filter query language (shared semantics with the report JS — the
-# JS side implements the same grammar in the filter module; both are pinned
-# against the same test vectors in tests/filter_cases.json).
+# JS side implements the same grammar in the filter module; keep both in sync
+# when extending the grammar or alias tables).
 #
 #   expr      := and ("OR" and)*
 #   and       := term ("AND" term)*
@@ -272,8 +461,9 @@ def eligible_severity(severity):
 # ---------------------------------------------------------------------------
 
 ADV_LIST_FIELDS = {
-    "roles", "eligible", "grpRoles", "dynmods", "dynattrs",
+    "roles", "eligible", "grproles", "grptype", "dynmods", "dynattrs",
     "azroles", "azusrroles", "azsproles", "adtags", "appdirroles",
+    "polapps", "polcontrols", "arcazroles", "capolicies", "caroles",
     # serve-side owned-table rows merge all owners into one map
     "owner", "ownerupn", "ownerstatus",
 }
@@ -291,13 +481,15 @@ ADV_COLUMN_ALIASES = {
     "roles": ["roles", "grproles", "appdirroles"],
     "grproles": ["grproles"], "appdirroles": ["appdirroles"],
     "eligible": ["eligible"],
-    "user": ["user"], "upn": ["userupn"], "userupn": ["userupn"],
+    "user": ["user"], "upn": ["userupn", "upn"], "userupn": ["userupn"],
     "privapps": ["privapps"], "capablegrp": ["capgroups"], "capgroups": ["capgroups"],
     "groupsowned": ["grpowned"], "grpowned": ["grpowned"], "caexcl": ["caexcl"],
     "accountsource": ["hybrid"], "hybrid": ["hybrid"],
     "status": ["userstatus", "status", "spstatus", "ownerstatus", "adstatus"],
     "userstatus": ["userstatus"], "spstatus": ["spstatus"],
     "ownerstatus": ["ownerstatus"], "adstatus": ["adstatus"],
+    "ownersource": ["ownersource"], "owneraddn": ["owneraddn"],
+    "ownersid": ["ownersid"], "ownerimmutableid": ["ownerimmutableid"],
     "target": ["target"], "targettype": ["targettype"],
     "objectid": ["id"], "id": ["id"],
     "passwords": ["pw"], "pw": ["pw"], "keys": ["keys"],
@@ -313,6 +505,8 @@ ADV_COLUMN_ALIASES = {
     "controls": ["polcontrols"], "polcontrols": ["polcontrols"],
     "included": ["polinc"], "polinc": ["polinc"],
     "excluded": ["polexc"], "polexc": ["polexc"],
+    "capolicies": ["capolicies"], "excludedpolicies": ["capolicies"],
+    "caroles": ["caroles"], "privilegedroles": ["caroles"],
     "application": ["app"], "app": ["app"],
     "owner": ["owner"], "ownerupn": ["ownerupn"],
     "resource": ["resource"], "permission": ["permission"],
@@ -334,6 +528,10 @@ ADV_COLUMN_ALIASES = {
     "arcprincipal": ["arcprincipal"], "arcprincipaltype": ["arcprincipaltype"],
     "arctag": ["arctag"], "arcazroles": ["arcazroles"], "arcprovider": ["arcprovider"],
     "pwlastset": ["pwlastset"],
+    "appid": ["appid"], "spty": ["spty"], "servicetype": ["spty"],
+    "poltype": ["poltype"], "polcreated": ["polcreated"], "created": ["polcreated"],
+    "polmodified": ["polmodified"], "lastmodified": ["polmodified"],
+    "immutableid": ["immutableid"],
 }
 
 # Multi-word display columns, rewritten to their canonical shortname only when
@@ -346,11 +544,20 @@ ADV_DISPLAY_PHRASES = [
     ("Target Status", "status"), ("Object ID", "objectid"),
     ("Role assignment", "roleassignment"), ("SP Status", "spstatus"),
     ("Owner UPN", "ownerupn"), ("Owner Status", "ownerstatus"),
+    ("Owner Source", "ownersource"), ("Owner AD DN", "owneraddn"),
+    ("Owner SID", "ownersid"), ("Owner Immutable ID", "ownerimmutableid"),
     ("Membership rule", "membershiprule"),
     ("Referenced attributes", "referencedattributes"),
+    ("Modifiable by", "modifiableby"),
     ("attribute modifiable by", "modifiableby"),
+    ("Modifiable by", "modifiableby"),
     ("AD CN", "adcn"), ("AD DN", "addn"),
     ("On-prem pw change", "onprempwchange"), ("Targeting tags", "targetingtags"),
+    ("App ID", "appid"), ("SP type", "spty"), ("Policy type", "poltype"),
+    ("Created", "polcreated"), ("Last modified", "polmodified"),
+    ("Immutable ID", "immutableid"),
+    ("Excluded policies", "capolicies"),
+    ("Privileged roles", "caroles"),
 ]
 ADV_PHRASE_RES = [
     (re.compile(r"\b" + re.escape(phrase) + r"(?=\s*:)", re.IGNORECASE), canonical)
@@ -515,6 +722,16 @@ def parse_advanced_query(text):
         field, _, rest = word.partition(":")
         if not field:
             return {"op": "text", "value": word}
+        if field.upper() == "CONTAINS":
+            # Bare `contains:` / `contains: value` is a text predicate, not an
+            # equality predicate with a missing field list (B-033).
+            if not rest:
+                vt = peek()
+                if vt is None or vt[0] not in ("word", "quoted"):
+                    raise AdvancedParseError("expected value after 'contains:'")
+                advance()
+                return {"op": "text", "value": consume_value_words(vt[1])}
+            return {"op": "text", "value": consume_value_words(rest)}
         if not rest:
             vt = peek()
             if vt is None or vt[0] not in ("word", "quoted"):
@@ -532,8 +749,6 @@ def parse_advanced_query(text):
         if rest.upper().startswith("CONTAINS:"):
             value = consume_value_words(rest[len("contains:"):])
             return {"op": "contains", "fields": resolve_field(field), "value": value}
-        if field.upper() == "CONTAINS":
-            return {"op": "text", "value": rest}
         if field.upper() == "UNIQ":
             names = [n.strip() for n in rest.split(",") if n.strip()]
             if not names:
@@ -589,15 +804,19 @@ def evaluate_advanced(ast, fields, full_text=""):
     if op in ("eq", "contains"):
         needle = ast["value"].lower()
         has_glob = "*" in needle
-        for field in ast["fields"]:
-            value = (fields_l.get(field) or "").lower()
+        fields = ast.get("fields") or ()
+        if not fields:
+            return False
+        for field in fields:
+            field_l = str(field).lower()
+            value = (fields_l.get(field_l) or "").lower()
             if op == "contains":
                 if has_glob:
                     if _glob_matches(needle, value, search=True):
                         return True
                 elif needle in value:
                     return True
-            elif field in ADV_LIST_FIELDS:
+            elif field_l in ADV_LIST_FIELDS:
                 if has_glob:
                     for item in value.split(","):
                         if _glob_matches(needle, item.strip().lower()):
@@ -670,11 +889,212 @@ GROUP_GRAPH_FIELDS = [
 ]
 DEVICE_GRAPH_FIELDS = [
     "objectId", "displayName", "hostnames", "deviceOSType", "dirSyncEnabled",
-    "onPremisesSecurityIdentifier", "accountEnabled",
+    "onPremisesSecurityIdentifier", "accountEnabled", "approximateLastLogonTimestamp",
 ]
 POLICY_GRAPH_FIELDS = [
     "objectId", "displayName", "policyType", "policyIdentifier", "policyDetail",
 ]
+
+
+def group_parents_index(group_member_group):
+    """{child_group: {direct_parent_group, ...}} from direct containment."""
+    parents = defaultdict(set)
+    for parent, children in (group_member_group or {}).items():
+        for child in children or ():
+            if parent and child:
+                parents[child].add(parent)
+    return parents
+
+
+def compute_effective_group_membership(graph):
+    """Effective group membership derived from the direct containment edges.
+
+    The collector stores direct ``lnk_group_member_*`` links. This builds the
+    transitive closure once per analysis run and returns effective member sets
+    per group plus reverse group sets per principal. Group hierarchy consumers
+    (parents/children, role paths) must keep using the direct edges.
+    """
+    direct_users = graph.get("group_member_user") or {}
+    direct_groups = graph.get("group_member_group") or {}
+    direct_sps = graph.get("group_member_sp") or {}
+    direct_devices = graph.get("group_member_device") or {}
+    group_ids = set(graph.get("group") or {})
+    for mapping in (direct_users, direct_groups, direct_sps, direct_devices):
+        group_ids.update(mapping)
+    for children in direct_groups.values():
+        group_ids.update(children or ())
+
+    memo = {}
+
+    def resolve(root):
+        if root in memo:
+            return memo[root]
+        stack = [(root, False)]
+        visiting = set()
+        while stack:
+            gid, processed = stack.pop()
+            if gid in memo:
+                continue
+            if not processed:
+                if gid in visiting:
+                    continue  # containment cycle: ignore the back-edge
+                visiting.add(gid)
+                stack.append((gid, True))
+                for child in direct_groups.get(gid, ()):
+                    if child not in memo:
+                        stack.append((child, False))
+                continue
+            users = set(direct_users.get(gid, ()))
+            groups = set()
+            sps = set(direct_sps.get(gid, ()))
+            devices = set(direct_devices.get(gid, ()))
+            for child in direct_groups.get(gid, ()):
+                child_members = memo.get(child)
+                if child_members is None:
+                    continue  # containment cycle: ignore the back-edge
+                users |= child_members[0]
+                groups.add(child)
+                groups |= child_members[1]
+                sps |= child_members[2]
+                devices |= child_members[3]
+            memo[gid] = (users, groups, sps, devices)
+            visiting.discard(gid)
+        return memo.get(root, (set(), set(), set(), set()))
+
+    for gid in group_ids:
+        resolve(gid)
+
+    users_by_user = defaultdict(set)
+    groups_by_group = {}
+    sps_by_group = {}
+    devices_by_group = {}
+    for gid, (users, groups, sps, devices) in memo.items():
+        groups_by_group[gid] = groups
+        sps_by_group[gid] = sps
+        devices_by_group[gid] = devices
+        for uid in users:
+            users_by_user[uid].add(gid)
+    groups_by_sp = defaultdict(set)
+    for gid, sps in sps_by_group.items():
+        for sid in sps:
+            groups_by_sp[sid].add(gid)
+    groups_by_device = defaultdict(set)
+    for gid, devices in devices_by_group.items():
+        for did in devices:
+            groups_by_device[did].add(gid)
+    return {
+        "users_by_group": {gid: users for gid, (users, _, _, _) in memo.items()},
+        "groups_by_group": groups_by_group,
+        "sps_by_group": sps_by_group,
+        "devices_by_group": devices_by_group,
+        "groups_by_user": dict(users_by_user),
+        "groups_by_sp": dict(groups_by_sp),
+        "groups_by_device": dict(groups_by_device),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Ownership helpers (human owners + service-principal owners)
+# ---------------------------------------------------------------------------
+
+def sp_owner_chain(graph, sp_ids):
+    """Return (owner_sp_ids, owner_user_ids) reachable through SP owners."""
+    owner_sps = set()
+    owner_users = set()
+    stack = [sid for sid in sp_ids if sid]
+    while stack:
+        sid = stack.pop()
+        if sid in owner_sps:
+            continue
+        owner_sps.add(sid)
+        owner_users |= set((graph.get("sp_owners") or {}).get(sid, ()))
+        stack.extend(set((graph.get("sp_owner_sp") or {}).get(sid, ())) - owner_sps)
+    return owner_sps, owner_users
+
+
+def app_owner_chain(graph, app_oid):
+    """Return (owner_sp_ids, owner_user_ids) for an application."""
+    owner_users = set((graph.get("app_owners") or {}).get(app_oid, ()))
+    owner_sps, sp_users = sp_owner_chain(
+        graph, (graph.get("app_owner_sp") or {}).get(app_oid, ()))
+    return owner_sps, owner_users | sp_users
+
+
+def sp_owner_details(graph, sp_oid):
+    """(owner_sp_ids without the SP itself, owner_user_ids) for an SP."""
+    owner_sps, owner_users = sp_owner_chain(graph, [sp_oid])
+    owner_sps.discard(sp_oid)
+    return owner_sps, owner_users
+
+
+def group_owner_chain(graph, gid):
+    """Return (owner_sp_ids, owner_user_ids) for a group."""
+    owner_users = set((graph.get("group_owner_user") or {}).get(gid, ()))
+    owner_sps, sp_users = sp_owner_chain(
+        graph, (graph.get("group_owner_sp") or {}).get(gid, ()))
+    return owner_sps, owner_users | sp_users
+
+
+def is_foreign_sp(graph, rec):
+    """True only when the SP belongs to a different tenant."""
+    owner_tid = rec.get("appOwnerTenantId")
+    if not owner_tid:
+        return False
+    if graph.get("app_by_appid", {}).get(rec.get("appId")):
+        return False
+    tenant_id = (graph.get("tenant") or {}).get("object_id")
+    if not tenant_id:
+        return True
+    return str(owner_tid).lower() != str(tenant_id).lower()
+
+
+def role_assignments_for_sp(ctx, sp_oid):
+    """App-role assignments for one SP, using the precomputed index when present."""
+    index = (ctx.get("analysis_indexes") or {}).get("role_assigns_by_sp")
+    if index is not None:
+        return index.get(sp_oid, ())
+    return [ra for ra in ctx["graph"]["role_assigns"]
+            if ra.get("principal_type") == "ServicePrincipal"
+            and ra.get("principal_id") == sp_oid]
+
+
+def role_assignment_count_for_sp(ctx, sp_oid):
+    index = (ctx.get("analysis_indexes") or {}).get("role_assign_count_by_sp")
+    if index is not None:
+        return index.get(sp_oid, 0)
+    return len(role_assignments_for_sp(ctx, sp_oid))
+
+
+def build_analysis_indexes(graph):
+    """Precomputed lookups shared by the checks (avoids per-SP full scans)."""
+    indexes = {
+        "assignments_by_principal": defaultdict(list),
+        "role_members_by_sp": defaultdict(list),
+        "role_members_by_user": defaultdict(list),
+        "groups_by_sp": defaultdict(set),
+        "role_assigns_by_sp": defaultdict(list),
+        "role_assign_count_by_sp": defaultdict(int),
+        "parents_by_child": graph.get("group_parents") or group_parents_index(
+            graph.get("group_member_group")),
+    }
+    for ra in graph.get("directory_role_assigns") or []:
+        if ra.get("principal_id"):
+            indexes["assignments_by_principal"][ra["principal_id"]].append(ra)
+    for role_oid, sp_oid in graph.get("role_member_sp") or []:
+        indexes["role_members_by_sp"][sp_oid].append(role_oid)
+    for role_oid, uid in graph.get("role_member_user") or []:
+        indexes["role_members_by_user"][uid].append(role_oid)
+    for gid, sps in (graph.get("group_member_sp") or {}).items():
+        for sid in sps:
+            indexes["groups_by_sp"][sid].add(gid)
+    for ra in graph.get("role_assigns") or []:
+        if ra.get("principal_type") == "ServicePrincipal" and ra.get("principal_id"):
+            indexes["role_assigns_by_sp"][ra["principal_id"]].append(ra)
+            indexes["role_assign_count_by_sp"][ra["principal_id"]] += 1
+    indexes["effective_membership"] = compute_effective_group_membership(graph)
+    for key in ("groups_by_user", "groups_by_sp", "groups_by_device"):
+        indexes[key] = indexes["effective_membership"][key]
+    return indexes
 
 
 def build_graph(cur):
@@ -740,7 +1160,10 @@ def build_graph(cur):
             cols = [c for c in wanted if c in available]
             if id_column not in cols:
                 cols = [id_column] + cols
-            cur.execute(f"SELECT {', '.join(cols)} FROM {table}")
+            # Quote identifiers: some collected columns (e.g. DirectorySettings
+            # "values") are SQL keywords.
+            col_sql = ", ".join(f'"{c}"' for c in cols)
+            cur.execute(f"SELECT {col_sql} FROM {table}")
             for row in cur.fetchall():
                 rec = {col: val for col, val in zip(cols, row)}
                 out[row[cols.index(id_column)]] = rec
@@ -774,8 +1197,19 @@ def build_graph(cur):
 
     graph["app_owners"] = load_owner_links("lnk_application_owner_user", "Application", "User")
     graph["sp_owners"] = load_owner_links("lnk_serviceprincipal_owner_user", "ServicePrincipal", "User")
+    # Service principals can own applications, other service principals, and
+    # groups. Keep those links so non-human ownership is visible and the human
+    # owners of the owning SP inherit the takeover path (B-034).
+    graph["app_owner_sp"] = load_owner_links(
+        "lnk_application_owner_serviceprincipal", "Application", "ServicePrincipal")
+    graph["sp_owner_sp"] = load_owner_links(
+        "lnk_serviceprincipal_owner_serviceprincipal", "ServicePrincipal", "childServicePrincipal")
+    graph["group_owner_sp"] = load_owner_links(
+        "lnk_group_owner_serviceprincipal", "Group", "ServicePrincipal")
 
     graph["group"] = load_table("Groups", "objectId", GROUP_GRAPH_FIELDS)
+    graph["administrative_unit"] = load_table(
+        "AdministrativeUnits", "objectId", ["objectId", "displayName"])
     graph["device"] = load_table("Devices", "objectId", DEVICE_GRAPH_FIELDS)
     graph["policy"] = load_table("Policys", "objectId", POLICY_GRAPH_FIELDS)
 
@@ -818,7 +1252,10 @@ def build_graph(cur):
     graph["group_member_group"] = load_owner_links("lnk_group_member_group", "Group", "childGroup")
     graph["group_owner_user"] = load_owner_links("lnk_group_owner_user", "Group", "User")
     graph["group_member_sp"] = load_owner_links("lnk_group_member_serviceprincipal", "Group", "ServicePrincipal")
+    graph["group_member_device"] = load_owner_links("lnk_group_member_device", "Group", "Device")
     graph["device_owners"] = load_owner_links("lnk_device_owner", "Device", "User")
+    # Cheap reverse index reused by every role-path walk.
+    graph["group_parents"] = group_parents_index(graph["group_member_group"])
 
     graph["policy_user_exclude"] = load_member_links("lnk_policy_user_exclude", "Policy", "User")
     graph["policy_user_include"] = load_member_links("lnk_policy_user_include", "Policy", "User")
@@ -1098,19 +1535,29 @@ def build_graph(cur):
 
     graph["pim_role_assignments"] = []
     try:
-        cur.execute("SELECT id, resourceId, roleDefinitionId, subjectId, "
-                    "linkedEligibleRoleAssignmentId, isPermanent, startDateTime, "
-                    "endDateTime, memberType, assignmentState, status "
-                    "FROM PIMgovernanceRoleAssignments")
+        try:
+            cur.execute("SELECT id, resourceId, roleDefinitionId, subjectId, "
+                        "linkedEligibleRoleAssignmentId, isPermanent, startDateTime, "
+                        "endDateTime, memberType, assignmentState, status, scopedResourceId "
+                        "FROM PIMgovernanceRoleAssignments")
+            columns = ("id", "resource_id", "role_definition_id", "subject_id",
+                       "linked_eligible_id", "is_permanent", "start", "end",
+                       "member_type", "assignment_state", "status", "scoped_resource_id")
+        except sqlite3.OperationalError:
+            cur.execute("SELECT id, resourceId, roleDefinitionId, subjectId, "
+                        "linkedEligibleRoleAssignmentId, isPermanent, startDateTime, "
+                        "endDateTime, memberType, assignmentState, status "
+                        "FROM PIMgovernanceRoleAssignments")
+            columns = ("id", "resource_id", "role_definition_id", "subject_id",
+                       "linked_eligible_id", "is_permanent", "start", "end",
+                       "member_type", "assignment_state", "status")
         for row in cur.fetchall():
             if not row[0]:
                 continue
-            graph["pim_role_assignments"].append({
-                "id": row[0], "resource_id": row[1], "role_definition_id": row[2],
-                "subject_id": row[3], "linked_eligible_id": row[4],
-                "is_permanent": bool(row[5]), "start": row[6], "end": row[7],
-                "member_type": row[8], "assignment_state": row[9], "status": row[10],
-            })
+            rec = dict(zip(columns, row))
+            rec["is_permanent"] = bool(rec.get("is_permanent"))
+            rec.setdefault("scoped_resource_id", None)
+            graph["pim_role_assignments"].append(rec)
     except sqlite3.OperationalError:
         pass
 
@@ -1161,13 +1608,55 @@ def build_graph(cur):
 # Config
 # ---------------------------------------------------------------------------
 
+class ConfigError(ValueError):
+    """A configuration file is missing, malformed, or has an invalid shape."""
+
+
+def _load_json_config(path, label):
+    path = Path(path)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except OSError as exc:
+        raise ConfigError(f"cannot read {label} config {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ConfigError(
+            f"invalid JSON in {label} config {path} "
+            f"(line {exc.lineno}, column {exc.colno}): {exc.msg}") from exc
+    except UnicodeError as exc:
+        raise ConfigError(
+            f"invalid text encoding in {label} config {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError(f"{label} config {path} must contain a JSON object")
+    return data
+
+
 def load_config(config_path):
-    with open(config_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    data = _load_json_config(config_path, "privileged roles")
     resources = {}
-    for resource_app_id, entry in data.get("resources", {}).items():
+    raw_resources = data.get("resources")
+    if raw_resources is None:
+        raw_resources = {}
+    if not isinstance(raw_resources, dict):
+        raise ConfigError(
+            f"privileged roles config {config_path}: 'resources' must be an object")
+    for resource_app_id, entry in raw_resources.items():
+        if not isinstance(entry, dict):
+            raise ConfigError(
+                f"privileged roles config {config_path}: "
+                f"resources[{resource_app_id!r}] must be an object")
         roles = {}
-        for role in entry.get("roles", []):
+        raw_roles = entry.get("roles") or []
+        if not isinstance(raw_roles, list):
+            raise ConfigError(
+                f"privileged roles config {config_path}: "
+                f"resources[{resource_app_id!r}].roles must be a list")
+        for index, role in enumerate(raw_roles):
+            if not isinstance(role, dict) or not isinstance(role.get("value"), str):
+                raise ConfigError(
+                    f"privileged roles config {config_path}: "
+                    f"resources[{resource_app_id!r}].roles[{index}] is missing "
+                    f"a string 'value'")
             roles[role["value"]] = {
                 "severity": role.get("severity", "High"),
                 "reason": role.get("reason", ""),
@@ -1175,15 +1664,28 @@ def load_config(config_path):
         resources[resource_app_id] = {"name": entry.get("name", resource_app_id), "roles": roles}
 
     check_cfg = dict(DEFAULT_CHECK_CFG)
-    cfg = data.get("checks") or {}
+    cfg = data.get("checks")
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        raise ConfigError(
+            f"privileged roles config {config_path}: 'checks' must be an object")
     for key in ("enabled", "suppress"):
         if isinstance(cfg.get(key), dict if key == "enabled" else list):
             check_cfg[key] = cfg[key]
     if isinstance(cfg.get("min_severity"), str) and cfg["min_severity"] in SEVERITY_ORDER:
         check_cfg["min_severity"] = cfg["min_severity"]
+    if isinstance(cfg.get("include_disabled"), bool):
+        check_cfg["include_disabled"] = cfg["include_disabled"]
 
     directory_roles = {}
-    for name, sev in (data.get("directory_roles") or {}).items():
+    raw_directory_roles = data.get("directory_roles")
+    if raw_directory_roles is None:
+        raw_directory_roles = {}
+    if not isinstance(raw_directory_roles, dict):
+        raise ConfigError(
+            f"privileged roles config {config_path}: 'directory_roles' must be an object")
+    for name, sev in raw_directory_roles.items():
         if isinstance(name, str) and name.startswith("_"):
             continue  # comment keys
         if isinstance(sev, str) and sev in SEVERITY_ORDER:
@@ -1193,13 +1695,26 @@ def load_config(config_path):
     check_cfg["directory_roles"] = directory_roles
 
     role_labels = {}
-    for value, label in (data.get("role_labels") or {}).items():
+    raw_labels = data.get("role_labels")
+    if raw_labels is None:
+        raw_labels = {}
+    if not isinstance(raw_labels, dict):
+        raise ConfigError(
+            f"privileged roles config {config_path}: 'role_labels' must be an object")
+    for value, label in raw_labels.items():
         if isinstance(value, str) and isinstance(label, str) and not value.startswith("_"):
             role_labels[value] = label
     check_cfg["role_labels"] = role_labels
 
     directory_role_descriptions = {}
-    for name, desc in (data.get("directory_role_descriptions") or {}).items():
+    raw_descriptions = data.get("directory_role_descriptions")
+    if raw_descriptions is None:
+        raw_descriptions = {}
+    if not isinstance(raw_descriptions, dict):
+        raise ConfigError(
+            f"privileged roles config {config_path}: "
+            "'directory_role_descriptions' must be an object")
+    for name, desc in raw_descriptions.items():
         if isinstance(name, str) and isinstance(desc, str) and not name.startswith("_"):
             directory_role_descriptions[name] = desc
     check_cfg["directory_role_descriptions"] = directory_role_descriptions
@@ -1221,9 +1736,8 @@ def load_azure_roles(config_path):
         print(f"warning: azure roles config not found: {config_path} "
               "(all Azure roles will render as Info)", file=sys.stderr)
         return azure_roles
-    with open(config_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    for key, sev in (data or {}).items():
+    data = _load_json_config(config_path, "Azure roles")
+    for key, sev in data.items():
         if not isinstance(key, str) or key.startswith("_") or not isinstance(sev, str):
             continue
         if sev not in SEVERITY_ORDER:
@@ -1245,6 +1759,33 @@ def azure_severity_for(mapping, role, scope_type):
         if scoped:
             return scoped
     return mapping.get(role, "Info")
+
+
+AUDIT_REQUIRED_TABLES = ("TenantDetails", "Users", "ServicePrincipals")
+
+
+def open_audit_database(db_path):
+    """Open a collected database read-only and reject non-SQLite or non-
+    ROADrecon files with a clear ValueError instead of a late empty report."""
+    path = Path(db_path)
+    try:
+        conn = sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise ValueError(f"cannot open database {path}: {exc}") from exc
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        tables = {row[0] for row in cur.fetchall()}
+    except sqlite3.DatabaseError as exc:
+        conn.close()
+        raise ValueError(f"not a valid SQLite database: {path} ({exc})") from exc
+    missing = [name for name in AUDIT_REQUIRED_TABLES if name not in tables]
+    if missing:
+        conn.close()
+        raise ValueError(
+            f"not a ROADrecon database: {path} is missing required table(s): "
+            + ", ".join(missing))
+    return conn
 
 
 def apply_azure_severity(graph, mapping):
@@ -1274,6 +1815,20 @@ def build_resource_role_index(graph, config_resources):
             info = cfg["roles"].get(value)
             if info:
                 role_map[role["id"]] = {
+                    "value": value,
+                    "severity": info["severity"],
+                    "reason": info["reason"],
+                }
+        # The SP appRoles column is frequently sparse; ApplicationRefs carries
+        # the same catalog by appId. Merge it by role ID so grants resolve even
+        # when the service principal row lacks its app-role list (B-011).
+        for role_id, entry in (graph.get("appref_roles") or {}).get(rec.get("appId"), {}).items():
+            if role_id in role_map:
+                continue
+            value = entry.get("value") or role_id
+            info = cfg["roles"].get(value)
+            if info:
+                role_map[role_id] = {
                     "value": value,
                     "severity": info["severity"],
                     "reason": info["reason"],
@@ -1356,22 +1911,29 @@ def check_priv_app_ownership(ctx):
                      resource_label, reason, evidence):
         app_entries = graph["app_by_appid"].get(sp.get("appId"), [])
         owner_ids = set()
+        owner_sp_ids = set()
         display_name = sp_display_name(sp)
         app_object_id = None
         if app_entries:
             app_object_id = app_entries[0]
             display_name = graph["app"][app_object_id].get("displayName") or display_name
-            owner_ids |= graph["app_owners"].get(app_object_id, set())
-        owner_ids |= graph["sp_owners"].get(principal_id, set())
+            app_owner_sps, app_owner_users = app_owner_chain(graph, app_object_id)
+            owner_sp_ids |= app_owner_sps
+            owner_ids |= app_owner_users
+        sp_owner_sps, sp_owner_users = sp_owner_details(graph, principal_id)
+        owner_sp_ids |= sp_owner_sps
+        owner_ids |= sp_owner_users
 
         owners = [graph["user"][u] for u in owner_ids if u in graph["user"]]
+        owner_sps = [graph["sp"][s] for s in owner_sp_ids if s in graph["sp"]]
+        has_owner = bool(owners or owner_sps)
 
         findings.append(make_finding(
             check_id="priv_app_ownership", category="apps",
             severity=severity,
-            title=f"{title_prefix} with owner" if owners else f"{title_prefix} with no owner",
+            title=f"{title_prefix} with owner" if has_owner else f"{title_prefix} with no owner",
             evidence=evidence,
-            remediation=("Assign an accountable owner or remove the privileged grant." if not owners
+            remediation=("Assign an accountable owner or remove the privileged grant." if not has_owner
                          else "Verify the privilege is still required by the nominated owner."),
             primary_id=principal_id,
             object_ids={
@@ -1399,7 +1961,7 @@ def check_priv_app_ownership(ctx):
                 kc += len(json_list(app_rec.get("keyCredentials")))
         finding["pw"] = pw
         finding["keys"] = kc
-        finding["is_foreign"] = app_object_id is None and bool(sp.get("appOwnerTenantId"))
+        finding["is_foreign"] = is_foreign_sp(graph, sp)
         finding["resource_name"] = resource_label
         finding["permission"] = permission
         finding["reason"] = reason
@@ -1412,7 +1974,19 @@ def check_priv_app_ownership(ctx):
                 "enabled": bool(o.get("accountEnabled")),
             }
             for o in owners
+        ] + [
+            {
+                "object_id": s.get("objectId"),
+                "display_name": sp_display_name(s),
+                "upn": "",
+                "user_type": "ServicePrincipal",
+                "enabled": bool(s.get("accountEnabled")),
+            }
+            for s in owner_sps
         ]
+        finding["owner_sps"] = sorted(
+            ({"object_id": s.get("objectId"), "display_name": sp_display_name(s)}
+             for s in owner_sps), key=lambda x: (x["display_name"] or "").lower())
 
     for principal_id, resource_id, role_info in matches:
         sp = graph["sp"].get(principal_id)
@@ -1434,14 +2008,14 @@ def check_priv_app_ownership(ctx):
     for principal_id in sorted(graph["sp"]):
         sp = graph["sp"][principal_id]
         roles = [r for r in resolve_sp(principal_id)
-                 if not r.get("eligible") and is_privileged(r["severity"])]
+                 if not r.get("eligible") and is_privileged(role_rating_severity(r))]
         if not roles:
             continue
         if not include_disabled and (not sp.get("accountEnabled") or sp.get("deletionTimestamp")):
             continue
-        severity = min((r["severity"] for r in roles), key=severity_rank)
-        details = [r["name"] + ("" if r["path"] is None
-                                else f" (via {' \u2192 '.join(r['path'])})")
+        severity = min((role_rating_severity(r) for r in roles), key=severity_rank)
+        details = [role_display_name(r) + ("" if r["path"] is None
+                                           else f" (via {' \u2192 '.join(r['path'])})")
                    for r in roles]
         emit_finding(sp, principal_id, severity,
                      "Privileged directory role",
@@ -1512,8 +2086,7 @@ def check_sp_credentials(ctx):
             continue
         app_oids = graph["app_by_appid"].get(rec.get("appId"), [])
         app_oid = app_oids[0] if app_oids else None
-        role_count = len([ra for ra in graph["role_assigns"]
-                          if ra["principal_type"] == "ServicePrincipal" and ra["principal_id"] == oid])
+        role_count = role_assignment_count_for_sp(ctx, oid)
         emit(sp_display_name(rec) if not app_oid else graph["app"][app_oid].get("displayName"),
              "Service Principal", oid, [oid], app_oid, pw, kc, role_count)
         flagged_sp.add(oid)
@@ -1526,9 +2099,7 @@ def check_sp_credentials(ctx):
         sp_oids = graph["sp_by_appid"].get(rec.get("appId"), [])
         if sp_oids and all(o in flagged_sp for o in sp_oids):
             continue  # already reported via the service principal
-        role_count = sum(len([ra for ra in graph["role_assigns"]
-                              if ra["principal_type"] == "ServicePrincipal" and ra["principal_id"] == o])
-                         for o in sp_oids)
+        role_count = sum(role_assignment_count_for_sp(ctx, o) for o in sp_oids)
         emit(rec.get("displayName") or oid, "Application registration", oid,
              sp_oids, oid, pw, kc, role_count)
 
@@ -1558,8 +2129,7 @@ def check_no_role_approval(ctx):
         if not include_disabled and (not rec.get("accountEnabled") or rec.get("deletionTimestamp")):
             continue
         has_priv = oid in priv_ids
-        role_count = len([ra for ra in graph["role_assigns"]
-                          if ra["principal_type"] == "ServicePrincipal" and ra["principal_id"] == oid])
+        role_count = role_assignment_count_for_sp(ctx, oid)
         evidence = (
             "appRoleAssignmentRequired=false — the app does not enforce explicit role "
             "assignments; whether a default user gains access depends on the application's own "
@@ -1602,9 +2172,7 @@ def check_implicit_flow(ctx):
             continue
         sp_oids = graph["sp_by_appid"].get(rec.get("appId"), [])
         has_priv = any(o in priv_ids for o in sp_oids)
-        role_count = sum(len([ra for ra in graph["role_assigns"]
-                              if ra["principal_type"] == "ServicePrincipal" and ra["principal_id"] == o])
-                         for o in sp_oids)
+        role_count = sum(role_assignment_count_for_sp(ctx, o) for o in sp_oids)
         findings.append(make_finding(
             check_id="implicit_flow", category="apps",
             severity="High" if has_priv else "Medium",
@@ -1636,9 +2204,7 @@ def check_public_client_privileged(ctx):
         has_priv = any(o in priv_ids for o in sp_oids)
         if not has_priv:
             continue
-        role_count = sum(len([ra for ra in graph["role_assigns"]
-                              if ra["principal_type"] == "ServicePrincipal" and ra["principal_id"] == o])
-                         for o in sp_oids)
+        role_count = sum(role_assignment_count_for_sp(ctx, o) for o in sp_oids)
         findings.append(make_finding(
             check_id="public_client_privileged", category="apps",
             severity="High",
@@ -1663,29 +2229,21 @@ def check_foreign_principal(ctx):
     graph, include_disabled = ctx["graph"], ctx["include_disabled"]
     priv_ids = ctx["priv_sp_ids"]
     grant_sev = app_role_grant_severity(graph, ctx["resource_index"])
-    tenant_id = graph["tenant"].get("object_id")
     findings = []
     for oid, rec in graph["sp"].items():
         if oid not in priv_ids:
             continue
-        owner_tid = rec.get("appOwnerTenantId")
-        if not owner_tid:
-            continue
-        local_app = bool(graph["app_by_appid"].get(rec.get("appId")))
-        foreign = not local_app and (tenant_id is None or str(owner_tid).lower() != str(tenant_id).lower())
-        if not foreign:
+        if not is_foreign_sp(graph, rec):
             continue
         if not include_disabled and (not rec.get("accountEnabled") or rec.get("deletionTimestamp")):
             continue
+        owner_tid = rec.get("appOwnerTenantId") or ""
         reasons = []
-        for ra in graph["role_assigns"]:
-            if ra["principal_type"] != "ServicePrincipal" or ra["principal_id"] != oid:
-                continue
+        for ra in role_assignments_for_sp(ctx, oid):
             ra_info = ctx["resource_index"].get(ra["resource_id"], {}).get(ra["app_role_id"])
             if ra_info:
                 reasons.append(ra_info["reason"])
-        role_count = len([ra for ra in graph["role_assigns"]
-                          if ra["principal_type"] == "ServicePrincipal" and ra["principal_id"] == oid])
+        role_count = role_assignment_count_for_sp(ctx, oid)
         findings.append(make_finding(
             check_id="foreign_principal", category="apps",
             severity=grant_sev.get(oid, "High"),
@@ -1723,8 +2281,9 @@ def check_app_directory_roles(ctx):
         if not roles:
             continue
         active = [r for r in roles if not r.get("eligible")]
-        severity = min((r["severity"] for r in active), key=severity_rank) if active else "Info"
-        parts = [r["name"] + (" (PIM eligible)" if r.get("eligible") else "")
+        severity = min((role_rating_severity(r) for r in active),
+                       key=severity_rank) if active else "Info"
+        parts = [role_display_name(r) + (" (PIM eligible)" if r.get("eligible") else "")
                  + ("" if r["path"] is None
                     else f" (via {' \u2192 '.join(r['path'])})")
                  for r in roles]
@@ -1777,7 +2336,7 @@ def check_app_inventory(ctx):
         if severity_rank(role_info["severity"]) < severity_rank(current):
             grant_sev[ra["principal_id"]] = role_info["severity"]
 
-    def owner_dicts(owner_ids):
+    def owner_dicts(owner_ids, owner_sp_ids=()):
         out = []
         for uid in sorted(owner_ids):
             rec = graph["user"].get(uid)
@@ -1794,15 +2353,32 @@ def check_app_inventory(ctx):
                 "ad_sid": rec.get("onPremisesSecurityIdentifier") or "",
                 "immutable_id": rec.get("immutableId") or "",
             })
+        for sid in sorted(owner_sp_ids):
+            rec = graph["sp"].get(sid)
+            if not rec:
+                continue
+            out.append({
+                "object_id": sid,
+                "display_name": sp_display_name(rec),
+                "upn": "",
+                "enabled": bool(rec.get("accountEnabled")),
+                "source": "ServicePrincipal",
+                "ad_dn": "", "ad_sid": "", "immutable_id": "",
+            })
         return out
 
     def emit(name, object_type, oid, sp_oids, app_oids, app_id, sp_type,
              pw, kc, role_count, severity, status, extra=""):
         owner_ids = set()
+        owner_sp_ids = set()
         for sp_oid in sp_oids:
-            owner_ids |= set(graph["sp_owners"].get(sp_oid, set()))
+            sp_sps, sp_users = sp_owner_details(graph, sp_oid)
+            owner_sp_ids |= sp_sps
+            owner_ids |= sp_users
         for app_oid in app_oids:
-            owner_ids |= set(graph["app_owners"].get(app_oid, set()))
+            app_sps, app_users = app_owner_chain(graph, app_oid)
+            owner_sp_ids |= app_sps
+            owner_ids |= app_users
         evidence = (f"{object_type} · {pw} password + {kc} key credential(s) · "
                     f"{role_count} app-role assignment(s)")
         if extra:
@@ -1824,7 +2400,7 @@ def check_app_inventory(ctx):
         f["inventory_type"] = object_type
         f["inventory_app_id"] = app_id
         f["inventory_sp_type"] = sp_type
-        f["inventory_owners"] = owner_dicts(owner_ids)
+        f["inventory_owners"] = owner_dicts(owner_ids, owner_sp_ids)
         f["pw"] = pw
         f["keys"] = kc
         f["roles"] = role_count
@@ -1928,12 +2504,7 @@ def check_privileged_users(ctx):
 
     # ---- CA policy exclusions (per-user attribute with drill-down data) ----
     def _policy_state(prec):
-        detail = json_safe_value(prec.get("policyDetail"))
-        try:
-            inner = json.loads(detail[0]) if detail and isinstance(detail[0], str) else (detail[0] if detail else None)
-            return ((inner or {}).get("State") or "").strip() or "Unknown"
-        except (json.JSONDecodeError, ValueError, TypeError, IndexError):
-            return "Unknown"
+        return policy_state_from_record(prec)
 
     def _user_label(uid):
         u = graph["user"].get(uid)
@@ -1971,30 +2542,57 @@ def check_privileged_users(ctx):
             user_devices[uid].append(did)
 
     # ---- direct directory roles ------------------------------------------
-    for uid, roles in direct_directory_roles_by_user(graph, role_sev).items():
+    direct_user_roles = ctx.get("direct_user_roles")
+    if direct_user_roles is None:
+        direct_user_roles = direct_directory_roles_by_user(graph, role_sev)
+    for uid, roles in direct_user_roles.items():
+        if uid not in graph["user"]:
+            continue
         p = ensure(uid)
         p["roles"].extend(roles)
 
     # ---- directory roles on owned SPs (direct, legacy role membership, and
     # group-inherited incl. nesting) ----------------------------------------
+    analysis_indexes = ctx.get("analysis_indexes") or {}
+    assignments_by_principal = analysis_indexes.get("assignments_by_principal")
+    role_members_by_sp = analysis_indexes.get("role_members_by_sp")
+    groups_by_sp = analysis_indexes.get("groups_by_sp")
+    parents_by_child = analysis_indexes.get("parents_by_child") or graph.get(
+        "group_parents") or group_parents_index(graph["group_member_group"])
+
     def sp_dir_roles(sp_oid):
         """Active directory roles of an SP: direct assignments, classic role
         memberships, and roles inherited through group memberships (nested)."""
         merged = {}
 
-        def add(name):
-            if name not in merged:
-                merged[name] = name
+        def add(entry):
+            if entry["name"] not in merged:
+                merged[entry["name"]] = entry
+            else:
+                merge_role_entry(merged[entry["name"]], entry)
 
-        for ra in graph["directory_role_assigns"]:
-            if ra["principal_id"] == sp_oid:
-                add(def_name(ra["role_definition_id"]))
-        for role_oid, sid in graph["role_member_sp"]:
-            if sid == sp_oid:
-                rec = graph["directory_role"].get(role_oid) or {}
-                add(rec.get("displayName") or role_oid)
-        stack = [gid for gid, sps in graph["group_member_sp"].items()
-                 if sp_oid in sps]
+        assignments = assignments_by_principal.get(sp_oid, ()) \
+            if assignments_by_principal is not None else \
+            [ra for ra in graph["directory_role_assigns"] if ra["principal_id"] == sp_oid]
+        for ra in assignments:
+            name = def_name(ra["role_definition_id"])
+            role_rec = graph["role_definition"].get(ra["role_definition_id"]) or {}
+            add(make_directory_role_entry(
+                graph, name, sev_of(name), scopes=ra.get("resource_scopes"),
+                disabled=_role_def_disabled(role_rec)))
+        role_oids = role_members_by_sp.get(sp_oid, ()) \
+            if role_members_by_sp is not None else \
+            [r for r, sid in graph["role_member_sp"] if sid == sp_oid]
+        for role_oid in role_oids:
+            rec = graph["directory_role"].get(role_oid) or {}
+            name = rec.get("displayName") or role_oid
+            add(make_directory_role_entry(
+                graph, name, sev_of(name), scopes="/",
+                disabled=_directory_role_disabled(rec)))
+        direct_groups = groups_by_sp.get(sp_oid, set()) \
+            if groups_by_sp is not None else \
+            {gid for gid, sps in graph["group_member_sp"].items() if sp_oid in sps}
+        stack = list(direct_groups)
         seen = set()
         while stack:
             gid = stack.pop()
@@ -2002,24 +2600,27 @@ def check_privileged_users(ctx):
                 continue
             seen.add(gid)
             for r in group_roles.get(gid) or []:
-                add(r["name"])
-            for parent, kids in graph["group_member_group"].items():
-                if gid in kids:
-                    stack.append(parent)
+                add(dict(r))
+            stack.extend(parents_by_child.get(gid, ()))
         return list(merged.values())
 
     for sp_oid, sp in graph["sp"].items():
-        names = sp_dir_roles(sp_oid)
-        if not names:
+        roles = sp_dir_roles(sp_oid)
+        if not roles:
             continue
-        entries = [{"sp_name": sp_name(sp), "role": name, "severity": sev_of(name)}
-                   for name in names]
-        owners = set(graph["sp_owners"].get(sp_oid, set()))
+        entries = [{"sp_name": sp_name(sp), "role": role_display_name(r),
+                    "severity": role_rating_severity(r),
+                    "base_severity": r.get("severity"), "scope": r.get("scope")}
+                   for r in roles]
+        _, owners = sp_owner_details(graph, sp_oid)
         # owners of the app registration behind the SP inherit the same
         # takeover (they can add credentials to the SP)
         for a_oid in graph["app_by_appid"].get(sp.get("appId"), []):
-            owners |= graph["app_owners"].get(a_oid, set())
+            _, app_users = app_owner_chain(graph, a_oid)
+            owners |= app_users
         for owner in owners:
+            if owner not in graph["user"]:
+                continue
             for entry in entries:
                 ensure(owner)["dir_sp_roles"].append(dict(entry))
 
@@ -2028,16 +2629,19 @@ def check_privileged_users(ctx):
         if pid in graph["user"]:
             p = ensure(pid)
             name = def_name(ea["role_definition_id"])
-            p["eligible_roles"].append({
-                "name": name, "severity": eligible_severity(sev_of(name)),
-                "source": "PIM eligible",
-                "scope": pim_scope_label(ea.get("resource_scopes")),
-            })
+            role_rec = graph["role_definition"].get(ea["role_definition_id"]) or {}
+            entry = make_directory_role_entry(
+                graph, name, eligible_severity(sev_of(name)),
+                scopes=ea.get("resource_scopes"), source="PIM eligible",
+                disabled=_role_def_disabled(role_rec), eligible=True)
+            p["eligible_roles"].append(entry)
 
     # v2-only eligible assignments (roadrecon pimgather) when the legacy v1
-    # tables don't carry them
+    # tables don't carry them. Only aadroles rows are directory roles.
     for a in graph.get("pim_role_assignments") or []:
         if (a.get("assignment_state") or "").lower() != "eligible":
+            continue
+        if not is_pim_directory_assignment(graph, a):
             continue
         subject = graph.get("pim_assign_subject", {}).get(a["id"]) or a.get("subject_id")
         if not subject or subject not in graph["user"]:
@@ -2046,10 +2650,12 @@ def check_privileged_users(ctx):
         p = ensure(subject)
         if any(r["name"] == name for r in p["eligible_roles"]):
             continue
-        p["eligible_roles"].append({
-            "name": name, "severity": eligible_severity(sev_of(name)),
-            "source": "PIM eligible",
-        })
+        role_rec = graph["role_definition"].get(a.get("role_definition_id")) or {}
+        entry = make_directory_role_entry(
+            graph, name, eligible_severity(sev_of(name)),
+            scopes=a.get("scoped_resource_id"), source="PIM eligible",
+            disabled=_role_def_disabled(role_rec), eligible=True)
+        p["eligible_roles"].append(entry)
 
     # ---- group memberships / ownership -------------------------------------
     group_path_cache = {}
@@ -2068,46 +2674,75 @@ def check_privileged_users(ctx):
                 gid, group_eligible_roles, graph["group_member_group"], group_name)
         return eligible_path_cache[gid]
 
-    for gid, uids in graph["group_member_user"].items():
-        rec = graph["group"].get(gid)
-        if not rec:
+    effective = analysis_indexes.get("effective_membership") \
+        or compute_effective_group_membership(graph)
+
+    # Membership lists/counts use effective membership (nested groups included),
+    # while hierarchy and role paths stay on the direct containment edges.
+    for uid, gids in effective["groups_by_user"].items():
+        if uid not in graph["user"]:
             continue
-        gname = rec.get("displayName") or gid
-        inherited = path_roles_for(gid)
-        inherited_eligible = eligible_paths_for(gid)
-        for uid in uids:
-            p = ensure(uid)
-            p["member_count"] += 1
+        p = ensure(uid)
+        for gid in sorted(gids):
+            rec = graph["group"].get(gid)
+            if not rec:
+                continue
+            gname = rec.get("displayName") or gid
             p["groups"].append({
                 "name": gname,
                 "group_id": gid,
                 "capable": gid in capable,
-                "roles": group_roles.get(gid, []),
+                "roles": path_roles_for(gid) or group_roles.get(gid, []),
             })
             if gid in capable:
-                p["cap_member"].append({"name": gname, "roles": group_roles.get(gid, [])})
+                p["cap_member"].append({
+                    "name": gname,
+                    "roles": path_roles_for(gid) or group_roles.get(gid, []),
+                })
+        p["member_count"] = len(p["groups"])
+
+    # Inherited privileges are attributed from each *direct* group membership,
+    # which keeps the real intermediate groups in the via path.
+    for gid, uids in graph["group_member_user"].items():
+        inherited = path_roles_for(gid)
+        inherited_eligible = eligible_paths_for(gid)
+        for uid in uids:
+            if uid not in graph["user"]:
+                continue
+            p = ensure(uid)
             # directory roles inherited through this group (incl. nesting),
             # with the group path — same treatment as service principals
             for r in inherited:
-                p["roles"].append({"name": r["name"], "severity": r["severity"],
-                                   "source": "via " + " \u2192 ".join(r["path"])})
+                entry = dict(r)
+                entry["source"] = "via " + " \u2192 ".join(r["path"])
+                p["roles"].append(entry)
             # PIM-eligible roles inherited through this group (incl. nesting)
             for r in inherited_eligible:
-                p["eligible_roles"].append({
-                    "name": r["name"], "severity": r["severity"],
-                    "source": "PIM eligible via " + " \u2192 ".join(r["path"]),
-                    "path": list(r["path"]),
-                })
-    for gid, uids in graph["group_owner_user"].items():
-        for uid in uids:
+                entry = dict(r)
+                entry["source"] = "PIM eligible via " + " \u2192 ".join(r["path"])
+                entry["path"] = list(r["path"])
+                entry["path_ids"] = list(r.get("path_ids") or [])
+                p["eligible_roles"].append(entry)
+
+    # Group ownership includes users who own an SP that owns the group, and
+    # inherits roles carried by ancestor groups (B-034 / B-035).
+    owned_group_ids = set(graph["group_owner_user"]) | set(graph.get("group_owner_sp") or {})
+    for gid in owned_group_ids:
+        _, owners = group_owner_chain(graph, gid)
+        for uid in owners:
+            if uid not in graph["user"]:
+                continue
             p = ensure(uid)
             p["owned_count"] += 1
             if gid in capable:
-                p["owned_cap"].append({"name": group_name(gid), "roles": group_roles.get(gid, [])})
+                p["owned_cap"].append({
+                    "name": group_name(gid),
+                    "roles": path_roles_for(gid) or group_roles.get(gid, []),
+                })
 
     # ---- ownership of privileged objects -----------------------------------
     seen_owner_sp = set()  # (uid, sp_oid) already attributed via the app
-    for app_oid, uids in graph["app_owners"].items():
+    for app_oid in set(graph["app_owners"]) | set(graph.get("app_owner_sp") or {}):
         app = graph["app"].get(app_oid)
         if not app:
             continue
@@ -2119,20 +2754,26 @@ def check_privileged_users(ctx):
                                for g in grants_by_sp[sp_oid]]
         if not app_grants:
             continue
-        for uid in uids:
+        _, owner_users = app_owner_chain(graph, app_oid)
+        for uid in owner_users:
+            if uid not in graph["user"]:
+                continue
             for sp_oid in sp_oids:
                 seen_owner_sp.add((uid, sp_oid))
             ensure(uid)["priv_apps"].append(
                 {"app_name": app.get("displayName") or app_oid, "grants": app_grants,
                  "kind": "application"})
 
-    for sp_oid, uids in graph["sp_owners"].items():
+    for sp_oid in set(graph["sp_owners"]) | set(graph.get("sp_owner_sp") or {}):
         if sp_oid not in grants_by_sp:
             continue
         grants = [{"permission": g[0], "severity": g[1], "resource": g[2]} for g in grants_by_sp[sp_oid]]
         sp = graph["sp"].get(sp_oid) or {}
         label = sp_name(sp) if sp else sp_oid
-        for uid in uids:
+        _, owner_users = sp_owner_details(graph, sp_oid)
+        for uid in owner_users:
+            if uid not in graph["user"]:
+                continue
             if (uid, sp_oid) in seen_owner_sp:
                 continue
             seen_owner_sp.add((uid, sp_oid))
@@ -2144,7 +2785,7 @@ def check_privileged_users(ctx):
         return (len(json_list(record.get("passwordCredentials"))),
                 len(json_list(record.get("keyCredentials"))))
 
-    for app_oid, uids in graph["app_owners"].items():
+    for app_oid in set(graph["app_owners"]) | set(graph.get("app_owner_sp") or {}):
         app = graph["app"].get(app_oid)
         if not app:
             continue
@@ -2167,10 +2808,12 @@ def check_privileged_users(ctx):
             "pw": pw, "key": key,
             "status": sp_status,
         }
-        for uid in uids:
-            ensure(uid)["owned_objects"].append(entry)
+        _, owner_users = app_owner_chain(graph, app_oid)
+        for uid in owner_users:
+            if uid in graph["user"]:
+                ensure(uid)["owned_objects"].append(entry)
 
-    for sp_oid, uids in graph["sp_owners"].items():
+    for sp_oid in set(graph["sp_owners"]) | set(graph.get("sp_owner_sp") or {}):
         sp = graph["sp"].get(sp_oid)
         if not sp:
             continue
@@ -2185,10 +2828,12 @@ def check_privileged_users(ctx):
             "pw": pw, "key": key,
             "status": bool(sp.get("accountEnabled")),
         }
-        for uid in uids:
-            ensure(uid)["owned_objects"].append(entry)
+        _, owner_users = sp_owner_details(graph, sp_oid)
+        for uid in owner_users:
+            if uid in graph["user"]:
+                ensure(uid)["owned_objects"].append(entry)
 
-    for gid, uids in graph["group_owner_user"].items():
+    for gid in set(graph["group_owner_user"]) | set(graph.get("group_owner_sp") or {}):
         grp = graph["group"].get(gid)
         if not grp:
             continue
@@ -2201,8 +2846,10 @@ def check_privileged_users(ctx):
             "pw": 0, "key": 0,
             "status": None,
         }
-        for uid in uids:
-            ensure(uid)["owned_objects"].append(entry)
+        _, owner_users = group_owner_chain(graph, gid)
+        for uid in owner_users:
+            if uid in graph["user"]:
+                ensure(uid)["owned_objects"].append(entry)
 
     # ---- hybrid / context ---------------------------------------------------
     def dedupe_roles(roles):
@@ -2210,21 +2857,14 @@ def check_privileged_users(ctx):
         for r in roles:
             key = r["name"]
             src = r.get("source") or "assigned"
+            entry = dict(r)
+            entry["source"] = src
             if key not in merged:
-                entry = {"name": key, "severity": r["severity"], "source": src}
-                for extra in ("scope", "path"):
-                    if r.get(extra):
-                        entry[extra] = r[extra]
                 merged[key] = entry
             else:
-                srcs = [s.strip() for s in merged[key]["source"].split("\u00b7")]
-                if src not in srcs:
-                    srcs.append(src)
-                merged[key]["source"] = " \u00b7 ".join(srcs)
-                for extra in ("scope", "path"):
-                    if not merged[key].get(extra) and r.get(extra):
-                        merged[key][extra] = r[extra]
-        return sorted(merged.values(), key=lambda r: severity_rank(r["severity"]))
+                merge_role_entry(merged[key], entry)
+        return sorted(merged.values(),
+                      key=lambda r: severity_rank(role_rating_severity(r)))
 
     for p in profiles.values():
         p["roles"] = dedupe_roles(p["roles"])
@@ -2241,9 +2881,13 @@ def check_privileged_users(ctx):
         # Group-inherited eligibility matches the eligibility on the group.
         if graph.get("pim_role_assignments"):
             for r in p["eligible_roles"]:
-                subjects = {uid} | set(r.get("path") or [])
+                # Match the PIM subject by object ID: path_ids also contains
+                # the real intermediate groups (B-081).
+                subjects = {uid} | set(r.get("path_ids") or [])
                 for a in graph["pim_role_assignments"]:
                     if (a.get("assignment_state") or "").lower() != "eligible":
+                        continue
+                    if not is_pim_directory_assignment(graph, a):
                         continue
                     subject = graph["pim_assign_subject"].get(a["id"]) or a.get("subject_id")
                     if subject not in subjects:
@@ -2288,10 +2932,13 @@ def check_privileged_users(ctx):
     # ---- findings ------------------------------------------------------------
     findings = []
     for uid, p in profiles.items():
-        user = graph["user"].get(uid) or {}
+        user = graph["user"].get(uid)
+        if not user:
+            continue  # stale links must not create unresolved user findings (B-082)
         if user.get("deletionTimestamp"):
             continue  # soft-deleted users are excluded; disabled users stay listed (status column)
-        sevs = [r["severity"] for r in p["roles"]] + [r["severity"] for r in p["eligible_roles"]]
+        sevs = [role_rating_severity(r) for r in p["roles"]] \
+            + [role_rating_severity(r) for r in p["eligible_roles"]]
         sevs += [g["severity"] for app in p["priv_apps"] for g in app["grants"]]
         sevs += [s["severity"] for s in p["dir_sp_roles"]]
         if p["cap_member"]:
@@ -2299,7 +2946,7 @@ def check_privileged_users(ctx):
         # owning a role-capable group is a takeover path: rate by the roles
         # the group actually carries; capable-but-unassigned groups stay High
         for g in p["owned_cap"]:
-            role_sevs = [r["severity"] for r in (g.get("roles") or [])]
+            role_sevs = [role_rating_severity(r) for r in (g.get("roles") or [])]
             if role_sevs:
                 sevs += role_sevs
             else:
@@ -2383,16 +3030,26 @@ def check_ad_sync_users(ctx):
         return rec.get("displayName") if rec else oid
 
     # ---- privileged user ids (>= High) ------------------------------------
+    # Direct roles, plus roles inherited through direct/nested group
+    # membership. AU-scoped and disabled roles never count (B-036 / B-009).
     privileged_ids = set()
-    for role_oid, uid in graph["role_member_user"]:
-        if sev_rank_of(role_name(role_oid)) <= 1:
+    direct_user_roles = ctx.get("direct_user_roles")
+    if direct_user_roles is None:
+        direct_user_roles = direct_directory_roles_by_user(graph, role_sev)
+    for uid, roles in direct_user_roles.items():
+        if uid in graph["user"] and any(
+                is_privileged(role_rating_severity(r)) for r in roles):
             privileged_ids.add(uid)
-    role_defs = graph["role_definition"]
-    for ra in graph["directory_role_assigns"]:
-        rd = role_defs.get(ra["role_definition_id"])
-        name = rd.get("displayName") if rd else ra["role_definition_id"]
-        if ra["principal_id"] in graph["user"] and sev_rank_of(name) <= 1:
-            privileged_ids.add(ra["principal_id"])
+    group_roles = ctx.get("group_roles") or compute_group_roles(
+        graph, ctx["check_cfg"])
+    effective = (ctx.get("analysis_indexes") or {}).get("effective_membership") \
+        or compute_effective_group_membership(graph)
+    for gid, roles in group_roles.items():
+        if not any(is_privileged(role_rating_severity(r)) for r in roles):
+            continue
+        for uid in effective["users_by_group"].get(gid, ()):
+            if uid in graph["user"]:
+                privileged_ids.add(uid)
 
     grants_by_sp = {}  # sp_oid -> [(permission, severity)]
     for ra in graph["role_assigns"]:
@@ -2403,16 +3060,16 @@ def check_ad_sync_users(ctx):
             grants_by_sp.setdefault(ra["principal_id"], []).append(
                 (ri["value"], ri["severity"]))
     priv_owner_ids = set()
-    for app_oid, uids in graph["app_owners"].items():
+    for app_oid in set(graph["app_owners"]) | set(graph.get("app_owner_sp") or {}):
         app = graph["app"].get(app_oid)
         if not app:
             continue
-        for sp_oid in graph["sp_by_appid"].get(app.get("appId"), []):
-            if any(is_privileged(g[1]) for g in grants_by_sp.get(sp_oid, [])):
-                priv_owner_ids |= uids
-    for sp_oid, uids in graph["sp_owners"].items():
+        if any(any(is_privileged(g[1]) for g in grants_by_sp.get(sp_oid, []))
+               for sp_oid in graph["sp_by_appid"].get(app.get("appId"), [])):
+            priv_owner_ids |= app_owner_chain(graph, app_oid)[1]
+    for sp_oid in set(graph["sp_owners"]) | set(graph.get("sp_owner_sp") or {}):
         if any(is_privileged(g[1]) for g in grants_by_sp.get(sp_oid, [])):
-            priv_owner_ids |= uids
+            priv_owner_ids |= sp_owner_details(graph, sp_oid)[1]
 
     # ---- realm meta --------------------------------------------------------
     domains = set()
@@ -2442,12 +3099,7 @@ def check_ad_sync_users(ctx):
 
     # ---- CA policy exclusions (per-user attribute) -------------------------
     def _policy_state(prec):
-        detail = json_safe_value(prec.get("policyDetail"))
-        try:
-            inner = json.loads(detail[0]) if detail and isinstance(detail[0], str) else (detail[0] if detail else None)
-            return ((inner or {}).get("State") or "").strip() or "Unknown"
-        except (json.JSONDecodeError, ValueError, TypeError, IndexError):
-            return "Unknown"
+        return policy_state_from_record(prec)
 
     def _user_label(uid):
         u = graph["user"].get(uid)
@@ -2545,12 +3197,14 @@ def check_ad_sync_infra(ctx):
     findings = []
 
     # --- ADSync groups ------------------------------------------------------
+    effective = (ctx.get("analysis_indexes") or {}).get("effective_membership") \
+        or compute_effective_group_membership(graph)
     for gid, rec in graph["group"].items():
         name = rec.get("displayName") or ""
         if "ADSync" not in name:
             continue
         members = sorted(graph["user"][uid].get("displayName") or uid
-                         for uid in graph["group_member_user"].get(gid, set())
+                         for uid in effective["users_by_group"].get(gid, set())
                          if uid in graph["user"])
         owners = sorted(graph["user"][uid].get("displayName") or uid
                         for uid in graph["group_owner_user"].get(gid, set())
@@ -2580,8 +3234,7 @@ def check_ad_sync_infra(ctx):
             continue
         dir_roles = [graph["directory_role"][r].get("displayName")
                      for r, sp_oid in graph["role_member_sp"] if sp_oid == oid and r in graph["directory_role"]]
-        role_assign_count = len([ra for ra in graph["role_assigns"]
-                                 if ra["principal_type"] == "ServicePrincipal" and ra["principal_id"] == oid])
+        role_assign_count = role_assignment_count_for_sp(ctx, oid)
         pw = len(json_list(rec.get("passwordCredentials")))
         kc = len(json_list(rec.get("keyCredentials")))
         bits = []
@@ -2611,14 +3264,42 @@ def check_ad_sync_infra(ctx):
         findings[-1]["roles"] = role_assign_count
 
     # --- hybrid / legacy auth policies ----------------------------------------
+    def legacy_auth_exposure(rec):
+        """Only flag policies that actually enable legacy/on-prem auth.
+
+        A policy named "Block legacy authentication" is a control, not an
+        exposure. Type-8 On-Premise Authentication Flow policies only count
+        when Desktop SSO is actually enabled (B-083).
+        """
+        name = rec.get("displayName") or ""
+        inner = policy_detail_normalized(rec.get("policyDetail"))
+        state = (str(inner.get("State") or "").strip() or "Unknown").lower()
+        if state == "disabled":
+            return None
+        if rec.get("policyType") == 8 or "n-premise" in name.lower() \
+                or "on-premise" in name.lower():
+            sso = parse_desktop_sso(rec.get("policyDetail"))
+            if not (sso and sso.get("enabled")):
+                return None
+            return f"policyType={rec.get('policyType')} · Desktop SSO enabled"
+        if "legacy" in name.lower():
+            controls = [str(c) for block in (inner.get("Controls") or [])
+                        for c in (block.get("Control") or [])]
+            if "block" in name.lower() or any(c.lower() == "block" for c in controls):
+                return None
+            return (f"policyType={rec.get('policyType')} · state={state} · "
+                    f"controls={', '.join(controls) or 'none captured'}")
+        return None
+
     for oid, rec in graph["policy"].items():
         name = rec.get("displayName") or ""
-        if "n-Premise" not in name and "legacy" not in name.lower():
+        detail = legacy_auth_exposure(rec)
+        if not detail:
             continue
         findings.append(make_finding(
             check_id="ad_sync_infra", category="ad", severity="Info",
             title=f"Authentication policy: {name}",
-            evidence=f"policyType={rec.get('policyType')} · policyIdentifier={rec.get('policyIdentifier') or 'n/a'}",
+            evidence=f"{detail} · policyIdentifier={rec.get('policyIdentifier') or 'n/a'}",
             remediation=("Hybrid sign-in / legacy-authentication policies widen the "
                          "on-prem attack surface; confirm they are required and enforced."),
             primary_id=oid,
@@ -2648,9 +3329,11 @@ def check_ad_sync_infra(ctx):
             bits.append("owner(s): " + ", ".join(owner_names))
         else:
             bits.append("no owner recorded")
+        device_label = ("Windows device" if ostype.lower().startswith("windows")
+                        else f"{ostype or 'Registered'} device")
         findings.append(make_finding(
             check_id="ad_sync_infra", category="ad", severity="Info",
-            title=f"Windows device: {name}",
+            title=f"{device_label}: {name}",
             evidence=" · ".join(bits),
             remediation=("Registered Windows hosts are candidates for overlay "
                          "(NTLM relay / spray) targeting; DC-bound devices include "
@@ -2872,31 +3555,34 @@ def parse_desktop_sso(policy_detail):
     if not policy_detail:
         return None
     try:
-        arr = json_safe_value(policy_detail)
-        if not isinstance(arr, list) or not arr:
-            return None
-        inner = json.loads(arr[0]) if isinstance(arr[0], str) else arr[0]
+        inner = policy_detail_inner(policy_detail)
         sso = ((inner or {}).get("OnPremAuthenticationFlowPolicy") or {}).get("DesktopSSO") or {}
         if not isinstance(sso, dict):
             return None
+        enabled = str(sso.get("Enabled")).lower() in ("true", "1", "yes")
+        if not enabled:
+            return None  # disabled/empty policies are not "found" (B-085)
         domains = [s.get("Domain") for s in (sso.get("Secrets") or [])
                    if isinstance(s, dict) and s.get("Domain")]
-        return {"enabled": bool(sso.get("Enabled")),
+        return {"enabled": True,
                 "spns": bool(sso.get("AreNewSPNsAdded")),
                 "domains": [d for d in domains if d]}
-    except (json.JSONDecodeError, ValueError, TypeError, KeyError):
+    except (json.JSONDecodeError, ValueError, TypeError, KeyError, IndexError):
         return None
 
 
-def resolve_group_role_paths(gid, group_roles, group_member_group, group_label):
+def resolve_group_role_paths(gid, group_roles, group_member_group, group_label,
+                             parents_by_child=None):
     """Directory roles members of `gid` inherit through nested group membership.
 
-    Walks up the containment chain (gid is a member of parent groups, which may
-    themselves be nested in further groups) and returns one entry per role with
-    the shortest group path from `gid` to the role-bearing group, e.g.
+    Walks up the *direct* containment chain (gid is a member of parent groups,
+    which may themselves be nested in further groups) and returns one entry per
+    role with the shortest group path from `gid` to the role-bearing group, e.g.
     {"name": "Global Administrator", "severity": "Critical",
-     "path": ["Team A", "Team A - Admins", "Root Admins"]}.
+     "path": ["Team A", "Team A - Admins", "Root Admins"],
+     "path_ids": ["<gid A>", "<gid B>", "<gid Root>"]}.
     """
+    parents = parents_by_child or group_parents_index(group_member_group)
     found = {}
     seen = {gid}
     queue = [(gid, [gid])]
@@ -2904,15 +3590,15 @@ def resolve_group_role_paths(gid, group_roles, group_member_group, group_label):
         cur, path = queue.pop(0)
         for r in group_roles.get(cur, []):
             if r["name"] not in found:
-                found[r["name"]] = {
-                    "name": r["name"], "severity": r["severity"],
-                    "path": [group_label(g) for g in path],
-                }
-        for parent, children in group_member_group.items():
-            if cur in children and parent not in seen:
+                entry = dict(r)
+                entry["path"] = [group_label(g) for g in path]
+                entry["path_ids"] = list(path)
+                found[r["name"]] = entry
+        for parent in sorted(parents.get(cur, ())):
+            if parent not in seen:
                 seen.add(parent)
                 queue.append((parent, path + [parent]))
-    return sorted(found.values(), key=lambda r: severity_rank(r["severity"]))
+    return sorted(found.values(), key=lambda r: severity_rank(role_rating_severity(r)))
 
 
 def direct_directory_roles_by_user(graph, role_sev):
@@ -2930,15 +3616,21 @@ def direct_directory_roles_by_user(graph, role_sev):
         return rec.get("displayName") if rec else oid
 
     for role_oid, uid in graph["role_member_user"]:
+        if uid not in graph["user"]:
+            continue
         name = _role_name(role_oid)
-        out[uid].append({"name": name, "severity": role_sev.get(name, "Info"),
-                         "source": "role member"})
+        role_rec = graph["directory_role"].get(role_oid) or {}
+        out[uid].append(make_directory_role_entry(
+            graph, name, role_sev.get(name, "Info"), scopes="/",
+            source="role member", disabled=_directory_role_disabled(role_rec)))
     for ra in graph["directory_role_assigns"]:
         if ra["principal_id"] in graph["user"]:
             name = _def_name(ra["role_definition_id"])
-            out[ra["principal_id"]].append({"name": name,
-                                            "severity": role_sev.get(name, "Info"),
-                                            "source": "role assignment"})
+            role_rec = graph["role_definition"].get(ra["role_definition_id"]) or {}
+            out[ra["principal_id"]].append(make_directory_role_entry(
+                graph, name, role_sev.get(name, "Info"),
+                scopes=ra.get("resource_scopes"), source="role assignment",
+                disabled=_role_def_disabled(role_rec)))
     for uid in list(out):
         merged = {}
         for r in out[uid]:
@@ -2946,11 +3638,9 @@ def direct_directory_roles_by_user(graph, role_sev):
             if key not in merged:
                 merged[key] = r
             else:
-                srcs = [s.strip() for s in merged[key]["source"].split("\u00b7")]
-                if r["source"] not in srcs:
-                    srcs.append(r["source"])
-                merged[key]["source"] = " \u00b7 ".join(srcs)
-        out[uid] = sorted(merged.values(), key=lambda r: severity_rank(r["severity"]))
+                merge_role_entry(merged[key], r)
+        out[uid] = sorted(merged.values(),
+                          key=lambda r: severity_rank(role_rating_severity(r)))
     return dict(out)
 
 
@@ -2970,16 +3660,27 @@ def direct_directory_roles_by_sp(graph, role_sev):
 
     for role_oid, sp_oid in graph["role_member_sp"]:
         name = _role_name(role_oid)
-        out[sp_oid].append({"name": name, "severity": role_sev.get(name, "Info")})
+        role_rec = graph["directory_role"].get(role_oid) or {}
+        out[sp_oid].append(make_directory_role_entry(
+            graph, name, role_sev.get(name, "Info"), scopes="/",
+            disabled=_directory_role_disabled(role_rec)))
     for ra in graph["directory_role_assigns"]:
         if ra["principal_id"] in graph["sp"]:
             name = _def_name(ra["role_definition_id"])
-            out[ra["principal_id"]].append({"name": name,
-                                            "severity": role_sev.get(name, "Info")})
+            role_rec = graph["role_definition"].get(ra["role_definition_id"]) or {}
+            out[ra["principal_id"]].append(make_directory_role_entry(
+                graph, name, role_sev.get(name, "Info"),
+                scopes=ra.get("resource_scopes"),
+                disabled=_role_def_disabled(role_rec)))
     for sp_oid in list(out):
-        seen = set()
-        out[sp_oid] = [r for r in out[sp_oid]
-                       if not (r["name"] in seen or seen.add(r["name"]))]
+        merged = {}
+        for r in out[sp_oid]:
+            if r["name"] not in merged:
+                merged[r["name"]] = r
+            else:
+                merge_role_entry(merged[r["name"]], r)
+        out[sp_oid] = sorted(merged.values(),
+                             key=lambda r: severity_rank(role_rating_severity(r)))
     return dict(out)
 
 
@@ -3004,20 +3705,48 @@ def compute_group_roles(graph, check_cfg):
     group_roles = defaultdict(list)
     for role_oid, gid in graph["role_member_group"]:
         name = _grole_name(role_oid)
-        group_roles[gid].append({"name": name, "severity": _gsev(name)})
+        role_rec = graph["directory_role"].get(role_oid) or {}
+        group_roles[gid].append(make_directory_role_entry(
+            graph, name, _gsev(name), scopes="/",
+            disabled=_directory_role_disabled(role_rec)))
     for ra in graph["directory_role_assigns"]:
         if ra["principal_id"] in graph["group"]:
             name = _gdef_name(ra["role_definition_id"])
-            group_roles[ra["principal_id"]].append({"name": name, "severity": _gsev(name)})
+            role_rec = graph["role_definition"].get(ra["role_definition_id"]) or {}
+            group_roles[ra["principal_id"]].append(make_directory_role_entry(
+                graph, name, _gsev(name), scopes=ra.get("resource_scopes"),
+                disabled=_role_def_disabled(role_rec)))
     for gid in list(group_roles):
-        seen = set()
-        group_roles[gid] = [r for r in group_roles[gid]
-                            if not (r["name"] in seen or seen.add(r["name"]))]
+        merged = {}
+        for r in group_roles[gid]:
+            if r["name"] not in merged:
+                merged[r["name"]] = r
+            else:
+                merge_role_entry(merged[r["name"]], r)
+        group_roles[gid] = sorted(merged.values(),
+                                  key=lambda r: severity_rank(role_rating_severity(r)))
     return group_roles
 
 
+def is_pim_directory_assignment(graph, assignment):
+    """True when a PIM v2 assignment belongs to the aadroles resource.
+
+    PIM-for-groups schedules are stored in the same table with the group ID as
+    resourceId and ``member``/``owner`` as roleDefinitionId; they must never be
+    interpreted as directory-role eligibility (B-037).
+    """
+    resource_id = assignment.get("resource_id")
+    if not resource_id:
+        return False
+    if resource_id == "aadroles":
+        return True
+    rec = (graph.get("pim_resources") or {}).get(resource_id) or {}
+    resource_type = str(rec.get("type") or "").strip().lower()
+    return resource_type in {"aadroles", "aadrole", "directoryrole", "directoryroles"}
+
+
 def sp_directory_roles(graph, group_roles, sp_oid, role_sev, group_eligible_roles=None,
-                       direct_sp_roles=None):
+                       direct_sp_roles=None, groups_by_sp=None, parents_by_child=None):
     """Directory roles held by a service principal: direct memberships and
     assignments plus roles inherited through group membership (incl. nesting).
     Each entry carries the group path to the role-bearing group (None when
@@ -3033,64 +3762,99 @@ def sp_directory_roles(graph, group_roles, sp_oid, role_sev, group_eligible_role
 
     if direct_sp_roles is None:
         direct_sp_roles = direct_directory_roles_by_sp(graph, role_sev)
-    roles = [{"name": r["name"], "severity": r["severity"], "path": None, "eligible": False}
-             for r in direct_sp_roles.get(sp_oid, [])]
-    seen = {r["name"] for r in roles}
-    for gid, members in graph["group_member_sp"].items():
-        if sp_oid not in members:
-            continue
-        for r in resolve_group_role_paths(gid, group_roles,
-                                          graph["group_member_group"], _group_label):
-            if r["name"] not in seen:
-                seen.add(r["name"])
-                roles.append({"name": r["name"], "severity": r["severity"],
-                              "path": list(r["path"]), "eligible": False})
+    parents_by_child = parents_by_child or graph.get("group_parents") or group_parents_index(
+        graph.get("group_member_group"))
+    if groups_by_sp is None:
+        groups_by_sp = defaultdict(set)
+        for gid, members in (graph.get("group_member_sp") or {}).items():
+            for sid in members:
+                groups_by_sp[sid].add(gid)
+    roles = []
+    by_name = {}
+    for r in direct_sp_roles.get(sp_oid, []):
+        entry = dict(r)
+        entry["path"] = None
+        entry["eligible"] = False
+        roles.append(entry)
+        by_name[entry["name"]] = entry
+    for gid in sorted(groups_by_sp.get(sp_oid, ())):
+        for r in resolve_group_role_paths(
+                gid, group_roles, graph["group_member_group"], _group_label,
+                parents_by_child=parents_by_child):
+            existing = by_name.get(r["name"])
+            if existing is not None:
+                merge_role_entry(existing, r)
+                continue
+            entry = dict(r)
+            entry["path"] = list(r["path"])
+            entry["path_ids"] = list(r.get("path_ids") or [])
+            entry["eligible"] = False
+            roles.append(entry)
+            by_name[entry["name"]] = entry
     # PIM-eligible directory roles (direct assignments + via groups): marker
     # only — shown with an '(eligible)' marker, rated one notch below active.
     if group_eligible_roles is not None:
         for ea in graph["eligible_role_assigns"]:
             if ea["principal_id"] == sp_oid:
                 name = _def_name(ea["role_definition_id"])
-                if name not in seen:
-                    seen.add(name)
-                    roles.append({"name": name, "severity": eligible_severity(role_sev.get(name, "Info")),
-                                  "path": None, "eligible": True})
+                if name not in by_name:
+                    role_rec = graph["role_definition"].get(ea["role_definition_id"]) or {}
+                    entry = make_directory_role_entry(
+                        graph, name, eligible_severity(role_sev.get(name, "Info")),
+                        scopes=ea.get("resource_scopes"), eligible=True,
+                        disabled=_role_def_disabled(role_rec))
+                    entry["path"] = None
+                    by_name[name] = entry
+                    roles.append(entry)
         # v2-only direct eligibility (pimgather)
         for a in graph.get("pim_role_assignments") or []:
             if (a.get("assignment_state") or "").lower() != "eligible":
+                continue
+            if not is_pim_directory_assignment(graph, a):
                 continue
             subject = graph.get("pim_assign_subject", {}).get(a["id"]) or a.get("subject_id")
             if subject != sp_oid:
                 continue
             name = _pim_role_def_name(graph, a.get("role_definition_id"))
-            if name not in seen:
-                seen.add(name)
-                roles.append({"name": name, "severity": eligible_severity(role_sev.get(name, "Info")),
-                              "path": None, "eligible": True})
-        for gid, members in graph["group_member_sp"].items():
-            if sp_oid not in members:
-                continue
-            for r in resolve_group_role_paths(gid, group_eligible_roles,
-                                              graph["group_member_group"], _group_label):
-                if r["name"] not in seen:
-                    seen.add(r["name"])
-                    roles.append({"name": r["name"], "severity": r["severity"],
-                                  "path": list(r["path"]), "eligible": True})
+            if name not in by_name:
+                role_rec = graph["role_definition"].get(a.get("role_definition_id")) or {}
+                entry = make_directory_role_entry(
+                    graph, name, eligible_severity(role_sev.get(name, "Info")),
+                    scopes=a.get("scoped_resource_id"), eligible=True,
+                    disabled=_role_def_disabled(role_rec))
+                entry["path"] = None
+                by_name[name] = entry
+                roles.append(entry)
+        for gid in sorted(groups_by_sp.get(sp_oid, ())):
+            for r in resolve_group_role_paths(
+                    gid, group_eligible_roles, graph["group_member_group"], _group_label,
+                    parents_by_child=parents_by_child):
+                if r["name"] not in by_name:
+                    entry = dict(r)
+                    entry["path"] = list(r["path"])
+                    entry["path_ids"] = list(r.get("path_ids") or [])
+                    entry["eligible"] = True
+                    by_name[r["name"]] = entry
+                    roles.append(entry)
     return roles
 
 
-def make_sp_dir_resolver(graph, group_roles, role_sev, group_eligible_roles=None):
+def make_sp_dir_resolver(graph, group_roles, role_sev, group_eligible_roles=None,
+                         direct_sp_roles=None, groups_by_sp=None,
+                         parents_by_child=None):
     """Memoized resolver of a service principal's directory roles (active +
     PIM-eligible, with group paths). Shared across the checks, the severity
     bump and the entity profiles so the group walks run once per SP per run."""
-    direct_sp_roles = direct_directory_roles_by_sp(graph, role_sev)
+    if direct_sp_roles is None:
+        direct_sp_roles = direct_directory_roles_by_sp(graph, role_sev)
     cache = {}
 
     def resolve(sp_oid):
         if sp_oid not in cache:
             cache[sp_oid] = sp_directory_roles(
                 graph, group_roles, sp_oid, role_sev, group_eligible_roles,
-                direct_sp_roles=direct_sp_roles)
+                direct_sp_roles=direct_sp_roles, groups_by_sp=groups_by_sp,
+                parents_by_child=parents_by_child)
         return cache[sp_oid]
 
     return resolve
@@ -3134,9 +3898,12 @@ def build_role_applications(graph, group_roles, group_eligible_roles=None):
     for ra in graph["directory_role_assigns"]:
         if ra["principal_id"] in graph["sp"]:
             add(_def_name(ra["role_definition_id"]), ra["principal_id"], None)
+    parents_by_child = graph.get("group_parents") or group_parents_index(
+        graph["group_member_group"])
     for gid, sp_ids in graph["group_member_sp"].items():
         for r in resolve_group_role_paths(gid, group_roles,
-                                          graph["group_member_group"], _group_label):
+                                          graph["group_member_group"], _group_label,
+                                          parents_by_child=parents_by_child):
             for sp_oid in sp_ids:
                 if sp_oid in graph["sp"]:
                     add(r["name"], sp_oid, r["path"])
@@ -3150,7 +3917,8 @@ def build_role_applications(graph, group_roles, group_eligible_roles=None):
                     add(name, ea["principal_id"], None, eligible=True)
         for gid, sp_ids in graph["group_member_sp"].items():
             for r in resolve_group_role_paths(gid, group_eligible_roles,
-                                              graph["group_member_group"], _group_label):
+                                              graph["group_member_group"], _group_label,
+                                              parents_by_child=parents_by_child):
                 for sp_oid in sp_ids:
                     if sp_oid in graph["sp"] and not any(
                             e["id"] == sp_oid and not e.get("eligible")
@@ -3219,20 +3987,33 @@ def compute_group_eligible_roles(graph, check_cfg):
     for ea in graph["eligible_role_assigns"]:
         if ea["principal_id"] in graph["group"]:
             name = _gdef_name(ea["role_definition_id"])
-            out[ea["principal_id"]].append({"name": name, "severity": _gsev(name)})
+            role_rec = graph["role_definition"].get(ea["role_definition_id"]) or {}
+            out[ea["principal_id"]].append(make_directory_role_entry(
+                graph, name, _gsev(name), scopes=ea.get("resource_scopes"),
+                eligible=True, disabled=_role_def_disabled(role_rec)))
     # v2-only group eligibility (pimgather) when the v1 tables don't carry it
     for a in graph.get("pim_role_assignments") or []:
         if (a.get("assignment_state") or "").lower() != "eligible":
+            continue
+        if not is_pim_directory_assignment(graph, a):
             continue
         subject = graph.get("pim_assign_subject", {}).get(a["id"]) or a.get("subject_id")
         if not subject or subject not in graph["group"]:
             continue
         name = _pim_role_def_name(graph, a.get("role_definition_id"))
         if not any(r["name"] == name for r in out.get(subject, [])):
-            out[subject].append({"name": name, "severity": _gsev(name)})
+            role_rec = graph["role_definition"].get(a.get("role_definition_id")) or {}
+            out[subject].append(make_directory_role_entry(
+                graph, name, _gsev(name), scopes=a.get("scoped_resource_id"),
+                eligible=True, disabled=_role_def_disabled(role_rec)))
     for gid in list(out):
-        seen = set()
-        out[gid] = [r for r in out[gid] if not (r["name"] in seen or seen.add(r["name"]))]
+        merged = {}
+        for r in out[gid]:
+            if r["name"] not in merged:
+                merged[r["name"]] = r
+            else:
+                merge_role_entry(merged[r["name"]], r)
+        out[gid] = list(merged.values())
     return out
 
 
@@ -3247,9 +4028,16 @@ def check_groups(ctx):
     capable = ctx["capable_groups"]
     group_roles = ctx["group_roles"]
     group_eligible_roles = ctx.get("group_eligible_roles") or {}
+    analysis_indexes = ctx.get("analysis_indexes") or {}
+    parents_by_child = analysis_indexes.get("parents_by_child") or graph.get(
+        "group_parents") or group_parents_index(graph["group_member_group"])
+    effective = analysis_indexes.get("effective_membership") \
+        or compute_effective_group_membership(graph)
 
     # direct directory roles per user (drives the privileged-member column)
-    user_roles = direct_directory_roles_by_user(graph, role_sev)
+    user_roles = ctx.get("direct_user_roles")
+    if user_roles is None:
+        user_roles = direct_directory_roles_by_user(graph, role_sev)
 
     def user_primary(uid):
         u = graph["user"].get(uid)
@@ -3261,6 +4049,10 @@ def check_groups(ctx):
         rec = graph["group"].get(gid)
         return rec.get("displayName") if rec else gid
 
+    def sp_label(sp_oid):
+        rec = graph["sp"].get(sp_oid)
+        return (rec.get("displayName") or rec.get("appDisplayName") or sp_oid) if rec else sp_oid
+
     # Roles members inherit through nested group membership, with the group
     # path from the viewed group to each role-bearing group.
     role_path_cache = {}
@@ -3268,11 +4060,35 @@ def check_groups(ctx):
     def role_paths_for(gid):
         if gid not in role_path_cache:
             role_path_cache[gid] = resolve_group_role_paths(
-                gid, group_roles, graph["group_member_group"], group_label)
+                gid, group_roles, graph["group_member_group"], group_label,
+                parents_by_child=parents_by_child)
         return role_path_cache[gid]
 
+    # A member's group-derived roles come from their own *direct* groups and
+    # keep the real intermediate path (Helpdesk -> Tier 2 -> Root).
+    direct_groups_by_user = defaultdict(set)
+    for direct_gid, uids in graph["group_member_user"].items():
+        for uid in uids:
+            direct_groups_by_user[uid].add(direct_gid)
+    member_roles_cache = {}
+
+    def member_group_roles(uid):
+        if uid not in member_roles_cache:
+            merged = {}
+            for direct_gid in direct_groups_by_user.get(uid, ()):
+                for r in role_paths_for(direct_gid):
+                    if r["name"] not in merged:
+                        merged[r["name"]] = dict(r)
+                    else:
+                        merge_role_entry(merged[r["name"]], r)
+            member_roles_cache[uid] = list(merged.values())
+        return member_roles_cache[uid]
+
     # direct directory roles per SP (memberships + role assignments)
-    sp_dir_roles = direct_directory_roles_by_sp(graph, role_sev)
+    sp_dir_roles = ctx.get("direct_sp_roles")
+    if sp_dir_roles is None:
+        sp_dir_roles = direct_directory_roles_by_sp(graph, role_sev)
+    sp_resolver = ctx.get("sp_dir_resolver")
 
     # privileged app-role assignments per SP, rated by the resources config
     # (same criticality tags as the priv_app_ownership findings)
@@ -3312,6 +4128,8 @@ def check_groups(ctx):
             for a in (graph.get("pim_role_assignments") or []):
                 if (a.get("assignment_state") or "").lower() != "eligible":
                     continue
+                if not is_pim_directory_assignment(graph, a):
+                    continue
                 subject = graph["pim_assign_subject"].get(a["id"]) or a.get("subject_id")
                 if subject != gid:
                     continue
@@ -3327,22 +4145,36 @@ def check_groups(ctx):
                 }
                 break
         group_role_tags = role_paths_for(gid)
-        parents = sorted((graph["group"][p].get("displayName") or p)
-                         for p, children in graph["group_member_group"].items() if gid in children)
-        children = sorted((graph["group"][c].get("displayName") or c)
-                          for c in graph["group_member_group"].get(gid, []))
+        parents = sorted((graph["group"].get(p) or {}).get("displayName") or p
+                         for p in parents_by_child.get(gid, ()))
+        children = sorted((graph["group"].get(c) or {}).get("displayName") or c
+                          for c in graph["group_member_group"].get(gid, ()))
         sp_members = []
-        for s in graph["group_member_sp"].get(gid, set()):
+        for s in sorted(effective["sps_by_group"].get(gid, set())):
             if s not in graph["sp"]:
                 continue
             tags = {}
-            for r in sp_dir_roles.get(s, []):
-                tags[r["name"]] = {"name": r["name"], "severity": r["severity"],
-                                   "path": None, "kind": "dir"}
+            if sp_resolver is not None:
+                sp_roles = [r for r in sp_resolver(s) if not r.get("eligible")]
+            else:
+                sp_roles = list(sp_dir_roles.get(s, []))
+            for r in sp_roles:
+                tags[r["name"]] = {
+                    "name": r["name"], "severity": r["severity"],
+                    "path": list(r["path"]) if r.get("path") is not None else None,
+                    "kind": "dir", "scope": r.get("scope"),
+                    "scope_limited": r.get("scope_limited", False),
+                    "disabled": r.get("disabled", False),
+                }
             for r in group_role_tags:
                 if r["name"] not in tags:
-                    tags[r["name"]] = {"name": r["name"], "severity": r["severity"],
-                                       "path": list(r["path"]), "kind": "dir"}
+                    tags[r["name"]] = {
+                        "name": r["name"], "severity": r["severity"],
+                        "path": list(r["path"]), "kind": "dir",
+                        "scope": r.get("scope"),
+                        "scope_limited": r.get("scope_limited", False),
+                        "disabled": r.get("disabled", False),
+                    }
             for g in sp_priv_grants.get(s, []):
                 key = f"app:{g['name']}"
                 if key not in tags:
@@ -3352,36 +4184,43 @@ def check_groups(ctx):
                 "id": s,
                 "name": graph["sp"][s].get("displayName") or s,
                 "enabled": bool(graph["sp"][s].get("accountEnabled")),
-                "roles": sorted(tags.values(), key=lambda r: severity_rank(r["severity"])),
+                "roles": sorted(tags.values(),
+                                key=lambda r: severity_rank(role_rating_severity(r))
+                                if r.get("kind") == "dir" else severity_rank(r["severity"])),
             })
         sp_members.sort(key=lambda m: (m["name"] or "").lower())
-        owners = sorted(user_primary(u) for u in graph["group_owner_user"].get(gid, set())
-                        if u in graph["user"])
+
+        owner_sps, owner_users = group_owner_chain(graph, gid)
+        owners = sorted(user_primary(u) for u in owner_users if u in graph["user"])
+        owner_sp_names = sorted(sp_label(s) for s in owner_sps if s in graph["sp"])
 
         members = []
-        for uid in graph["group_member_user"].get(gid, set()):
+        for uid in sorted(effective["users_by_group"].get(gid, set())):
             if uid not in graph["user"]:
                 continue
             u = graph["user"][uid]
             merged = {}
             for r in user_roles.get(uid, []):
-                merged[r["name"]] = {"name": r["name"], "severity": r["severity"], "path": None}
-            for r in group_role_tags:
+                entry = dict(r)
+                entry["path"] = None
+                merged[r["name"]] = entry
+            for r in member_group_roles(uid):
                 if r["name"] not in merged:
-                    merged[r["name"]] = {
-                        "name": r["name"], "severity": r["severity"], "path": list(r["path"]),
-                    }
-            roles = sorted(merged.values(), key=lambda r: severity_rank(r["severity"]))
+                    merged[r["name"]] = dict(r)
+                else:
+                    merge_role_entry(merged[r["name"]], r)
+            roles = sorted(merged.values(),
+                           key=lambda r: severity_rank(role_rating_severity(r)))
             members.append({
                 "name": u.get("displayName") or uid,
                 "upn": u.get("userPrincipalName") or "",
                 "roles": roles,
-                "privileged": any(is_privileged(r["severity"]) for r in roles),
+                "privileged": any(is_privileged(role_rating_severity(r)) for r in roles),
             })
         members.sort(key=lambda m: (not m["privileged"], (m["name"] or "").lower()))
         priv_members = [m for m in members if m["privileged"]]
 
-        role_sevs = [r["severity"] for r in dir_roles]
+        role_sevs = [role_rating_severity(r) for r in dir_roles]
         if role_sevs:
             severity = min(role_sevs, key=severity_rank)
         elif assignable:
@@ -3433,13 +4272,17 @@ def check_groups(ctx):
         f["eligible_roles"] = eligible_roles
         f["parents"] = parents
         f["children"] = children
-        f["owners"] = owners
+        f["owners"] = owners + [f"{n} (service principal)" for n in owner_sp_names]
+        f["owner_sps"] = owner_sp_names
         f["members"] = members
         f["sp_members"] = sp_members
-        f["member_count"] = len(members) + len(sp_members)
+        device_members = effective["devices_by_group"].get(gid, set())
+        f["device_member_count"] = len(device_members)
+        f["nested_group_count"] = len(effective["groups_by_group"].get(gid, set()))
+        f["member_count"] = len(members) + len(sp_members) + len(device_members)
         f["user_member_count"] = len(members)
         f["priv_member_count"] = len(priv_members)
-        f["dyn_rule"] = rule
+        f["dyn_rule"] = rule if dynamic else ""
         f["dyn_attrs"] = dyn_attrs
         f["dyn_mods"] = dyn_mods
         f["az_roles"] = az_roles
@@ -3472,22 +4315,16 @@ def pim_scope_label(raw):
 
 
 def check_ca_exposure(ctx):
-    """Conditional Access exposure: per-policy posture (state, scope, exclusions)
-    plus a full policy profile (included/excluded users, roles, groups,
-    applications, controls, conditions) for the drawer. Per-user exclusions are
-    surfaced as an attribute in the Users tab (no rating); group-targeted scope
-    cannot be resolved from the captured links."""
+    """Conditional Access policy inventory: per-policy posture (state, scope,
+    exclusions) plus a full policy profile (included/excluded users, roles,
+    groups, applications, controls, conditions) for the drawer. Per-user
+    exposure gaps are emitted separately by check_ca_gaps."""
     graph = ctx["graph"]
     role_sev = ctx["check_cfg"]["directory_roles"]
 
     def policy_inner(pol_id):
         rec = graph["policy"].get(pol_id)
-        detail = json_safe_value(rec.get("policyDetail")) if rec else None
-        try:
-            inner = json.loads(detail[0]) if detail and isinstance(detail[0], str) else (detail[0] if detail else None)
-            return _normalize_ca_policy(inner) if isinstance(inner, dict) else {}
-        except (json.JSONDecodeError, ValueError, TypeError, IndexError):
-            return {}
+        return policy_detail_normalized(rec.get("policyDetail") if rec else None)
 
     def policy_state(pol_id):
         return ((policy_inner(pol_id).get("State")) or "").strip() or "Unknown"
@@ -3574,8 +4411,8 @@ def check_ca_exposure(ctx):
             evidence=" · ".join(bits),
             remediation=("Confirm the policy state, scope, and exclusions; Reporting "
                          "policies do not enforce, and excluded users bypass the "
-                         "policy's sign-on requirements. Per-user exclusions are "
-                         "shown as an attribute in the Users tab."),
+                         "policy's sign-on requirements. Privileged excluded "
+                         "users get their own per-user findings."),
             primary_id=pol,
             object_ids={},
             target={"type": "Policy", "name": name, "id": pol},
@@ -3599,6 +4436,103 @@ def check_ca_exposure(ctx):
         f["created"] = inner.get("CreatedDateTime", "")
         f["modified"] = inner.get("ModifiedDateTime", "")
         f["template_id"] = inner.get("TemplateId", "")
+        findings.append(f)
+
+    findings.sort(key=lambda f: (severity_rank(f["severity"]),
+                                 (f["target"]["name"] or "").lower()))
+    return findings
+
+
+def check_ca_gaps(ctx):
+    """Conditional Access gaps: privileged users explicitly excluded from an
+    enabled policy that otherwise targets them. An exclusion only counts when
+    the policy also includes the user (all users or an explicit include link).
+    Severity follows the most critical privileged directory role the user
+    holds, including roles inherited through group membership."""
+    graph = ctx["graph"]
+    role_sev = ctx["check_cfg"]["directory_roles"]
+    group_roles = ctx.get("group_roles") or {}
+
+    def policy_state(pol_id):
+        rec = graph["policy"].get(pol_id)
+        return policy_state_from_record(rec) if rec else "Unknown"
+
+    def _group_label(gid):
+        rec = graph["group"].get(gid)
+        return rec.get("displayName") if rec else gid
+
+    privileges = defaultdict(dict)  # uid -> role name -> severity
+    for uid, roles in direct_directory_roles_by_user(graph, role_sev).items():
+        for r in roles:
+            privileges[uid].setdefault(r["name"], r["severity"])
+    for gid, members in graph["group_member_user"].items():
+        inherited = resolve_group_role_paths(
+            gid, group_roles, graph["group_member_group"], _group_label)
+        for uid in members:
+            for r in inherited:
+                privileges[uid].setdefault(r["name"], r["severity"])
+
+    ca_policies = [oid for oid, rec in graph["policy"].items()
+                   if rec.get("policyType") == 18]
+    excluded_from = defaultdict(list)
+    for pol in ca_policies:
+        rec = graph["policy"][pol]
+        if _ca_state_label(policy_state(pol)) != "Enabled":
+            continue
+        included_all = pol in graph["policy_include_allusers"]
+        included_uids = {uid for p, uid in graph["policy_user_include"] if p == pol}
+        excluded_uids = {uid for p, uid in graph["policy_user_exclude"] if p == pol}
+        if not excluded_uids:
+            continue
+        name = rec.get("displayName") or pol
+        for uid in sorted(excluded_uids):
+            # Exclusions only matter for users the policy otherwise targets
+            # (all users, or an explicit include link).
+            if not (included_all or uid in included_uids):
+                continue
+            excluded_from[uid].append({"id": pol, "name": name})
+
+    findings = []
+    for uid, policies_excluded in sorted(excluded_from.items()):
+        roles = privileges.get(uid) or {}
+        active = [(name, sev) for name, sev in roles.items() if is_privileged(sev)]
+        if not active:
+            continue
+        severity = min((sev for _, sev in active), key=severity_rank)
+        user = graph["user"].get(uid) or {}
+        display = user.get("displayName") or user.get("userPrincipalName") or uid
+        upn = user.get("userPrincipalName") or ""
+        policy_names = sorted({p["name"] for p in policies_excluded},
+                              key=lambda x: x.lower())
+        role_entries = sorted(
+            ({"name": name, "severity": sev} for name, sev in active),
+            key=lambda r: (severity_rank(r["severity"]), r["name"].lower()))
+        role_names = [r["name"] for r in role_entries]
+        f = make_finding(
+            check_id="ca_gaps", category="configs", severity=severity,
+            title=f"Privileged user excluded from Conditional Access: {display}",
+            evidence=(f"excluded from {len(policy_names)} enabled CA policy(ies): "
+                      + ", ".join(policy_names)
+                      + (" · privileged directory role(s): " + ", ".join(role_names)
+                         if role_names else "")),
+            remediation=("Do not exclude privileged accounts from sign-on / MFA "
+                         "Conditional Access policies. Scope the policy to emergency-"
+                         "access accounts only, or replace the exclusion with a "
+                         "stronger control and monitored break-glass process."),
+            primary_id=uid,
+            object_ids={"user": {uid}},
+            target={"type": "User", "name": display, "id": uid},
+            status={"label": "Excluded"},
+        )
+        f["user_id"] = uid
+        f["user_display"] = display
+        f["user_upn"] = upn
+        f["user_type"] = user.get("userType") or "Member"
+        f["user_enabled"] = bool(user.get("accountEnabled"))
+        f["ca_excluded_policies"] = policy_names
+        f["ca_exclusion_count"] = len(policy_names)
+        f["privileged_roles"] = role_names
+        f["privileged_role_entries"] = role_entries
         findings.append(f)
 
     findings.sort(key=lambda f: (severity_rank(f["severity"]),
@@ -3972,12 +4906,20 @@ CHECK_SPECS = [
         "id": "ca_exposure",
         "category": "configs",
         "title": "Conditional Access policy exposure",
-        "description": ("Per-policy posture (state, scope, exclusions) plus per-user "
-                        "findings for users explicitly excluded from sign-on / MFA "
-                        "Conditional Access policies. Elevated when the excluded user "
-                        "holds privileged directory roles. Group-targeted scope cannot "
-                        "be resolved from the captured links."),
+        "description": ("Per-policy posture (state, scope, exclusions, conditions) "
+                        "with a full policy profile in the drawer. Group-targeted "
+                        "scope cannot be resolved from the captured links."),
         "run": check_ca_exposure,
+    },
+    {
+        "id": "ca_gaps",
+        "category": "configs",
+        "title": "Conditional Access gaps",
+        "description": ("Privileged users explicitly excluded from enabled sign-on / "
+                        "MFA Conditional Access policies that otherwise target them. "
+                        "Severity follows the user's privileged directory roles, "
+                        "including roles inherited through group membership."),
+        "run": check_ca_gaps,
     },
     {
         "id": "ad_sync_summary",
@@ -4029,10 +4971,13 @@ CHECK_SPECS = [
 
 
 def run_checks(graph, config_resources, check_cfg,
-               group_roles=None, group_eligible_roles=None, sp_dir_resolver=None):
+               group_roles=None, group_eligible_roles=None, sp_dir_resolver=None,
+               include_disabled=None):
     """Run every enabled check and return the list of {spec, findings} results."""
-    opts = {"include_disabled": True}
     check_config = dict(check_cfg)
+    if include_disabled is None:
+        include_disabled = check_config.get("include_disabled", True)
+    opts = {"include_disabled": bool(include_disabled)}
 
     # ---- selection from the config only (the tool always serves the full
     # report: every check that the config has not explicitly disabled) ------
@@ -4092,37 +5037,38 @@ def run_checks(graph, config_resources, check_cfg,
         group_roles = compute_group_roles(graph, check_config)
     if group_eligible_roles is None:
         group_eligible_roles = compute_group_eligible_roles(graph, check_config)
+    analysis_indexes = build_analysis_indexes(graph)
+    direct_user_roles = direct_directory_roles_by_user(
+        graph, check_config["directory_roles"])
+    direct_sp_roles = direct_directory_roles_by_sp(
+        graph, check_config["directory_roles"])
     if sp_dir_resolver is None:
         sp_dir_resolver = make_sp_dir_resolver(
-            graph, group_roles, check_config["directory_roles"], group_eligible_roles)
+            graph, group_roles, check_config["directory_roles"], group_eligible_roles,
+            direct_sp_roles=direct_sp_roles,
+            groups_by_sp=analysis_indexes["groups_by_sp"],
+            parents_by_child=analysis_indexes["parents_by_child"])
 
     ctx["capable_groups"] = capable_groups
     ctx["group_roles"] = group_roles
     ctx["group_eligible_roles"] = group_eligible_roles
     ctx["sp_dir_resolver"] = sp_dir_resolver
+    ctx["analysis_indexes"] = analysis_indexes
+    ctx["direct_user_roles"] = direct_user_roles
+    ctx["direct_sp_roles"] = direct_sp_roles
 
-    results = []
+    raw_results = []
     for spec in selected:
         sys.stdout.write(f"Running {spec['id']}...")
         sys.stdout.flush()
         try:
             findings = spec["run"](ctx)
-            filtered = []
-            for f in findings:
-                if severity_rank(f["severity"]) > min_rank:
-                    continue
-                key = f"{f['check_id']}:{f['primary_id']}"
-                if key in suppress or f["check_id"] in suppress:
-                    continue
-                filtered.append(f)
         except Exception:
             sys.stdout.write(" error\n")
             raise
-        sys.stdout.write(f" {len(filtered)}\n")
-        if filtered:
-            results.append({"id": spec["id"], "category": spec["category"],
+        raw_results.append({"id": spec["id"], "category": spec["category"],
                             "title": spec["title"], "description": spec["description"],
-                            "findings": filtered,
+                            "findings": findings,
                             "meta": ctx.get("ad_realm", {})})
 
     # ---- ARM (Azure RBAC) roles per finding (marker only, never rated) ----
@@ -4141,7 +5087,7 @@ def run_checks(graph, config_resources, check_cfg,
         out.sort(key=lambda a: (bool(a.get("eligible")), a["role"].lower()))
         return out
 
-    for res in results:
+    for res in raw_results:
         for f in res["findings"]:
             if f.get("az_roles") is not None:
                 continue
@@ -4160,7 +5106,7 @@ def run_checks(graph, config_resources, check_cfg,
     # severity is raised to the most critical directory role it holds.
     sp_dir_tags = sp_dir_resolver
 
-    for res in results:
+    for res in raw_results:
         for f in res["findings"]:
             o = f.get("object_ids") or {}
             sp_ids = o.get("sp", set())
@@ -4170,19 +5116,39 @@ def run_checks(graph, config_resources, check_cfg,
             for sp_oid in sorted(sp_ids):
                 for r in sp_dir_tags(sp_oid):
                     if r["name"] not in merged:
-                        merged[r["name"]] = r
+                        merged[r["name"]] = dict(r)
+                    else:
+                        merge_role_entry(merged[r["name"]], r)
             if not merged:
                 continue
             f["dir_role_tags"] = sorted(
                 merged.values(), key=lambda r: severity_rank(r["severity"]))
-            # eligible (PIM) roles are marker-only: rate by active roles alone
+            # eligible (PIM) roles are marker-only: rate by active roles alone;
+            # AU-scoped/disabled roles never raise a tenant-wide finding.
             active = [r for r in f["dir_role_tags"] if not r.get("eligible")]
             if not active:
                 continue
-            best_rank = min(severity_rank(r["severity"]) for r in active)
+            best_rank = min(severity_rank(role_rating_severity(r)) for r in active)
             if best_rank < severity_rank(f["severity"]):
                 f["severity"] = next(
                     sev for sev, rank in SEVERITY_ORDER.items() if rank == best_rank)
+
+    # ---- severity/suppress filtering runs *after* all severity escalation --
+    results = []
+    for res in raw_results:
+        filtered = []
+        for f in res["findings"]:
+            if severity_rank(f["severity"]) > min_rank:
+                continue
+            key = f"{f['check_id']}:{f['primary_id']}"
+            if key in suppress or f["check_id"] in suppress:
+                continue
+            filtered.append(f)
+        sys.stdout.write(f" {len(filtered)}\n")
+        if filtered:
+            res = dict(res)
+            res["findings"] = filtered
+            results.append(res)
     return results
 
 
@@ -4400,10 +5366,24 @@ def make_profile_builder(graph, check_cfg, group_roles=None, group_eligible_role
         ra_by_resource[ra["resource_id"]].append(ra)
         if ra["principal_type"] == "ServicePrincipal":
             ra_by_principal[ra["principal_id"]].append(ra)
-    sp_groups = defaultdict(list)
+    sp_groups = defaultdict(set)
+    group_parents = graph.get("group_parents") or group_parents_index(
+        graph.get("group_member_group"))
     for gid, members in graph["group_member_sp"].items():
         for sid in members:
-            sp_groups[sid].append(gid)
+            sp_groups[sid].add(gid)
+    # The drawer lists effective group memberships (direct + ancestors); the
+    # role paths themselves still use the direct containment edges.
+    for sid, gids in list(sp_groups.items()):
+        stack = list(gids)
+        seen = set(gids)
+        while stack:
+            gid = stack.pop()
+            for parent in group_parents.get(gid, ()):
+                if parent not in seen:
+                    seen.add(parent)
+                    stack.append(parent)
+        sp_groups[sid] = seen
 
     def catalog_entry(value, description):
         return {"value": value,
@@ -4450,14 +5430,15 @@ def make_profile_builder(graph, check_cfg, group_roles=None, group_eligible_role
                 for role in sp_dir_resolver(sp_oid)]
 
     def groups_for(sp_oid):
-        return [{"name": graph["group"][g].get("displayName") or g}
-                for g in sp_groups.get(sp_oid, ())]
+        groups = []
+        for g in sp_groups.get(sp_oid, ()):
+            rec = graph["group"].get(g)
+            if rec is None:
+                continue  # stale link to a group that was not collected
+            groups.append({"id": g, "name": rec.get("displayName") or g})
+        return groups
 
-    def owners_for(sp_oid, app_oids):
-        owner_ids = set()
-        for app_oid in app_oids:
-            owner_ids |= graph["app_owners"].get(app_oid, set())
-        owner_ids |= graph["sp_owners"].get(sp_oid, set())
+    def _human_owner_entries(owner_ids):
         owners = []
         for uid in owner_ids:
             user = graph["user"].get(uid)
@@ -4469,6 +5450,33 @@ def make_profile_builder(graph, check_cfg, group_roles=None, group_eligible_role
                 "type": user.get("userType") or "Member",
                 "enabled": bool(user.get("accountEnabled")),
             })
+        return owners
+
+    def _sp_owner_entries(owner_sps):
+        entries = []
+        for sid in owner_sps:
+            rec = graph["sp"].get(sid)
+            if not rec:
+                continue
+            entries.append({
+                "name": rec.get("displayName") or rec.get("appDisplayName") or sid,
+                "upn": "",
+                "type": "ServicePrincipal",
+                "enabled": bool(rec.get("accountEnabled")),
+            })
+        return entries
+
+    def owners_for(sp_oid, app_oids):
+        owner_ids = set()
+        owner_sps = set()
+        for app_oid in app_oids:
+            app_sps, app_users = app_owner_chain(graph, app_oid)
+            owner_sps |= app_sps
+            owner_ids |= app_users
+        sp_sps, sp_users = sp_owner_details(graph, sp_oid)
+        owner_sps |= sp_sps
+        owner_ids |= sp_users
+        owners = _human_owner_entries(owner_ids) + _sp_owner_entries(owner_sps)
         owners.sort(key=lambda o: (o["name"] or "").lower())
         return owners
 
@@ -4531,40 +5539,52 @@ def make_profile_builder(graph, check_cfg, group_roles=None, group_eligible_role
             return None
         sp_oids = graph["sp_by_appid"].get(app.get("appId"), [])
         granted, assigned, dir_roles, groups = [], [], [], []
-        owner_ids = set(graph["app_owners"].get(app_oid, set()))
+        owner_ids = set()
+        owner_sps = set()
+        app_sps, app_users = app_owner_chain(graph, app_oid)
+        owner_sps |= app_sps
+        owner_ids |= app_users
         for sp_oid in sp_oids:
             prof = sp_profile(sp_oid)
+            if prof is None:
+                continue  # stale app -> SP link; skip rather than fail the drawer
             granted += prof["granted_roles"]
             assigned += prof["assigned_roles"]
             dir_roles += prof["dir_roles"]
             groups += prof["groups"]
-            owner_ids |= graph["sp_owners"].get(sp_oid, set())
-        seen = set()
-        dedup = []
-        for item in granted + assigned:
-            key = (item.get("principal_name"), item.get("role"), item.get("application"), item.get("description"))
-            if key not in seen:
-                seen.add(key)
-                dedup.append(item)
-        owner_list = []
-        for uid in owner_ids:
-            user = graph["user"].get(uid)
-            if not user:
-                continue
-            owner_list.append({"name": user.get("displayName") or uid,
-                               "upn": user.get("userPrincipalName") or "",
-                               "type": user.get("userType") or "Member",
-                               "enabled": bool(user.get("accountEnabled"))})
+            sp_sps, sp_users = sp_owner_details(graph, sp_oid)
+            owner_sps |= sp_sps
+            owner_ids |= sp_users
+
+        def _dedupe(items):
+            seen_items = set()
+            deduped = []
+            for item in items:
+                key = (item.get("principal_name"), item.get("role"),
+                       item.get("application"), item.get("description"))
+                if key not in seen_items:
+                    seen_items.add(key)
+                    deduped.append(item)
+            return deduped
+
+        granted = _dedupe(granted)
+        assigned = _dedupe(assigned)
+        owner_list = _human_owner_entries(owner_ids) + _sp_owner_entries(owner_sps)
         owner_list.sort(key=lambda o: (o["name"] or "").lower())
-        name_seen = set()
-        uniq_roles, uniq_groups = [], []
+        # Directory roles and groups are separate namespaces: a group whose
+        # display name equals a role must not be dropped.
+        role_seen = set()
+        uniq_roles = []
         for r in dir_roles:
-            if r["name"] not in name_seen:
-                name_seen.add(r["name"])
+            if r["name"] not in role_seen:
+                role_seen.add(r["name"])
                 uniq_roles.append(r)
+        group_seen = set()
+        uniq_groups = []
         for g in groups:
-            if g["name"] not in name_seen:
-                name_seen.add(g["name"])
+            key = g.get("id") or g.get("name")
+            if key not in group_seen:
+                group_seen.add(key)
                 uniq_groups.append(g)
         az_roles = []
         for sp_oid in sp_oids:
@@ -4657,7 +5677,7 @@ def cap_annotate(items):
         line = c.get("name") or ""
         roles = c.get("roles") or []
         if roles:
-            line += " — " + ", ".join(f"{r['name']} ({r['severity']})" for r in roles)
+            line += " — " + ", ".join(f"{role_display_name(r)} ({r['severity']})" for r in roles)
         out.append(line)
     return out
 
@@ -4713,6 +5733,9 @@ FIELD_META = {
     "polType": {"label": "Policy type", "width": 110},
     "polCreated": {"label": "Created", "width": 170},
     "polModified": {"label": "Last modified", "width": 170},
+    # --- CA gaps (per-user exclusions) --------------------------------------
+    "caPolicies": {"label": "Excluded policies", "width": 300},
+    "caRoles": {"label": "Privileged roles", "width": 260},
     # --- group --------------------------------------------------------------
     "group": {"label": "Group", "width": 220, "cls": "clickable"},
     "grpType": {"label": "Type", "width": 180},
@@ -4848,8 +5871,13 @@ def _cell_user_upn(f, r):
 
 
 def _cell_roles(f, r):
+    def title(x):
+        text = x.get("source") or ""
+        if x.get("scope") and x.get("scope") != "Tenant-wide":
+            text += f" \u2014 {x['scope']}"
+        return text
     chips = "".join(
-        f'<span class="badge {severity_class(x["severity"])} role-badge" data-role="{esc(x["name"])}" data-role-field="roles" title="{esc(x["source"])}">{esc(x["name"])}</span> '
+        f'<span class="badge {severity_class(x["severity"])} role-badge" data-role="{esc(x["name"])}" data-role-field="roles" title="{esc(title(x))}">{esc(role_display_name(x))}</span> '
         for x in f["roles"])
     return chips, ", ".join(x["name"] for x in f["roles"])
 
@@ -4857,11 +5885,11 @@ def _cell_roles(f, r):
 def _cell_eligible(f, r):
     elig = f.get("eligible_roles") or []
     if "group_id" in f:  # groups table flavour: dash inside the count span
-        titles = "\n".join(f"{x['name']} (PIM eligible)" for x in elig)
+        titles = "\n".join(f"{role_display_name(x)} (PIM eligible)" for x in elig)
         inner = (f'<span class="perm" title="{esc(titles or "")}">'
                  f'{len(elig) if elig else DASH_INNER}</span>')
     else:
-        titles = "\n".join(f"{x['name']} ({x['source']})" for x in elig)
+        titles = "\n".join(f"{role_display_name(x)} ({x['source']})" for x in elig)
         inner = (f'<span class="perm" title="{esc(titles)}">{len(elig)}</span>'
                  if elig else DASH_INNER)
     return inner, ", ".join(x["name"] for x in elig)
@@ -5155,9 +6183,46 @@ def _cell_pol_modified(f, r):
     return (esc(v) if v else DASH_INNER), v
 
 
+def _cell_ca_policies(f, r):
+    names = f.get("ca_excluded_policies") or []
+    if not names:
+        return DASH_INNER, ""
+    chips = "".join(
+        f'<span class="badge badge-info" title="{esc(name)}">{esc(name)}</span> '
+        for name in names)
+    return chips, ", ".join(names)
+
+
+def _cell_ca_roles(f, r):
+    roles = f.get("privileged_role_entries") or []
+    if not roles:
+        return DASH_INNER, ""
+    chips = "".join(
+        f'<span class="badge {severity_class(role.get("severity"))} role-badge" '
+        f'data-role="{esc(role.get("name") or "")}" data-role-field="roles" '
+        f'title="{esc(role.get("name") or "")}">{esc(role.get("name") or "")}</span> '
+        for role in roles)
+    return chips, ", ".join(role.get("name") or "" for role in roles)
+
+
 def _cell_group(f, r):
     v = f.get("group_name") or ""
     return esc(v), v
+
+
+def grp_type_value(f):
+    """Comma-list value for grpType, aligned with the chips shown in the cell
+    (including Mail, Public, Assignable and Auto-membership flags)."""
+    values = list(f.get("types") or [])
+    if f.get("is_public"):
+        values.append("Public")
+    if f.get("assignable"):
+        values.append("Assignable")
+    if f.get("dynamic"):
+        values.append("Auto-membership")
+    if f.get("mail"):
+        values.append("Mail")
+    return ", ".join(values)
 
 
 def _cell_grp_type(f, r):
@@ -5171,16 +6236,12 @@ def _cell_grp_type(f, r):
         chips.append('<span class="tag-chip tag-divergence">Assignable</span>')
     if f.get("mail"):
         chips.append('<span class="tag-chip">Mail</span>')
-    value = ", ".join(types
-                      + (["Public"] if f.get("is_public") else [])
-                      + (["assignable"] if f.get("assignable") else [])
-                      + (["dynamic"] if f.get("dynamic") else []))
-    return ("".join(chips) or DASH_INNER), value
+    return ("".join(chips) or DASH_INNER), grp_type_value(f)
 
 
 def _cell_grp_roles(f, r):
     chips = "".join(
-        f'<span class="badge {severity_class(x["severity"])} role-badge" data-role="{esc(x["name"])}" data-role-field="grpRoles" title="{esc(x["name"])}">{esc(x["name"])}</span> '
+        f'<span class="badge {severity_class(x["severity"])} role-badge" data-role="{esc(x["name"])}" data-role-field="grpRoles" title="{esc(role_display_name(x))}">{esc(role_display_name(x))}</span> '
         for x in f["dir_roles"])
     return (chips or DASH_INNER), ", ".join(x["name"] for x in f["dir_roles"])
 
@@ -5251,11 +6312,13 @@ def _cell_dyn_group(f, r):
 
 def _cell_dyn_rule(f, r):
     rule = f.get("dyn_rule") or ""
+    if rule.strip() in ("", "[]"):
+        rule = ""
     if not rule:
         gid = (r or {}).get("group_id")
         rec = (_graph_of(r).get("group") or {}).get(gid) if gid else None
         rule = (rec or {}).get("membershipRule") or ""
-    if not rule:
+    if rule.strip() in ("", "[]"):
         return _dash_pair()
     return (f'<span class="perm" title="{esc(rule)}">{esc(truncate(rule, 60))}</span>',
             rule)
@@ -5364,7 +6427,7 @@ def _cell_arc_tag(f, r):
 def _cell_arc_az_roles(f, r):
     roles = f.get("arc_roles") or []
     chips = "".join(
-        f'<span class="badge badge-info role-badge" '
+        f'<span class="badge badge-info" '
         f'title="{esc((a.get("scope_label") or a.get("scope") or ""))}">'
         f'{esc(a.get("role") or "")}{" (eligible)" if a.get("eligible") else ""}</span> '
         for a in roles)
@@ -5436,6 +6499,8 @@ FIELD_RENDERERS = {
     "polType": _cell_pol_type,
     "polCreated": _cell_pol_created,
     "polModified": _cell_pol_modified,
+    "caPolicies": _cell_ca_policies,
+    "caRoles": _cell_ca_roles,
     "group": _cell_group,
     "grpType": _cell_grp_type,
     "grpRoles": _cell_grp_roles,
@@ -5515,6 +6580,12 @@ TABLE_SPECS = {
                      "polControls", "polInc", "polExc"],
         "extras": [("polType", "policy"), ("polCreated", "policy"),
                    ("polModified", "policy")],
+    },
+    "table-ca_gaps": {
+        "family": "user",
+        "defaults": ["severity", "user", "userUpn", "caPolicies", "caRoles",
+                     "userStatus"],
+        "extras": [],
     },
     "groups-table": {
         "family": "group",
@@ -5636,6 +6707,34 @@ def default_fields(table_id):
     return list(spec["defaults"]) if spec is not None else []
 
 
+def validate_table_specs():
+    """Import-time guard: every catalog field must have label/width metadata and
+    a renderer, otherwise a header can be emitted without a matching <td> or
+    row_html can silently drop the cell (B-099/B-108)."""
+    errors = []
+    specs = {"table-generic": GENERIC_SPEC}
+    specs.update(TABLE_SPECS)
+    for table_id, spec in specs.items():
+        fields = list(spec["defaults"]) + [field for field, _ in spec["extras"]]
+        seen = set()
+        for field in fields:
+            if field in seen:
+                errors.append(f"{table_id}: duplicate field {field!r}")
+            seen.add(field)
+            if field not in FIELD_META:
+                errors.append(f"{table_id}: {field!r} missing from FIELD_META")
+            if field not in FIELD_RENDERERS:
+                errors.append(f"{table_id}: {field!r} missing from FIELD_RENDERERS")
+    for field in FIELD_RENDERERS:
+        if field not in FIELD_META:
+            errors.append(f"FIELD_RENDERERS: {field!r} missing from FIELD_META")
+    if errors:
+        raise RuntimeError("invalid table specification:\n  " + "\n  ".join(errors))
+
+
+validate_table_specs()
+
+
 def parse_cols_param(raw, table_id):
     """Validate a `cols=` request parameter against the table's catalog."""
     allowed = allowed_fields(table_id)
@@ -5665,15 +6764,16 @@ def row_html(table_id, tr_attrs, key, fields, f, r, collect=None):
     for field in render_list:
         renderer = FIELD_RENDERERS.get(field)
         if renderer is None:
-            continue
+            raise KeyError(f"no FIELD_RENDERERS entry for {table_id}.{field}")
         inner, value = renderer(f, r)
         if field in fields:
             cls = cell_cls(table_id, field, field in extras)
             cls_attr = f' class="{cls}"' if cls else ""
             cells.append(
                 f'<td{cls_attr} data-field="{field}" data-value="{esc(value)}">{inner}</td>')
-        if blob is not None and field in extras \
-                and not (value == "" and inner == DASH_INNER):
+        if blob is not None and field in extras:
+            # Record every extra, including empty ones: shell-rendered tables
+            # must still emit a <td> for each enabled extra column (B-023).
             blob[field] = [inner, value]
     body = "\n          ".join(cells)
     return (f'\n        <tr {tr_attrs} data-detail-key="{key}">\n          {body}\n        </tr>'
@@ -5730,15 +6830,8 @@ def catalog_entry(table_id):
     return {"family": spec["family"], "fields": fields}
 
 
-def user_search_text(f):
-    parts = [f.get("user_display") or "", f.get("user_upn") or "", f.get("severity") or ""]
-    parts += [r["name"] for r in f.get("roles", [])]
-    parts += [r["name"] for r in f.get("eligible_roles", [])]
-    parts += [g.get("name") or "" for g in f.get("groups", [])]
-    parts += [a.get("role", "") for a in f.get("az_roles", [])]
-    if f.get("hybrid"):
-        parts.append("AD")
-    return " ".join(parts).lower()
+def user_search_text(f, ctx=None):
+    return serve_search_text("privileged-users-table", f, ctx=ctx)
 
 
 def user_sort_value(f, key, ctx=None):
@@ -5784,7 +6877,7 @@ def user_rows_html(findings, start=0, stop=None, q="", sort_key=None, desc=False
     items = findings
     if q:
         q = q.lower()
-        items = [f for f in items if q in user_search_text(f)]
+        items = [f for f in items if q in serve_search_text(tid, f, ctx=ctx)]
     if sort_key:
         items = sorted(items, key=lambda f: user_sort_value(f, sort_key, ctx),
                        reverse=bool(desc))
@@ -5832,12 +6925,8 @@ def page_rows(findings, q, sort_key, desc, start, stop, search_text, sort_value)
 
 # ---- legacy owned/unowned rows ---------------------------------------------
 
-def legacy_search_text(f):
-    parts = [o.get("display_name") or "" for o in f.get("owners", [])] + \
-            [o.get("upn") or "" for o in f.get("owners", [])] + \
-            [f.get("display_name") or "", f.get("resource_name") or "",
-             f.get("permission") or "", f.get("severity") or ""]
-    return " ".join(parts).lower()
+def legacy_search_text(f, owner=None, ctx=None):
+    return serve_search_text("owned-table", f, owner=owner, ctx=ctx)
 
 
 def sp_extra_sort_value(sp_id, app_id, key, ctx):
@@ -5863,8 +6952,8 @@ def owner_attr_sort_value(rec, key):
 OWNER_FIELDS = ("owner", "ownerUpn", "ownerStatus") + OWNER_USER_FIELDS
 
 
-def legacy_sort_value(f, key, ctx=None):
-    owner = (f.get("owners") or [{}])[0]
+def legacy_sort_value(f, key, ctx=None, owner=None):
+    owner = owner if owner is not None else (f.get("owners") or [{}])[0]
     if key == "severity":
         return severity_rank(f.get("severity", "Info"))
     if key == "owner":
@@ -5899,45 +6988,40 @@ def legacy_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=No
     tid = "owned-table"
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
-    items = findings
+    # One row per (finding, owner), filtered and sorted at the same row level
+    # as the rendered table. Previously plain search matched any owner of a
+    # finding and then emitted every owner row (B-052).
+    rows = [(f, owner) for f in findings for owner in (f.get("owners") or [])]
     if q:
         needle = q.lower()
-        items = [f for f in items if needle in legacy_search_text(f)]
+        rows = [(f, owner) for f, owner in rows
+                if needle in serve_search_text(tid, f, owner=owner, ctx=ctx)]
     if sort_key:
-        items = sorted(items, key=lambda f: legacy_sort_value(f, sort_key, ctx),
-                       reverse=bool(desc))
+        rows = sorted(rows, key=lambda pair: legacy_sort_value(
+            pair[0], sort_key, ctx, owner=pair[1]), reverse=bool(desc))
     else:
-        items = sorted(
-            items,
-            key=lambda f: (severity_rank(f.get("severity", "Info")),
-                           str(f.get("title") or "").lower()))
-    total = sum(len(f.get("owners") or []) for f in items)
+        rows = sorted(
+            rows,
+            key=lambda pair: (severity_rank(pair[0].get("severity", "Info")),
+                              str(pair[0].get("title") or "").lower()))
+    total = len(rows)
     if stop is None:
         stop = total
     out = []
-    row_index = 0
-    for f in items:
-        for owner in f.get("owners") or []:
-            if row_index >= stop:
-                break
-            if row_index >= start:
-                key = f"row-{row_index}"
-                r = {"graph": (ctx or {}).get("graph"), "owner": owner,
-                     "tid": tid, "sp_id": f.get("principal_id"),
-                     "app_id": f.get("app_object_id")}
-                tr_attrs = (f'data-sp-id="{esc(f["principal_id"])}" '
-                            f'data-app-id="{esc(f["app_object_id"] or "")}" '
-                            f'data-owner-id="{esc(owner["object_id"])}"')
-                out.append(row_html(tid, tr_attrs, key, fields, f, r))
-            row_index += 1
-        if row_index >= stop:
-            break
+    for row_index, (f, owner) in enumerate(rows[start:stop]):
+        key = f"row-{start + row_index}"
+        r = {"graph": (ctx or {}).get("graph"), "owner": owner,
+             "tid": tid, "sp_id": f.get("principal_id"),
+             "app_id": f.get("app_object_id")}
+        tr_attrs = (f'data-sp-id="{esc(f["principal_id"])}" '
+                    f'data-app-id="{esc(f["app_object_id"] or "")}" '
+                    f'data-owner-id="{esc(owner["object_id"])}"')
+        out.append(row_html(tid, tr_attrs, key, fields, f, r))
     return out, total
 
 
-def unowned_search_text(f):
-    return " ".join([f.get("display_name") or "", f.get("resource_name") or "",
-                     f.get("permission") or "", f.get("severity") or ""]).lower()
+def unowned_search_text(f, ctx=None):
+    return serve_search_text("unowned-table", f, ctx=ctx)
 
 
 def unowned_sort_value(f, key, ctx=None):
@@ -5967,7 +7051,7 @@ def legacy_unowned_rows_html(findings, q="", sort_key=None, desc=False, start=0,
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                            unowned_search_text,
+                            lambda f: serve_search_text(tid, f, ctx=ctx),
                             lambda f, k: unowned_sort_value(f, k, ctx))
     out = []
     for f in selected:
@@ -5983,10 +7067,8 @@ def legacy_unowned_rows_html(findings, q="", sort_key=None, desc=False, start=0,
 
 # ---- generic (per-check) rows ----------------------------------------------
 
-def generic_search_text(f):
-    t = f.get("target") or {}
-    return " ".join([t.get("name") or "", t.get("type") or "", t.get("id") or "",
-                     f.get("severity") or ""]).lower()
+def generic_search_text(f, ctx=None):
+    return serve_search_text("table-generic", f, ctx=ctx)
 
 
 def generic_sort_value(f, key, ctx=None):
@@ -6030,7 +7112,7 @@ def generic_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=N
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                            generic_search_text,
+                            lambda f: serve_search_text(tid, f, ctx=ctx),
                             lambda f, k: generic_sort_value(f, k, ctx))
     out = []
     for f in selected:
@@ -6053,15 +7135,8 @@ def generic_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=N
 
 # ---- azure arc rows ---------------------------------------------------------
 
-def arc_search_text(f):
-    parts = [f.get("machine_name") or "", f.get("arc_principal") or "",
-             f.get("arc_provider") or "", f.get("arc_sub") or "",
-             f.get("arc_rg") or "", f.get("arc_resource_id") or "",
-             f.get("pw_expiry") or "", f.get("severity") or ""]
-    parts += [a.get("role", "") for a in f.get("arc_roles", [])]
-    if f.get("arc_tagged"):
-        parts.append("AzureArcSPN")
-    return " ".join(parts).lower()
+def arc_search_text(f, table_id="arc-principals-table", ctx=None):
+    return serve_search_text(table_id, f, ctx=ctx)
 
 
 def arc_sort_value(f, key, ctx=None):
@@ -6096,6 +7171,19 @@ def arc_sort_value(f, key, ctx=None):
         return sp_extra_sort_value(next(iter(o.get("sp", ()) or ()), ""), "", key, ctx)
     if key == "id":
         return ((f.get("target") or {}).get("id") or "").lower()
+    if key in OWNER_FIELDS:
+        oid = (f.get("target") or {}).get("id") or ""
+        owner = ({}
+                 if (f.get("arc_principal_type") or "") != "Service Principal"
+                 else (sp_owner_dict(oid, (ctx or {}).get("graph")) or {}))
+        if key == "owner":
+            return (owner.get("display_name") or "").lower()
+        if key == "ownerUpn":
+            return (owner.get("upn") or "").lower()
+        if key == "ownerStatus":
+            return 0 if owner.get("enabled") else 1
+        return owner_attr_sort_value(
+            graph_user_record((ctx or {}).get("graph"), owner.get("object_id")), key)
     return 0
 
 
@@ -6105,7 +7193,8 @@ def arc_machines_rows_html(findings, q="", sort_key=None, desc=False, start=0, s
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                                arc_search_text, lambda f, k: arc_sort_value(f, k, ctx))
+                                lambda f: serve_search_text(tid, f, ctx=ctx),
+                                lambda f, k: arc_sort_value(f, k, ctx))
     out = []
     for f in selected:
         sp_id = (f.get("target") or {}).get("id") or ""
@@ -6122,7 +7211,8 @@ def arc_principals_rows_html(findings, q="", sort_key=None, desc=False, start=0,
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                                arc_search_text, lambda f, k: arc_sort_value(f, k, ctx))
+                                lambda f: serve_search_text(tid, f, ctx=ctx),
+                                lambda f, k: arc_sort_value(f, k, ctx))
     out = []
     graph = (ctx or {}).get("graph")
     for f in selected:
@@ -6149,7 +7239,8 @@ def arc_providers_rows_html(findings, q="", sort_key=None, desc=False, start=0, 
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                                arc_search_text, lambda f, k: arc_sort_value(f, k, ctx))
+                                lambda f: serve_search_text(tid, f, ctx=ctx),
+                                lambda f, k: arc_sort_value(f, k, ctx))
     out = []
     for f in selected:
         sp_id = (f.get("target") or {}).get("id") or ""
@@ -6169,10 +7260,8 @@ ARC_TABLE_ROWS = {
 
 # ---- app directory roles rows ------------------------------------------------
 
-def app_dir_search_text(f):
-    t = f.get("target") or {}
-    roles = ", ".join(r["name"] for r in f.get("dir_role_tags", []))
-    return " ".join([t.get("name") or "", f.get("severity") or "", roles]).lower()
+def app_dir_search_text(f, ctx=None):
+    return serve_search_text("app-dir-roles-table", f, ctx=ctx)
 
 
 def app_dir_role_chip(r):
@@ -6182,11 +7271,13 @@ def app_dir_role_chip(r):
         title = r["name"] + " \u2014 PIM eligible"
         if r.get("path"):
             title += " \u2014 via " + " \u2192 ".join(r["path"])
-        label = f'{esc(r["name"])} <span class="muted">(PIM)</span>'
+        label = f'{esc(role_display_name(r))} <span class="muted">(PIM)</span>'
     else:
         title = (r["name"] + " \u2014 via " + " \u2192 ".join(r["path"])
                  if r.get("path") else r["name"] + " \u2014 direct assignment")
-        label = esc(r["name"])
+        label = esc(role_display_name(r))
+    if r.get("scope") and r.get("scope") != "Tenant-wide":
+        title += f" \u2014 {r['scope']}"
     return (f'<span class="badge {severity_class(r["severity"])} role-badge" '
             f'data-role="{esc(r["name"])}" data-role-field="roles" '
             f'title="{esc(title)}">{label}</span> ')
@@ -6228,7 +7319,7 @@ def app_dir_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=N
     fields = list(columns) if columns else list(spec["defaults"])
     need_owner = any(x in fields for x in OWNER_FIELDS)
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                                app_dir_search_text,
+                                lambda f: serve_search_text(tid, f, ctx=ctx),
                                 lambda f, k: app_dir_sort_value(f, k, ctx))
     out = []
     for f in selected:
@@ -6244,17 +7335,8 @@ def app_dir_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=N
 
 # ---- app / service-principal inventory rows ----------------------------------
 
-def app_inventory_search_text(f):
-    t = f.get("target") or {}
-    owners = f.get("inventory_owners") or []
-    roles = ", ".join(r["name"] for r in f.get("dir_role_tags", []))
-    return " ".join([
-        t.get("name") or "", f.get("inventory_type") or "",
-        f.get("inventory_app_id") or "", f.get("inventory_sp_type") or "",
-        (f.get("status") or {}).get("label") or "", f.get("severity") or "",
-        " ".join(o.get("display_name") or "" for o in owners),
-        " ".join(o.get("upn") or "" for o in owners), roles,
-    ]).lower()
+def app_inventory_search_text(f, ctx=None):
+    return serve_search_text("app-inventory-table", f, ctx=ctx)
 
 
 def app_inventory_sort_value(f, key, ctx=None):
@@ -6301,7 +7383,7 @@ def app_inventory_rows_html(findings, q="", sort_key=None, desc=False, start=0,
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                                app_inventory_search_text,
+                                lambda f: serve_search_text(tid, f, ctx=ctx),
                                 lambda f, k: app_inventory_sort_value(f, k, ctx))
     out = []
     for f in selected:
@@ -6320,11 +7402,8 @@ def app_inventory_rows_html(findings, q="", sort_key=None, desc=False, start=0,
 
 # ---- groups / dynamic rows ---------------------------------------------------
 
-def group_search_text(f):
-    roles = ", ".join(r["name"] for r in f.get("dir_roles", []))
-    elig = ", ".join(r["name"] for r in f.get("eligible_roles", []))
-    return " ".join([f.get("group_name") or "", f.get("severity") or "",
-                     roles, elig, " ".join(f.get("types", []))]).lower()
+def group_search_text(f, ctx=None):
+    return serve_search_text("groups-table", f, ctx=ctx)
 
 
 def group_sort_value(f, key, ctx=None):
@@ -6355,7 +7434,7 @@ def group_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=Non
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                            group_search_text,
+                            lambda f: serve_search_text(tid, f, ctx=ctx),
                             lambda f, k: group_sort_value(f, k, ctx))
     out = []
     for f in selected:
@@ -6367,10 +7446,8 @@ def group_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=Non
     return out, total
 
 
-def dynamic_search_text(f):
-    return " ".join([f.get("group_name") or "", f.get("dyn_rule") or "",
-                     " ".join(f.get("dyn_attrs", [])),
-                     " ".join(f.get("dyn_mods", []))]).lower()
+def dynamic_search_text(f, ctx=None):
+    return serve_search_text("dynamic-groups-table", f, ctx=ctx)
 
 
 def dynamic_sort_value(f, key, ctx=None):
@@ -6395,7 +7472,7 @@ def dynamic_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=N
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                            dynamic_search_text,
+                            lambda f: serve_search_text(tid, f, ctx=ctx),
                             lambda f, k: dynamic_sort_value(f, k, ctx))
     out = []
     for f in selected:
@@ -6409,11 +7486,8 @@ def dynamic_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=N
 
 # ---- AD roster rows -----------------------------------------------------------
 
-def ad_search_text(f):
-    return " ".join([f.get("user_display") or "", f.get("user_upn") or "",
-                     f.get("ad_cn") or "", f.get("ad_dn") or "",
-                     f.get("ad_sid") or "", " ".join(f.get("tags", [])),
-                     " ".join(x.get("name") or "" for x in f.get("ca_exclusions", []))]).lower()
+def ad_search_text(f, ctx=None):
+    return serve_search_text("ad-sync-users-table", f, ctx=ctx)
 
 
 def ad_sort_value(f, key, ctx=None):
@@ -6447,7 +7521,7 @@ def ad_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                            ad_search_text,
+                            lambda f: serve_search_text(tid, f, ctx=ctx),
                             lambda f, k: ad_sort_value(f, k, ctx))
     out = []
     for f in selected:
@@ -6476,7 +7550,7 @@ def _serve_pager():
 
 def realm_card_html(meta):
     """Realm summary above the AD-synced users table: realm, SID prefix, synced
-    count, and DC hosts — hosts are capped at 10 with a dropdown for the rest."""
+    count, and AD-bound hosts — hosts are capped at 10 with a dropdown for the rest."""
     parts = []
     if meta.get("domain"):
         parts.append(f"Realm: <b>{esc(meta['domain'])}</b>")
@@ -6490,7 +7564,7 @@ def realm_card_html(meta):
         if len(hosts) > 10:
             host_html += (f' <details class="inline-more"><summary>+{len(hosts) - 10} more</summary>'
                           f'<span> {esc(", ".join(hosts[10:]))}</span></details>')
-        parts.append("DC hosts: " + host_html)
+        parts.append("AD-bound hosts: " + host_html)
     if not parts:
         return ""
     return '<div class="realm">' + " \u00b7 ".join(parts) + "</div>"
@@ -6498,11 +7572,12 @@ def realm_card_html(meta):
 
 JS_FILTER_MODULE = """<script id="filter-module">
 // Advanced filter query language — mirrors the Python grammar in
-// entra-surface.py (parse_advanced_query); both are pinned against the same
-// test vectors in tests/filter_cases.json.
+// entra-surface.py (parse_advanced_query); keep both in sync when extending
+// the grammar or alias tables.
 (function() {
-  var LIST_FIELDS = {roles:1, eligible:1, grproles:1, dynmods:1, dynattrs:1,
+  var LIST_FIELDS = {roles:1, eligible:1, grproles:1, grptype:1, dynmods:1, dynattrs:1,
     azroles:1, azusrroles:1, azsproles:1, adtags:1, appdirroles:1,
+    polapps:1, polcontrols:1, arcazroles:1, capolicies:1, caroles:1,
     owner:1, ownerupn:1, ownerstatus:1};
 
   // column-name aliases -> DOM field names (any-match), mirrored from Python
@@ -6511,7 +7586,7 @@ JS_FILTER_MODULE = """<script id="filter-module">
     roles: ['roles', 'grproles', 'appdirroles'],
     grproles: ['grproles'], appdirroles: ['appdirroles'],
     eligible: ['eligible'],
-    user: ['user'], upn: ['userupn'], userupn: ['userupn'],
+    user: ['user'], upn: ['userupn', 'upn'], userupn: ['userupn'],
     privapps: ['privapps'], capablegrp: ['capgroups'], capgroups: ['capgroups'],
     groupsowned: ['grpowned'], grpowned: ['grpowned'], caexcl: ['caexcl'],
     accountsource: ['hybrid'], hybrid: ['hybrid'],
@@ -6535,6 +7610,8 @@ JS_FILTER_MODULE = """<script id="filter-module">
     controls: ['polcontrols'], polcontrols: ['polcontrols'],
     included: ['polinc'], polinc: ['polinc'],
     excluded: ['polexc'], polexc: ['polexc'],
+    capolicies: ['capolicies'], excludedpolicies: ['capolicies'],
+    caroles: ['caroles'], privilegedroles: ['caroles'],
     application: ['app'], app: ['app'],
     owner: ['owner'], ownerupn: ['ownerupn'],
     resource: ['resource'], permission: ['permission'],
@@ -6582,6 +7659,7 @@ JS_FILTER_MODULE = """<script id="filter-module">
     onprempwchange: 'On-prem pw change', targetingtags: 'Targeting tags',
     appid: 'App ID', spty: 'SP type', poltype: 'Policy type',
     polcreated: 'Created', polmodified: 'Last modified', immutableid: 'Immutable ID',
+    capolicies: 'Excluded policies', caroles: 'Privileged roles',
     check: 'Check', category: 'Category'
   };
 
@@ -6593,13 +7671,20 @@ JS_FILTER_MODULE = """<script id="filter-module">
     ['Target Status', 'status'], ['Object ID', 'objectid'],
     ['Role assignment', 'roleassignment'], ['SP Status', 'spstatus'],
     ['Owner UPN', 'ownerupn'], ['Owner Status', 'ownerstatus'],
+    ['Owner Source', 'ownersource'], ['Owner AD DN', 'owneraddn'],
+    ['Owner SID', 'ownersid'], ['Owner Immutable ID', 'ownerimmutableid'],
     ['Membership rule', 'membershiprule'],
     ['Referenced attributes', 'referencedattributes'],
+    ['Modifiable by', 'modifiableby'],
     ['attribute modifiable by', 'modifiableby'],
+    ['Modifiable by', 'modifiableby'],
     ['AD CN', 'adcn'], ['AD DN', 'addn'],
     ['On-prem pw change', 'onprempwchange'], ['Targeting tags', 'targetingtags'],
     ['App ID', 'appid'], ['SP type', 'spty'], ['Policy type', 'poltype'],
-    ['Immutable ID', 'immutableid']
+    ['Created', 'polcreated'], ['Last modified', 'polmodified'],
+    ['Immutable ID', 'immutableid'],
+    ['Excluded policies', 'capolicies'],
+    ['Privileged roles', 'caroles']
   ];
 
   var BS = String.fromCharCode(92);  // backslash, avoids escape-layering with Python strings
@@ -6740,6 +7825,18 @@ JS_FILTER_MODULE = """<script id="filter-module">
         var idx = word.indexOf(':');
         var field = word.slice(0, idx), rest = word.slice(idx + 1);
         if (!field) return {op: 'text', value: word};
+        if (field.toUpperCase() === 'CONTAINS') {
+          // bare contains: / contains: value is a text predicate (B-033)
+          if (!rest) {
+            var vt0 = peek();
+            if (!vt0 || (vt0.t !== 'word' && vt0.t !== 'quoted')) {
+              throw new Error("expected value after 'contains:'");
+            }
+            advance();
+            return {op: 'text', value: consumeValueWords(vt0.v)};
+          }
+          return {op: 'text', value: consumeValueWords(rest)};
+        }
         if (!rest) {
           var vt = peek();
           if (!vt || (vt.t !== 'word' && vt.t !== 'quoted')) {
@@ -6760,7 +7857,6 @@ JS_FILTER_MODULE = """<script id="filter-module">
           return {op: 'contains', fields: resolveField(field),
                   value: consumeValueWords(rest.slice('contains:'.length))};
         }
-        if (field.toUpperCase() === 'CONTAINS') return {op: 'text', value: rest};
         if (field.toUpperCase() === 'UNIQ') {
           var names = rest.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
           if (!names.length) {
@@ -6830,16 +7926,18 @@ JS_FILTER_MODULE = """<script id="filter-module">
     if (op === 'eq' || op === 'contains') {
       var needle = ast.value.toLowerCase();
       var hasGlob = needle.indexOf('*') !== -1;
-      for (var f = 0; f < ast.fields.length; f++) {
-        var field = ast.fields[f];
-        var value = (fl[field] || '').toLowerCase();
+      var fieldList = ast.fields || [];
+      for (var f = 0; f < fieldList.length; f++) {
+        var field = fieldList[f];
+        var fieldL = String(field).toLowerCase();
+        var value = (fl[fieldL] || '').toLowerCase();
         if (op === 'contains') {
           if (hasGlob) {
             if (globMatches(needle, value, true)) return true;
           } else if (value.indexOf(needle) !== -1) {
             return true;
           }
-        } else if (LIST_FIELDS[field]) {
+        } else if (LIST_FIELDS[fieldL]) {
           if (hasGlob) {
             var items = value.split(',');
             for (var j = 0; j < items.length; j++) {
@@ -6891,14 +7989,12 @@ JS_FILTER_MODULE = """<script id="filter-module">
 
 # ---- conditional-access policy rows ------------------------------------------
 
-def ca_search_text(f):
-    ch = f.get("conditions_html") or {}
-    return " ".join([f.get("policy_name") or "", f.get("state") or "",
-                     f.get("scope") or "",
-                     " ".join(ch.get("apps") or []),
-                     " ".join(ch.get("controls") or []),
-                     " ".join(f.get("included") or []),
-                     " ".join(f.get("excluded") or [])]).lower()
+def ca_search_text(f, ctx=None):
+    return serve_search_text("table-ca_exposure", f, ctx=ctx)
+
+
+def ca_gaps_search_text(f, ctx=None):
+    return serve_search_text("table-ca_gaps", f, ctx=ctx)
 
 
 def ca_sort_value(f, key, ctx=None):
@@ -6935,7 +8031,7 @@ def ca_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
     spec = table_spec(tid)
     fields = list(columns) if columns else list(spec["defaults"])
     selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                                ca_search_text,
+                                lambda f: serve_search_text(tid, f, ctx=ctx),
                                 lambda f, k: ca_sort_value(f, k, ctx))
     out = []
     for f in selected:
@@ -6943,6 +8039,41 @@ def ca_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
         r = {"graph": (ctx or {}).get("graph"), "tid": tid,
              "policy_id": f.get("policy_id")}
         tr_attrs = f'data-policy-id="{esc(f.get("policy_id", ""))}"'
+        out.append(row_html(tid, tr_attrs, key, fields, f, r))
+    return out, total
+
+
+def ca_gaps_sort_value(f, key, ctx=None):
+    if key == "severity":
+        return severity_rank(f.get("severity", "Info"))
+    if key == "user":
+        return (f.get("user_display") or "").lower()
+    if key == "userUpn":
+        return (f.get("user_upn") or "").lower()
+    if key == "caPolicies":
+        return ", ".join(f.get("ca_excluded_policies") or []).lower()
+    if key == "caRoles":
+        return ", ".join(f.get("privileged_roles") or []).lower()
+    if key == "userStatus":
+        return 0 if f.get("user_enabled") else 1
+    return 0
+
+
+def ca_gaps_rows_html(findings, q="", sort_key=None, desc=False, start=0,
+                      stop=None, columns=None, ctx=None):
+    tid = "table-ca_gaps"
+    spec = table_spec(tid)
+    fields = list(columns) if columns else list(spec["defaults"])
+    selected, total = page_rows(findings, q, sort_key, desc, start, stop,
+                                lambda f: serve_search_text(tid, f, ctx=ctx),
+                                lambda f, k: ca_gaps_sort_value(f, k, ctx))
+    out = []
+    for f in selected:
+        key = f"row-{len(out)}"
+        r = {"graph": (ctx or {}).get("graph"), "tid": tid,
+             "profile_id": f.get("user_id")}
+        tr_attrs = (f'data-profile-id="{esc(f.get("user_id", ""))}" '
+                    f'data-user-id="{esc(f.get("user_id", ""))}"')
         out.append(row_html(tid, tr_attrs, key, fields, f, r))
     return out, total
 
@@ -6960,11 +8091,15 @@ def render_report(results, tenant_name, db_path, config_path,
     extras_blobs = {}
     catalog_tids = []
 
-    def register_catalog_table(tid, findings, rows_fn, search_fn):
-        """Register a catalog-driven table for serving and the column catalog."""
+    def register_catalog_table(tid, findings, rows_fn, search_fn=None):
+        """Register a catalog-driven table for serving and the column catalog.
+        Search text is derived from the same field map as the rendered cells
+        (search_fn is accepted for call-site compatibility)."""
         if serve_tables is not None:
             serve_tables[tid] = {"findings": findings, "rows": rows_fn,
-                                 "search": search_fn, "ctx": col_ctx}
+                                 "search": lambda f, _tid=tid: serve_search_text(
+                                     _tid, f, ctx=col_ctx),
+                                 "ctx": col_ctx}
         if tid not in catalog_tids:
             catalog_tids.append(tid)
 
@@ -7084,11 +8219,7 @@ def render_report(results, tenant_name, db_path, config_path,
     {unowned_pager}
     {'<div class="empty">No unowned privileged applications found.</div>' if not unowned else ''}
   </section>
-""" + azure_roles_section(
-        "Azure Roles (service principals)", "azure-roles-apps", "apps",
-        az_rows_for(graph["az_sp_roles"], "sp",
-                    lambda oid: ((graph["sp"].get(oid) or {}).get("displayName")
-                                 or (oid if oid in graph["sp"] else None))))
+"""
 
     # ---- generic findings sections ---------------------------------------
     def generic_section(res):
@@ -7136,9 +8267,29 @@ def render_report(results, tenant_name, db_path, config_path,
         return f"""
   <section data-category="configs"{caview}>
     <h2>{esc(res["title"])}</h2>
+    <p class="sub">{esc(res["description"])}</p>
     <div class="table-scroll">
     <table id="table-ca_exposure" class="findings" data-serve="1">
       {table_head_html("table-ca_exposure")}
+      <tbody>{rows_html}</tbody>
+    </table>
+    </div>
+    {pager}
+  </section>
+"""
+
+    def ca_gaps_section(res):
+        rows_html = catalog_rows("table-ca_gaps", res["findings"],
+                               ca_gaps_rows_html, ca_gaps_search_text)
+        pager = serve_pager()
+        caview = ' data-caview="main"'
+        return f"""
+  <section data-category="configs"{caview}>
+    <h2>{esc(res["title"])}</h2>
+    <p class="sub">{esc(res["description"])}</p>
+    <div class="table-scroll">
+    <table id="table-ca_gaps" class="findings" data-serve="1">
+      {table_head_html("table-ca_gaps")}
       <tbody>{rows_html}</tbody>
     </table>
     </div>
@@ -7162,14 +8313,11 @@ def render_report(results, tenant_name, db_path, config_path,
     </div>
     {pager}
   </section>
-""" + azure_roles_section(
-        "Azure Roles (groups)", "azure-roles-groups", "groups",
-        az_rows_for(graph["az_roles"], "group",
-                    lambda gid: ((graph["group"].get(gid) or {}).get("displayName")
-                                 or (gid if gid in graph["group"] else None))))
+"""
 
     def dynamic_groups_table(res):
-        dyn = [f for f in res["findings"] if f.get("dyn_rule")]
+        dyn = [f for f in res["findings"]
+               if f.get("dynamic") and (f.get("dyn_rule") or "").strip() not in ("", "[]")]
         if not dyn:
             return ""
         rows_html = catalog_rows("dynamic-groups-table", dyn, dynamic_rows_html,
@@ -7203,12 +8351,7 @@ def render_report(results, tenant_name, db_path, config_path,
     </div>
     {pager}
   </section>
-""" + azure_roles_section(
-        "Azure Roles (users)", "azure-roles-users", "users",
-        az_rows_for(graph["az_user_roles"], "user",
-                    lambda uid: (lambda u: ((u.get("userPrincipalName")
-                                             or u.get("displayName") or uid) if u else None))(
-                        graph["user"].get(uid))))
+"""
 
     # ---- app directory roles section --------------------------------------
     def app_dir_roles_section(res):
@@ -7330,17 +8473,57 @@ def render_report(results, tenant_name, db_path, config_path,
     </div>
     {pager}
   </section>
-""" + azure_roles_section(
-        "Azure Roles (synced users)", "azure-roles-ad", "ad",
-        az_rows_for(
-            {uid: roles for uid, roles in graph["az_user_roles"].items()
-             if (graph["user"].get(uid) or {}).get("dirSyncEnabled") in (1, True)},
-            "user",
-            lambda uid: (lambda u: ((u.get("userPrincipalName")
-                                     or u.get("displayName") or uid) if u else None))(
-                graph["user"].get(uid))))
+"""
+
+    # ---- Azure Roles sections (independent of check result presence) ------
+    def _az_map(name):
+        return (graph or {}).get(name) or {}
+
+    def azure_apps_section():
+        return azure_roles_section(
+            "Azure Roles (service principals)", "azure-roles-apps", "apps",
+            az_rows_for(_az_map("az_sp_roles"), "sp",
+                        lambda oid: ((_az_map("sp").get(oid) or {}).get("displayName")
+                                     or (oid if oid in _az_map("sp") else None))))
+
+    def azure_groups_section():
+        return azure_roles_section(
+            "Azure Roles (groups)", "azure-roles-groups", "groups",
+            az_rows_for(_az_map("az_roles"), "group",
+                        lambda gid: ((_az_map("group").get(gid) or {}).get("displayName")
+                                     or (gid if gid in _az_map("group") else None))))
+
+    def azure_users_section():
+        return azure_roles_section(
+            "Azure Roles (users)", "azure-roles-users", "users",
+            az_rows_for(_az_map("az_user_roles"), "user",
+                        lambda uid: (lambda u: ((u.get("userPrincipalName")
+                                                 or u.get("displayName") or uid)
+                                                if u else None))(
+                            _az_map("user").get(uid))))
+
+    def azure_ad_section():
+        synced = {uid: roles for uid, roles in _az_map("az_user_roles").items()
+                  if (_az_map("user").get(uid) or {}).get("dirSyncEnabled") in (1, True)}
+        return azure_roles_section(
+            "Azure Roles (synced users)", "azure-roles-ad", "ad",
+            az_rows_for(synced, "user",
+                        lambda uid: (lambda u: ((u.get("userPrincipalName")
+                                                 or u.get("displayName") or uid)
+                                                if u else None))(
+                            _az_map("user").get(uid))))
 
     sections_html = []
+    azure_rendered = set()
+
+    def append_azure(table_id, builder):
+        if table_id in azure_rendered:
+            return
+        azure_rendered.add(table_id)
+        html = builder()
+        if html:
+            sections_html.append(html)
+
     diff_entries = []
     if diff:
         for f in diff.get("added") or []:
@@ -7355,6 +8538,7 @@ def render_report(results, tenant_name, db_path, config_path,
                                          ((e["f"].get("target") or {}).get("name")
                                           or "").lower()))
     app_dir_rendered = False
+    ca_gaps_rendered = False
     for res in results:
         if res["id"] == "priv_app_ownership":
             owned_html = legacy_owned_section()
@@ -7369,16 +8553,25 @@ def render_report(results, tenant_name, db_path, config_path,
             unowned_html = legacy_unowned_section()
             if unowned_html:
                 sections_html.append(unowned_html)
+            append_azure("azure-roles-apps", azure_apps_section)
         elif res["id"] == "app_dir_roles":
             if not app_dir_rendered:
                 sections_html.append(app_dir_roles_section(res))
                 app_dir_rendered = True
+        elif res["id"] == "ca_gaps":
+            # Normally rendered directly under the CA policy inventory above;
+            # this branch covers configs where ca_exposure is disabled.
+            if not ca_gaps_rendered:
+                sections_html.append(ca_gaps_section(res))
+                ca_gaps_rendered = True
         elif res["id"] == "app_inventory":
             sections_html.append(app_inventory_section(res))
         elif res["id"] == "privileged_users":
             sections_html.append(users_section(res))
+            append_azure("azure-roles-users", azure_users_section)
         elif res["id"] == "groups":
             sections_html.append(groups_section(res))
+            append_azure("azure-roles-groups", azure_groups_section)
             dyn_html = dynamic_groups_table(res)
             if dyn_html:
                 sections_html.append(dyn_html)
@@ -7393,6 +8586,12 @@ def render_report(results, tenant_name, db_path, config_path,
   </section>
 """)
             sections_html.append(ca_section(res))
+            # Per-user exclusion gaps render as their own table directly under
+            # the policy inventory (the on-demand coverage analysis follows).
+            ca_gaps_res = next((r for r in results if r["id"] == "ca_gaps"), None)
+            if ca_gaps_res:
+                sections_html.append(ca_gaps_section(ca_gaps_res))
+                ca_gaps_rendered = True
             sections_html.append("""
   <section data-category="configs" data-caview="main">
     <h2>CA coverage analysis</h2>
@@ -7410,7 +8609,7 @@ def render_report(results, tenant_name, db_path, config_path,
           <option value="">All</option><option>browser</option><option>mobileAppsAndDesktopClients</option><option>exchangeActiveSync</option><option>other</option>
         </select></label>
         <label>Mode <select id="ca-mode"><option value="fast">Fast</option><option value="full">Full</option></select></label>
-        <label>Max scenarios <input type="number" id="ca-max-scenarios" class="ca-small-input" value="24" min="0" max="500"></label>
+        <label>Max scenarios/path <input type="number" id="ca-max-scenarios" class="ca-small-input" value="24" min="0" max="500"></label>
         <label class="ca-check"><input type="checkbox" id="ca-synced"> Synced only</label>
         <label class="ca-check"><input type="checkbox" id="ca-include-disabled" checked> Include disabled</label>
       </div>
@@ -7483,6 +8682,7 @@ def render_report(results, tenant_name, db_path, config_path,
             sections_html.append(ad_summary_card(res))
         elif res["id"] == "ad_sync_users":
             sections_html.append(ad_users_section(res))
+            append_azure("azure-roles-ad", azure_ad_section)
         elif res["id"] == "azure_arc_machines":
             sections_html.append(arc_section(res, "arc-machines-table"))
         elif res["id"] == "azure_arc_sps":
@@ -7491,6 +8691,14 @@ def render_report(results, tenant_name, db_path, config_path,
             sections_html.append(arc_section(res, "arc-providers-table"))
         else:
             sections_html.append(generic_section(res))
+
+    # The Azure Roles sections are sourced from graph data, not from the check
+    # that happens to render nearby: render any that were not reached because
+    # the related check is disabled or produced no findings (B-057).
+    append_azure("azure-roles-apps", azure_apps_section)
+    append_azure("azure-roles-groups", azure_groups_section)
+    append_azure("azure-roles-users", azure_users_section)
+    append_azure("azure-roles-ad", azure_ad_section)
 
     # ---- changes since the last analysis (diff against the cache) ---------
     if diff_entries:
@@ -7553,6 +8761,9 @@ def render_report(results, tenant_name, db_path, config_path,
         "dynmods", "dynattrs", "adtags", "targettype", "status", "hybrid",
         "userstatus", "spstatus", "ownerstatus", "adstatus", "polstate",
         "resource", "permission", "appid", "sptype", "appdirroles",
+        "capolicies", "caroles",
+        "owner", "ownerupn", "ownersource", "owneraddn", "ownersid",
+        "ownerimmutableid",
         "arcmachine", "arcprincipal", "arcprincipaltype", "arctag",
         "arcazroles", "arcprovider", "arcsub", "arcrg", "arcstatus",
     }
@@ -7568,12 +8779,15 @@ def render_report(results, tenant_name, db_path, config_path,
 
     for res in results:
         for f in res["findings"]:
-            for k, v in serve_field_map(_serve_table_id(res["id"]), f).items():
+            for k, v in serve_field_map(_serve_table_id(res["id"]), f,
+                                        ctx=col_ctx).items():
                 if k.lower() in SUGGEST_VALUE_FIELDS:
                     for item in v.split(","):
                         _suggest_add(k.lower(), item)
-            if res["id"] == "groups" and f.get("dyn_rule"):
-                for k, v in serve_field_map("dynamic-groups-table", f).items():
+            if res["id"] == "groups" and f.get("dynamic") \
+                    and (f.get("dyn_rule") or "").strip() not in ("", "[]"):
+                for k, v in serve_field_map("dynamic-groups-table", f,
+                                            ctx=col_ctx).items():
                     if k.lower() in SUGGEST_VALUE_FIELDS:
                         for item in v.split(","):
                             _suggest_add(k.lower(), item)
@@ -8019,6 +9233,8 @@ def render_report(results, tenant_name, db_path, config_path,
   .ca-status li {{ padding: 3px 0; font-size: 13px; color: var(--text-muted); }}
   .ca-status li.done {{ color: var(--text-primary); }}
   .ca-status li.done::before {{ content: "\\2713 "; color: var(--status-good); }}
+  .ca-status li.running {{ color: var(--text-primary); font-weight: 500; }}
+  .ca-status li.running::before {{ content: "\\2026 "; color: var(--accent); }}
   .ca-status li.error {{ color: var(--status-critical); }}
   .ca-status li .step-detail {{ color: var(--text-muted); margin-left: 6px; font-size: 12px; }}
   th.col-drag-source {{ opacity: 0.45; }}
@@ -8029,6 +9245,9 @@ def render_report(results, tenant_name, db_path, config_path,
   section[data-category] {{ margin-top: 26px; }}
   section.hidden {{ display: none; }}
   .hidden {{ display: none; }}
+  /* higher-specificity layout rules must not resurrect hidden controls */
+  .drawer-tabs.hidden {{ display: none; }}
+  .ca-whatif label.hidden {{ display: none; }}
   section h2 {{ font-size: 15px; font-weight: 600; margin: 0 0 4px; }}
   section .sub {{ color: var(--text-secondary); font-size: 12px; margin: 0 0 10px; }}
   .table-scroll {{
@@ -8970,7 +10189,8 @@ def render_report(results, tenant_name, db_path, config_path,
         rec.__ids = {{
           sp: row.getAttribute('data-sp-id') || '',
           app: row.getAttribute('data-app-id') || '',
-          owner: row.getAttribute('data-owner-id') || ''
+          owner: row.getAttribute('data-owner-id') || '',
+          profile: row.getAttribute('data-profile-id') || ''
         }};
         rec.__gid = row.getAttribute('data-group-id') || '';
         rec.__pid = row.getAttribute('data-policy-id') || '';
@@ -8998,11 +10218,52 @@ def render_report(results, tenant_name, db_path, config_path,
   var PERMISSION_APPS = {{}};
   try {{ PERMISSION_APPS = JSON.parse(document.getElementById('permission-apps-data').textContent); }} catch (e) {{}}
 
+  var drilldownSeq = 0;
+  var drilldownAbort = null;
+
+  function beginDrilldownRequest() {{
+    drilldownSeq += 1;
+    if (drilldownAbort) {{
+      try {{ drilldownAbort.abort(); }} catch (e) {{}}
+    }}
+    drilldownAbort = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    return {{ seq: drilldownSeq, signal: drilldownAbort ? drilldownAbort.signal : null }};
+  }}
+
+  function isCurrentDrilldown(token) {{
+    return !!token && token.seq === drilldownSeq;
+  }}
+
+  function isAbortError(err) {{
+    return !!err && err.name === 'AbortError';
+  }}
+
+  function clearDrilldownTable(message) {{
+    theadRow.innerHTML = '';
+    tbody.innerHTML = '';
+    if (message) {{
+      var tr = document.createElement('tr');
+      var td = document.createElement('td');
+      td.className = 'muted';
+      td.textContent = message;
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    }}
+  }}
+
   function closeDrilldown() {{
+    drilldownSeq += 1;  // ignore any in-flight response
+    if (drilldownAbort) {{
+      try {{ drilldownAbort.abort(); }} catch (e) {{}}
+      drilldownAbort = null;
+    }}
     overlay.classList.add('hidden');
     tabsWrap.classList.add('hidden');
+    tabsWrap.innerHTML = '';
     usersScroll.classList.remove('hidden');
     appsScroll.classList.add('hidden');
+    clearDrilldownTable('');
+    subtitleEl.textContent = '';
   }}
 
   var CONTAINS_FIELDS = {{ roles: true, eligible: true, grpRoles: true, dynMods: true, dynAttrs: true, azRoles: true, azUsrRoles: true, azSpRoles: true }};
@@ -9022,34 +10283,51 @@ def render_report(results, tenant_name, db_path, config_path,
   }}
 
   function openDrilldown(field, value) {{
+    if (value === '' || value == null) return;  // never query for an empty value
     if (isRoleDrilldown(field)) {{ openRoleDrilldown(field, value); return; }}
+    var token = beginDrilldownRequest();
     tabsWrap.classList.add('hidden');
+    tabsWrap.innerHTML = '';
     usersScroll.classList.remove('hidden');
     appsScroll.classList.add('hidden');
+    // set the title immediately and replace the previous entity's rows with a
+    // loading state so a slow response can never expose stale content
+    titleEl.textContent = (FIELD_LABELS[field] || field) + ': ' + value;
+    subtitleEl.textContent = 'Loading\u2026';
+    clearDrilldownTable('Loading\u2026');
+    overlay.classList.remove('hidden');
     if (SERVE_DRILLDOWN_FIELDS[field]) {{
-      fetch('/api/drilldown?field=' + encodeURIComponent(field) + '&value=' + encodeURIComponent(value))
-        .then(function(r) {{ return r.json(); }})
+      var opts = token.signal ? {{ signal: token.signal }} : undefined;
+      fetch('/api/drilldown?field=' + encodeURIComponent(field) + '&value=' + encodeURIComponent(value), opts)
+        .then(function(r) {{
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        }})
         .then(function(d) {{
+          if (!isCurrentDrilldown(token)) return;
           if (!d || d.rows_html == null) {{ fillUsersLocal(field, value); return; }}
           titleEl.textContent = d.title;
           subtitleEl.textContent = d.subtitle;
           theadRow.innerHTML = d.thead_html;
           tbody.innerHTML = d.rows_html;
-          overlay.classList.remove('hidden');
         }})
-        .catch(function() {{ fillUsersLocal(field, value); overlay.classList.remove('hidden'); }});
+        .catch(function(err) {{
+          if (isAbortError(err) || !isCurrentDrilldown(token)) return;
+          fillUsersLocal(field, value);
+        }});
       return;
     }}
-    titleEl.textContent = (FIELD_LABELS[field] || field) + ': ' + value;
     fillUsersLocal(field, value);
-    overlay.classList.remove('hidden');
   }}
 
   function fillUsersLocal(field, value) {{
+    var wanted = String(value).split(',').map(function(x) {{ return x.trim(); }})
+        .filter(function(x) {{ return x; }});
     var matches = allRecords.filter(function(r) {{
       var v = r[field] || '';
       if (CONTAINS_FIELDS[field]) {{
-        return v.split(',').map(function(x) {{ return x.trim(); }}).indexOf(value) >= 0;
+        var have = String(v).split(',').map(function(x) {{ return x.trim(); }});
+        return wanted.length && wanted.every(function(x) {{ return have.indexOf(x) >= 0; }});
       }}
       return v === value;
     }});
@@ -9071,6 +10349,7 @@ def render_report(results, tenant_name, db_path, config_path,
       tr.setAttribute('data-sp-id', r.__ids.sp);
       tr.setAttribute('data-app-id', r.__ids.app);
       tr.setAttribute('data-owner-id', r.__ids.owner);
+      tr.setAttribute('data-profile-id', r.__ids.profile || r.__ids.owner || '');
       tr.setAttribute('data-group-id', r.__gid || '');
       tr.setAttribute('data-policy-id', r.__pid || '');
       tr.setAttribute('data-detail-key', 'dd-' + matches.length + '-' + rIdx);
@@ -9104,6 +10383,15 @@ def render_report(results, tenant_name, db_path, config_path,
       tdr.appendChild(tdc);
       tbody.appendChild(tdr);
     }});
+    if (!matches.length) {{
+      var emptyTr = document.createElement('tr');
+      var emptyTd = document.createElement('td');
+      emptyTd.colSpan = columns.length + 1;
+      emptyTd.className = 'muted';
+      emptyTd.textContent = 'No matching findings.';
+      emptyTr.appendChild(emptyTd);
+      tbody.appendChild(emptyTr);
+    }}
   }}
 
   function fillAppsPane(value, isPermission) {{
@@ -9249,6 +10537,8 @@ def render_report(results, tenant_name, db_path, config_path,
   }}
 
   function openRoleDrilldown(field, value) {{
+    if (value === '' || value == null) return;
+    var token = beginDrilldownRequest();
     var isPermission = field === 'permission';
     var entries = (isPermission ? PERMISSION_APPS[value] : ROLE_APPS[value]) || [];
     var ownerSeen = {{}};
@@ -9280,15 +10570,27 @@ def render_report(results, tenant_name, db_path, config_path,
           + (entries.length === 1 ? ' principal holds this permission' : ' principals hold this permission')
           + (ownerCount ? ' \u00b7 ' + ownerCount + ' recorded owner(s)' : ' \u00b7 no recorded owners');
     }} else if (SERVE_DRILLDOWN_FIELDS[field]) {{
-      fetch('/api/drilldown?field=' + encodeURIComponent(field) + '&value=' + encodeURIComponent(value))
-        .then(function(r) {{ return r.json(); }})
+      // drop the previous role's users immediately; only this request's
+      // response may repopulate the shared table
+      clearDrilldownTable('Loading\u2026');
+      subtitleEl.textContent = 'Loading\u2026';
+      var opts = token.signal ? {{ signal: token.signal }} : undefined;
+      fetch('/api/drilldown?field=' + encodeURIComponent(field) + '&value=' + encodeURIComponent(value), opts)
+        .then(function(r) {{
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        }})
         .then(function(d) {{
+          if (!isCurrentDrilldown(token)) return;
           if (!d || d.rows_html == null) {{ fillUsersLocal(field, value); return; }}
           subtitleEl.textContent = d.subtitle;
           theadRow.innerHTML = d.thead_html;
           tbody.innerHTML = d.rows_html;
         }})
-        .catch(function() {{ fillUsersLocal(field, value); }});
+        .catch(function(err) {{
+          if (isAbortError(err) || !isCurrentDrilldown(token)) return;
+          fillUsersLocal(field, value);
+        }});
     }} else {{
       fillUsersLocal(field, value);
     }}
@@ -9309,29 +10611,52 @@ def render_report(results, tenant_name, db_path, config_path,
   document.addEventListener('click', function(e) {{
     var badge = e.target.closest('.role-badge');
     if (!badge) return;
+    var value = badge.getAttribute('data-role') || '';
+    if (!value) return;  // decorative/unmapped chip: never open an empty drilldown
     e.stopPropagation();
-    openDrilldown(badge.getAttribute('data-role-field') || 'roles', badge.getAttribute('data-role') || '');
+    openDrilldown(badge.getAttribute('data-role-field') || 'roles', value);
   }});
   document.addEventListener('click', function(e) {{
     var tag = e.target.closest('.filter-tag');
     if (!tag) return;
+    var value = tag.getAttribute('data-filter-value') || '';
+    if (!value) return;
     e.stopPropagation();
-    openDrilldown(tag.getAttribute('data-filter-field') || '', tag.getAttribute('data-filter-value') || '');
+    openDrilldown(tag.getAttribute('data-filter-field') || '', value);
   }});
 
   document.getElementById('drilldown-close').addEventListener('click', closeDrilldown);
   overlay.addEventListener('click', function(e) {{ if (e.target === overlay) closeDrilldown(); }});
   document.addEventListener('keydown', function(e) {{ if (e.key === 'Escape') closeDrilldown(); }});
 
-  allTables().forEach(function(table) {{
-    table.tBodies[0].addEventListener('click', function(e) {{
-      var cell = e.target.closest('td.clickable');
-      if (!cell || !table.contains(cell)) return;
-      var field = cell.getAttribute('data-field');
-      var value = cell.getAttribute('data-value');
-      if (!field || !value) return;
-      openDrilldown(field, value);
-    }});
+  // One delegated handler covers tables present at load time and CA-result
+  // tables created later by caRenderResults. The identity/app capture
+  // handlers above run first and stop propagation for object-cell clicks.
+  document.addEventListener('click', function(e) {{
+    var cell = e.target.closest('td.clickable');
+    if (!cell) return;
+    var table = cell.closest('table.findings');
+    if (!table || !table.tBodies.length) return;
+    var row = cell.closest('tr');
+    var field = cell.getAttribute('data-field');
+    var value = cell.getAttribute('data-value');
+    if (!field || !value) return;
+    if (table.getAttribute('data-ca-result') === '1') {{
+      // CA result rows are not registered as server drilldown records; open
+      // the object drawer for policy cells, and let the capture handlers deal
+      // with user/app cells. Other CA text cells are informational.
+      if (field === 'polName' && row && row.getAttribute('data-policy-id')) {{
+        var drawerRow = row.nextElementSibling;
+        var alreadyOpen = !!(drawerRow && drawerRow.classList.contains('drawer')
+                             && drawerRow.classList.contains('open'));
+        if (!alreadyOpen) {{
+          var expand = row.querySelector('.expand-btn');
+          if (expand) expand.click();
+        }}
+      }}
+      return;
+    }}
+    openDrilldown(field, value);
   }});
 }})();
 
@@ -9347,9 +10672,20 @@ def render_report(results, tenant_name, db_path, config_path,
   function pEsc(s) {{
     return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }}
+
+  function activeDrawerTab(container) {{
+    var active = container ? container.querySelector('.drawer-tabs-wrap .drawer-tab.active') : null;
+    return active ? (active.getAttribute('data-dtab') || '') : '';
+  }}
   function pSev(sev) {{
     var cls = {{ Critical: 'sev-critical', High: 'sev-high', Medium: 'sev-medium', Low: 'sev-low' }}[sev] || 'sev-info';
     return '<span class="badge ' + cls + '">' + pEsc(sev) + '</span>';
+  }}
+  function pRoleName(r) {{
+    var label = r.name || '';
+    if (r.disabled) label += ' (disabled role)';
+    else if (r.scope && r.scope !== 'Tenant-wide') label += ' [' + r.scope + ']';
+    return pEsc(label);
   }}
   function pSection(label, html) {{
     return '<div class="detail-section"><h4>' + pEsc(label) + '</h4>' + html + '</div>';
@@ -9421,7 +10757,12 @@ def render_report(results, tenant_name, db_path, config_path,
       var pub = isSp ? (rec.publisherName || '') : (rec.publisherDomain || '');
       if (pub) kvRows.push(['Publisher', pub]);
       if (isSp) {{
-        kvRows.push(['Status', rec.accountEnabled === false ? 'Disabled' : 'Enabled']);
+        var spEnabled = rec.accountEnabled;
+        var spStatus = (spEnabled === undefined || spEnabled === null || spEnabled === '')
+            ? 'Unknown'
+            : ((spEnabled === true || spEnabled === 1 || spEnabled === '1' || spEnabled === 'true')
+                ? 'Enabled' : 'Disabled');
+        kvRows.push(['Status', spStatus]);
         if (prof.application) {{
           var appVal = prof.app_oid
               ? '<button type="button" class="app-link" data-app-oid="' + pEsc(prof.app_oid) + '">' + pEsc(prof.application) + '</button>'
@@ -9582,7 +10923,7 @@ def render_report(results, tenant_name, db_path, config_path,
     }});
   }}
 
-  function renderPolicyTabs(pol, container) {{
+  function renderPolicyTabs(pol, container, activeTab) {{
     var kv = [['Name', pol.policy_name || ''],
               ['ObjectId', pol.policy_id || ''],
               ['State', pol.state || '?'],
@@ -9616,11 +10957,12 @@ def render_report(results, tenant_name, db_path, config_path,
       ['included', 'Included users (' + (pol.included ? pol.included.length : 0) + ')', incHtml],
       ['excluded', 'Excluded users (' + (pol.excluded ? pol.excluded.length : 0) + ')', excHtml]
     ];
+    var initialTab = activeTab || 'overview';
     var tabsHtml = '<div class="drawer-tabs">' + panes.map(function(pt) {{
-      return '<button type="button" class="drawer-tab' + (pt[0] === 'overview' ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pEsc(pt[1]) + '</button>';
+      return '<button type="button" class="drawer-tab' + (pt[0] === initialTab ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pEsc(pt[1]) + '</button>';
     }}).join('') + '</div>';
     var panesHtml = panes.map(function(pt) {{
-      return '<div class="dtab-pane' + (pt[0] === 'overview' ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pt[2] + '</div>';
+      return '<div class="dtab-pane' + (pt[0] === initialTab ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pt[2] + '</div>';
     }}).join('');
     var wrap = document.createElement('div');
     wrap.className = 'drawer-tabs-wrap';
@@ -9629,7 +10971,7 @@ def render_report(results, tenant_name, db_path, config_path,
     attachDrawerTabs(wrap);
   }}
 
-  function renderGroupTabs(g, container) {{
+  function renderGroupTabs(g, container, activeTab) {{
     var kvRows = [
       ['Name', g.group_name || ''],
       ['ObjectId', g.group_id || ''],
@@ -9644,15 +10986,17 @@ def render_report(results, tenant_name, db_path, config_path,
       return '<tr><th>' + pEsc(r[0]) + '</th><td>' + pEsc(r[1]) + '</td></tr>';
     }}).join('') + '</table>';
     var dirRolesHtml = (g.dir_roles && g.dir_roles.length)
-        ? '<p>' + g.dir_roles.map(function(r) {{ return pSev(r.severity) + ' ' + pEsc(r.name); }}).join(' &nbsp;&middot;&nbsp; ') + '</p>'
+        ? '<p>' + g.dir_roles.map(function(r) {{ return pSev(r.severity) + ' ' + pRoleName(r); }}).join(' &nbsp;&middot;&nbsp; ') + '</p>'
         : '<p class="muted">No directory roles assigned to this group.</p>';
     var eligRolesHtml = (g.eligible_roles && g.eligible_roles.length)
-        ? '<p>' + g.eligible_roles.map(function(r) {{ return '<button type="button" class="elig-link dtab-sp-link" data-elig-role="' + pEsc(r.name) + '">' + pSev(r.severity) + ' ' + pEsc(r.name) + '</button> <span class="muted">(PIM eligible)</span>'; }}).join(' &nbsp;&middot;&nbsp; ') + '</p>'
+        ? '<p>' + g.eligible_roles.map(function(r) {{ return '<button type="button" class="elig-link dtab-sp-link" data-elig-role="' + pEsc(r.name) + '">' + pSev(r.severity) + ' ' + pRoleName(r) + '</button> <span class="muted">(PIM eligible)</span>'; }}).join(' &nbsp;&middot;&nbsp; ') + '</p>'
         : '';
     var ownersHtml = (g.owners && g.owners.length)
         ? '<p>' + g.owners.map(function(o) {{ return pEsc(o); }}).join(', ') + '</p>'
         : '<p class="muted">No owners recorded.</p>';
     var membershipHtml = '<p class="muted">' + (g.user_member_count || 0) + ' user member(s)';
+    if (g.device_member_count) membershipHtml += ' · ' + g.device_member_count + ' device member(s)';
+    if (g.nested_group_count) membershipHtml += ' · ' + g.nested_group_count + ' nested group(s)';
     if (g.sp_members && g.sp_members.length) membershipHtml += ' · ' + g.sp_members.length + ' app member(s): ' + pEsc(g.sp_members.map(function(m) {{ return m.name; }}).join(', '));
     if (g.parents && g.parents.length) membershipHtml += ' · member of: ' + pEsc(g.parents.join(', '));
     if (g.children && g.children.length) membershipHtml += ' · contains groups: ' + pEsc(g.children.join(', '));
@@ -9684,7 +11028,7 @@ def render_report(results, tenant_name, db_path, config_path,
     var memberRows = shownMembers.map(function(m) {{
       var roleHtml = (m.roles || []).filter(function(r) {{ return r.severity !== 'Info'; }})
           .map(function(r) {{
-            var tag = pSev(r.severity) + ' ' + pEsc(r.name);
+            var tag = pSev(r.severity) + ' ' + pRoleName(r);
             if (r.path && r.path.length > 1) {{
               tag += ' <span class="muted">via ' + pEsc(r.path.join(' \u2192 ')) + '</span>';
             }}
@@ -9710,7 +11054,7 @@ def render_report(results, tenant_name, db_path, config_path,
     var spMemberRows = shownSpMembers.map(function(m) {{
       var roleHtml = (m.roles || []).filter(function(r) {{ return r.severity !== 'Info'; }})
           .map(function(r) {{
-            var tag = pSev(r.severity) + ' ' + pEsc(r.name);
+            var tag = pSev(r.severity) + ' ' + pRoleName(r);
             if (r.kind === 'app') {{
               tag += ' <span class="muted">@ ' + pEsc(r.resource || 'app role') + '</span>';
             }} else if (r.path && r.path.length > 1) {{
@@ -9738,11 +11082,12 @@ def render_report(results, tenant_name, db_path, config_path,
       ['user-members', 'User Members (' + (g.user_member_count || 0) + ')', membersHtml],
       ['sp-members', 'App Members (' + (g.sp_members ? g.sp_members.length : 0) + ')', spMembersHtml]
     ];
+    var initialTab = activeTab || 'overview';
     var tabsHtml = '<div class="drawer-tabs">' + panes.map(function(pt) {{
-      return '<button type="button" class="drawer-tab' + (pt[0] === 'overview' ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pEsc(pt[1]) + '</button>';
+      return '<button type="button" class="drawer-tab' + (pt[0] === initialTab ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pEsc(pt[1]) + '</button>';
     }}).join('') + '</div>';
     var panesHtml = panes.map(function(pt) {{
-      return '<div class="dtab-pane' + (pt[0] === 'overview' ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pt[2] + '</div>';
+      return '<div class="dtab-pane' + (pt[0] === initialTab ? ' active' : '') + '" data-dtab="' + pt[0] + '">' + pt[2] + '</div>';
     }}).join('');
     var wrap = document.createElement('div');
     wrap.className = 'drawer-tabs-wrap';
@@ -9753,6 +11098,7 @@ def render_report(results, tenant_name, db_path, config_path,
       b.addEventListener('click', function() {{
         var oid = b.getAttribute('data-obj-id');
         var kind = b.getAttribute('data-obj-kind');
+        var returnTab = activeDrawerTab(container) || 'overview';
         container.innerHTML = '';
         var backRow = document.createElement('div');
         backRow.className = 'drawer-back-row';
@@ -9761,7 +11107,7 @@ def render_report(results, tenant_name, db_path, config_path,
         Array.prototype.forEach.call(backRow.querySelectorAll('.drawer-back'), function(x) {{
           x.addEventListener('click', function() {{
             container.innerHTML = '';
-            renderGroupTabs(g, container);
+            renderGroupTabs(g, container, returnTab);
           }});
         }});
         var prof2 = PROFILES2.sp[oid];
@@ -10121,12 +11467,12 @@ def render_report(results, tenant_name, db_path, config_path,
     }}
     var factors = [];
     (p.roles || []).forEach(function(r) {{
-      factors.push(pSev(r.severity) + ' ' + pEsc(r.name)
+      factors.push(pSev(r.severity) + ' ' + pRoleName(r)
           + ' <span class="muted">\u2014 via ' + pEsc(viaSource(r.source)) + '</span>');
     }});
     (p.eligible_roles || []).forEach(function(r) {{
       factors.push('<button type="button" class="elig-link dtab-sp-link" data-elig-role="' + pEsc(r.name) + '">'
-          + pSev(r.severity) + ' ' + pEsc(r.name) + '</button>'
+          + pSev(r.severity) + ' ' + pRoleName(r) + '</button>'
           + ' <span class="muted">\u2014 via ' + pEsc(viaSource(r.source)) + '</span>');
     }});
     (p.priv_apps || []).forEach(function(a) {{
@@ -10175,14 +11521,14 @@ def render_report(results, tenant_name, db_path, config_path,
     }}
     var html = '';
     html += pSection('Directory roles', cappedListHtml(p.roles, function(r) {{
-      return '<li>' + pSev(r.severity) + ' ' + pEsc(r.name) + ' <span class="muted">(' + pEsc(r.source) + ')</span></li>';
+      return '<li>' + pSev(r.severity) + ' ' + pRoleName(r) + ' <span class="muted">(' + pEsc(r.source) + ')</span></li>';
     }}));
     html += pSection('Eligible (PIM) roles', cappedListHtml(p.eligible_roles, function(r) {{
       var extra = '';
       if (r.schedule && r.schedule.permanent) extra = ' <span class="tag-chip tag-privileged">permanent</span>';
       if (r.path && r.path.length) extra += ' <span class="muted">via ' + pEsc(r.path.join(' \u2192 ')) + '</span>';
       return '<li><button type="button" class="elig-link dtab-sp-link" data-elig-role="' + pEsc(r.name) + '">'
-          + pSev(r.severity) + ' ' + pEsc(r.name) + '</button>' + extra + '</li>';
+          + pSev(r.severity) + ' ' + pRoleName(r) + '</button>' + extra + '</li>';
     }}));
     html += pSection('Privileged objects owned', cappedListHtml(p.priv_apps, function(a) {{
       var grants = a.grants.map(function(g) {{
@@ -10201,7 +11547,7 @@ def render_report(results, tenant_name, db_path, config_path,
     html += pSection('Owned role-capable groups (' + ownedCap.length + ')',
         cappedListHtml(ownedCap, function(g) {{
           var roles = (g.roles || []).map(function(r) {{
-            return pSev(r.severity) + ' ' + pEsc(r.name);
+            return pSev(r.severity) + ' ' + pRoleName(r);
           }}).join(' &nbsp;&middot;&nbsp; ');
           return '<li><b>' + pEsc(g.name) + '</b>'
               + (roles ? ' &mdash; ' + roles : '') + '</li>';
@@ -10327,72 +11673,121 @@ def render_report(results, tenant_name, db_path, config_path,
     return null;
   }}
 
+  function activateDrawerTab(container, tab) {{
+    if (!container || !tab) return;
+    var found = false;
+    Array.prototype.forEach.call(container.querySelectorAll('.drawer-tabs-wrap .drawer-tab'), function(x) {{
+      var match = x.getAttribute('data-dtab') === tab;
+      x.classList.toggle('active', match);
+      if (match) found = true;
+    }});
+    if (!found) return;
+    Array.prototype.forEach.call(container.querySelectorAll('.drawer-tabs-wrap .dtab-pane'), function(x) {{
+      x.classList.toggle('active', x.getAttribute('data-dtab') === tab);
+    }});
+  }}
+
+  function markDrawerFilled(drawer) {{
+    if (!drawer) return;
+    delete drawer.dataset.loading;
+    drawer.dataset.filled = '1';
+  }}
+
+  function markDrawerFailed(drawer) {{
+    if (!drawer) return;
+    delete drawer.dataset.loading;
+    delete drawer.dataset.filled;  // let a later click retry a failed fetch
+  }}
+
   function populateDrawer(row) {{
     var drawer = drawerFor(row);
-    if (!drawer || drawer.dataset.filled) return;
-    drawer.dataset.filled = '1';
+    if (!drawer || drawer.dataset.filled || drawer.dataset.loading) return;
     var body = drawer.querySelector('.drawer-body');
     if (!body) return;
+    drawer.dataset.loading = '1';
+    body.innerHTML = '';
+    var returnTab = drawer.__returnTab || '';
+    delete drawer.__returnTab;
+    var finished = false;
+    function done(ok) {{
+      if (finished) return;
+      finished = true;
+      if (ok) {{
+        activateDrawerTab(body, returnTab);
+        markDrawerFilled(drawer);
+      }} else {{
+        markDrawerFailed(drawer);
+      }}
+    }}
     var spId2 = row.getAttribute('data-sp-id') || '';
     var appId2 = row.getAttribute('data-app-id') || '';
     if (spId2 && !PROFILES2.sp[spId2]) {{
       // the SP profile may not be cached yet even when the app profile is
       // (e.g. after navigating app -> back); prefer the SP drawer
-      fetchSpApp(spId2, 'sp', body);
+      fetchSpApp(spId2, 'sp', body, done);
       return;
     }}
     var prof2 = (spId2 && PROFILES2.sp[spId2]) ? PROFILES2.sp[spId2]
               : (appId2 && PROFILES2.app[appId2]) ? PROFILES2.app[appId2] : null;
     if (prof2) {{
       var rec2 = (spId2 && PROFILES2.sp[spId2]) ? (DETAILS.sp[spId2] || null) : (DETAILS.app[appId2] || null);
-      renderSpAppTabs(prof2, rec2, body);
+      if (!rec2) {{
+        // The profile is cached but the raw/details fetch failed earlier;
+        // retry both rather than leaving the Raw tab permanently empty.
+        fetchSpApp(spId2 || appId2, spId2 ? 'sp' : 'app', body, done);
+        return;
+      }}
+      renderSpAppTabs(prof2, rec2, body, returnTab);
+      done(true);
       return;
     }}
     if (spId2 || appId2) {{
-      fetchSpApp(spId2 || appId2, spId2 ? 'sp' : 'app', body);
+      fetchSpApp(spId2 || appId2, spId2 ? 'sp' : 'app', body, done);
       return;
     }}
     var profileId = row.getAttribute('data-profile-id') || '';
     var p = PROFILES[profileId];
     if (profileId && p) {{
-      renderProfileTabs(p, body);
+      renderProfileTabs(p, body, returnTab);
+      done(true);
       return;
     }}
     if (profileId) {{
-      fetch('/api/user/' + encodeURIComponent(profileId)).then(function(r) {{ return r.json(); }}).then(function(prof) {{
-        if (prof && prof.user_id) {{
-          PROFILES[profileId] = prof;
-          renderProfileTabs(prof, body);
-        }} else {{
-          var mp = document.createElement('p');
-          mp.className = 'muted';
-          mp.textContent = 'No captured signals for this user.';
-          body.appendChild(mp);
-        }}
-      }}).catch(function() {{
-        var mp = document.createElement('p');
-        mp.className = 'muted';
-        mp.textContent = 'Failed to load profile.';
-        body.appendChild(mp);
-      }});
+      fetch('/api/user/' + encodeURIComponent(profileId))
+        .then(function(r) {{ return r.ok ? r.json() : null; }})
+        .catch(function() {{ return null; }})
+        .then(function(prof) {{
+          if (prof && prof.user_id && !prof.error) {{
+            PROFILES[profileId] = prof;
+            renderProfileTabs(prof, body, returnTab);
+            done(true);
+            return;
+          }}
+          // Not every row with data-profile-id is a privileged-user finding;
+          // fall back to the raw user record so '+/identity' still works.
+          body.innerHTML = '';
+          fetchDetailsAll([['user', profileId]], body, done);
+        }});
       return;
     }}
     var gid2 = row.getAttribute('data-group-id') || '';
     if (gid2 && GROUPS[gid2]) {{
-      renderGroupTabs(GROUPS[gid2], body);
+      renderGroupTabs(GROUPS[gid2], body, returnTab);
+      done(true);
       return;
     }}
     if (gid2) {{
-      fetchProfile('group', gid2, function(g) {{ renderGroupTabs(g, body); }}, body);
+      fetchProfile('group', gid2, function(g) {{ renderGroupTabs(g, body, returnTab); }}, body, done);
       return;
     }}
     var pid2 = row.getAttribute('data-policy-id') || '';
     if (pid2 && POLICIES[pid2]) {{
-      renderPolicyTabs(POLICIES[pid2], body);
+      renderPolicyTabs(POLICIES[pid2], body, returnTab);
+      done(true);
       return;
     }}
     if (pid2) {{
-      fetchProfile('policy', pid2, function(pol) {{ renderPolicyTabs(pol, body); }}, body);
+      fetchProfile('policy', pid2, function(pol) {{ renderPolicyTabs(pol, body, returnTab); }}, body, done);
       return;
     }}
     var wants = [];
@@ -10400,12 +11795,11 @@ def render_report(results, tenant_name, db_path, config_path,
     if (row.getAttribute('data-app-id')) wants.push(['app', row.getAttribute('data-app-id')]);
     if (row.getAttribute('data-sp-id')) wants.push(['sp', row.getAttribute('data-sp-id')]);
     if (wants.length) {{
-      fetchDetailsAll(wants, body);
+      fetchDetailsAll(wants, body, done);
       return;
     }}
-    if (!body.children.length) {{
-      body.appendChild(mutedP('No additional details captured for this object.'));
-    }}
+    body.appendChild(mutedP('No additional details captured for this object.'));
+    done(true);
   }}
 
   function mutedP(msg) {{
@@ -10415,52 +11809,110 @@ def render_report(results, tenant_name, db_path, config_path,
     return mp;
   }}
 
-  function fetchProfile(kind, oid, cb, body) {{
-    fetch('/api/profile/' + kind + '/' + encodeURIComponent(oid)).then(function(r) {{ return r.json(); }}).then(function(data) {{
-      if (!data || data.error) {{ body.appendChild(mutedP('No data for this object.')); return; }}
-      if (kind === 'group') GROUPS[oid] = data;
-      else if (kind === 'policy') POLICIES[oid] = data;
-      cb(data);
-    }}).catch(function() {{ body.appendChild(mutedP('Failed to load.')); }});
+  function fetchProfile(kind, oid, cb, body, doneCb) {{
+    fetch('/api/profile/' + kind + '/' + encodeURIComponent(oid))
+      .then(function(r) {{
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      }})
+      .then(function(data) {{
+        if (!data || data.error) {{
+          body.appendChild(mutedP('No data for this object.'));
+          if (doneCb) doneCb(false);
+          return;
+        }}
+        if (kind === 'group') GROUPS[oid] = data;
+        else if (kind === 'policy') POLICIES[oid] = data;
+        cb(data);
+        if (doneCb) doneCb(true);
+      }})
+      .catch(function() {{
+        body.appendChild(mutedP('Failed to load.'));
+        if (doneCb) doneCb(false);
+      }});
   }}
 
-  function fetchSpApp(oid, kind, body) {{
-    var p1 = fetch('/api/profile/' + kind + '/' + encodeURIComponent(oid)).then(function(r) {{ return r.json(); }});
-    var p2 = fetch('/api/details/' + kind + '/' + encodeURIComponent(oid)).then(function(r) {{ return r.json(); }}).catch(function() {{ return null; }});
+  function fetchSpApp(oid, kind, body, doneCb) {{
+    var p1 = fetch('/api/profile/' + kind + '/' + encodeURIComponent(oid)).then(function(r) {{
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }});
+    var p2 = fetch('/api/details/' + kind + '/' + encodeURIComponent(oid))
+      .then(function(r) {{
+        if (!r.ok) return {{ ok: false, data: null }};
+        return r.json().then(function(data) {{ return {{ ok: true, data: data }}; }});
+      }})
+      .catch(function() {{ return {{ ok: false, data: null }}; }});
     Promise.all([p1, p2]).then(function(res) {{
-      var prof = res[0], rec = res[1];
-      if (!prof || prof.error) {{ body.appendChild(mutedP('No data for this principal.')); return; }}
+      var prof = res[0], recInfo = res[1] || {{ ok: false, data: null }};
+      var rec = recInfo.data;
+      if (!prof || prof.error) {{
+        body.appendChild(mutedP('No data for this principal.'));
+        if (doneCb) doneCb(false);
+        return;
+      }}
       if (rec && rec.error) rec = null;  // details missing: render from the profile alone
-      if (kind === 'sp') {{ PROFILES2.sp[oid] = prof; DETAILS.sp[oid] = rec; }}
-      else {{ PROFILES2.app[oid] = prof; DETAILS.app[oid] = rec; }}
+      if (kind === 'sp') {{
+        PROFILES2.sp[oid] = prof;
+        if (rec) DETAILS.sp[oid] = rec;
+        else delete DETAILS.sp[oid];
+      }} else {{
+        PROFILES2.app[oid] = prof;
+        if (rec) DETAILS.app[oid] = rec;
+        else delete DETAILS.app[oid];
+      }}
       renderSpAppTabs(prof, rec, body);
-    }}).catch(function() {{ body.appendChild(mutedP('Failed to load.')); }});
+      // A transient detail failure must not mark the drawer permanently
+      // filled: re-opening it retries the raw/details fetch.
+      if (doneCb) doneCb(!!rec || recInfo.ok);
+    }}).catch(function() {{
+      body.appendChild(mutedP('Failed to load.'));
+      if (doneCb) doneCb(false);
+    }});
   }}
 
-  function fetchDetailsAll(wants, body) {{
+  function fetchDetailsAll(wants, body, doneCb) {{
     var pending = wants.length;
-    var done = [];
+    var loaded = [];
+    var failed = 0;
     function finish() {{
-      done.forEach(function(pair) {{
+      loaded.forEach(function(pair) {{
         if (pair[0] === 'device') {{
           body.appendChild(deviceSection(pair[2]));
           return;
         }}
-        var label = pair[0] === 'app' ? 'Application' : 'Service Principal';
+        var label = pair[0] === 'app' ? 'Application'
+                  : pair[0] === 'user' ? 'User' : 'Service Principal';
         body.appendChild(section(label, pair[2]));
       }});
-      if (!body.children.length) body.appendChild(mutedP('No additional details captured for this object.'));
+      if (!loaded.length) {{
+        body.appendChild(mutedP(failed ? 'Failed to load details.'
+                                      : 'No additional details captured for this object.'));
+        if (doneCb) doneCb(!failed);
+        return;
+      }}
+      if (doneCb) doneCb(true);
     }}
     wants.forEach(function(pair) {{
       var kind = pair[0], oid = pair[1];
       var cached = DETAILS[kind] && DETAILS[kind][oid];
-      if (cached) {{ done.push([kind, oid, cached]); if (--pending === 0) finish(); return; }}
-      fetch('/api/details/' + kind + '/' + encodeURIComponent(oid)).then(function(r) {{ return r.json(); }}).then(function(d) {{
-        if (!DETAILS[kind]) DETAILS[kind] = {{}};
-        DETAILS[kind][oid] = d;
-        done.push([kind, oid, d]);
-        if (--pending === 0) finish();
-      }}).catch(function() {{ if (--pending === 0) finish(); }});
+      if (cached) {{ loaded.push([kind, oid, cached]); if (--pending === 0) finish(); return; }}
+      fetch('/api/details/' + kind + '/' + encodeURIComponent(oid))
+        .then(function(r) {{ return r.ok ? r.json() : null; }})
+        .then(function(d) {{
+          if (d && !d.error) {{
+            if (!DETAILS[kind]) DETAILS[kind] = {{}};
+            DETAILS[kind][oid] = d;
+            loaded.push([kind, oid, d]);
+          }} else if (d && d.error) {{
+            failed += 1;
+          }}
+          if (--pending === 0) finish();
+        }})
+        .catch(function() {{
+          failed += 1;
+          if (--pending === 0) finish();
+        }});
     }});
   }}
 
@@ -10494,7 +11946,8 @@ def render_report(results, tenant_name, db_path, config_path,
     if (!row) return;
     var pid = row.getAttribute('data-profile-id') || '';
     if (!pid) return;
-    if (!PROFILES[pid]) return;
+    // Always own the click: the drawer fetches the profile on demand, so a
+    // cold PROFILES cache must not fall through to the aggregate drilldown.
     e.stopImmediatePropagation();
     toggleDrawer(row);
   }}, true);
@@ -10543,18 +11996,34 @@ def render_report(results, tenant_name, db_path, config_path,
     var drawer = drawerFor(row);
     if (!drawer) return;
     delete drawer.dataset.filled;  // back must re-populate even if the drawer was filled once
+    delete drawer.dataset.loading;
     if (!drawer.classList.contains('open')) drawer.classList.add('open');
     var body = drawer.querySelector('.drawer-body');
+    var returnTab = activeDrawerTab(body);
+    if (returnTab) drawer.__returnTab = returnTab;
+    var hasSp = !!row.getAttribute('data-sp-id');
+    drawer.dataset.loading = '1';
     body.innerHTML = '';
-    var backRow = document.createElement('div');
-    backRow.className = 'drawer-back-row';
-    backRow.innerHTML = '<button type="button" class="drawer-tab drawer-back">&#8592; Back to service principal</button>';
-    body.appendChild(backRow);
-    backRow.querySelector('.drawer-back').addEventListener('click', function() {{
-      body.innerHTML = '';
-      populateDrawer(row);
+    if (hasSp) {{
+      // only offer "back" when there is a real parent service principal;
+      // app-only rows would otherwise loop back into the same app profile
+      var backRow = document.createElement('div');
+      backRow.className = 'drawer-back-row';
+      backRow.innerHTML = '<button type="button" class="drawer-tab drawer-back">&#8592; Back to service principal</button>';
+      body.appendChild(backRow);
+      backRow.querySelector('.drawer-back').addEventListener('click', function() {{
+        // the app view itself was marked filled; clear it so the parent
+        // service-principal view is allowed to repopulate
+        delete drawer.dataset.filled;
+        delete drawer.dataset.loading;
+        body.innerHTML = '';
+        populateDrawer(row);
+      }});
+    }}
+    renderApp(oid, body, function(ok) {{
+      if (ok) markDrawerFilled(drawer);
+      else markDrawerFailed(drawer);
     }});
-    renderApp(oid, body);
   }}
 
   function openAppDrawerInPlace(oid, body) {{
@@ -10562,8 +12031,8 @@ def render_report(results, tenant_name, db_path, config_path,
     renderApp(oid, body);
   }}
 
-  function renderApp(oid, body) {{
-    fetchSpApp(oid, 'app', body);
+  function renderApp(oid, body, doneCb) {{
+    fetchSpApp(oid, 'app', body, doneCb);
   }}
 
   window.__renderProfileTabs = renderProfileTabs;
@@ -10736,6 +12205,7 @@ def render_report(results, tenant_name, db_path, config_path,
   function applyRowFilter() {{
     var q = input.value;
     if (!advOn) {{
+      window.__advancedQueryInvalid = false;
       var needle = q.toLowerCase();
       setRowVisibility(function(row) {{
         return q.length === 0 || row.textContent.toLowerCase().indexOf(needle) !== -1;
@@ -10746,11 +12216,13 @@ def render_report(results, tenant_name, db_path, config_path,
     }}
     var parsed = ADV_FILTER.parse(q);
     if (parsed.error) {{
+      window.__advancedQueryInvalid = true;
       errorEl.textContent = 'Filter error: ' + parsed.error;
       errorEl.classList.remove('hidden');
       hideSuggest();
       return;
     }}
+    window.__advancedQueryInvalid = false;
     errorEl.classList.add('hidden');
     if (q.trim() === '') {{
       setRowVisibility(function() {{ return true; }});
@@ -10807,8 +12279,8 @@ def render_report(results, tenant_name, db_path, config_path,
     advOn = !advOn;
     advToggle.setAttribute('aria-pressed', String(advOn));
     input.placeholder = advOn
-        ? 'Advanced: severity:High AND target:contains:admin, uniq:owner&hellip;'
-        : 'Filter all tables by target, owner, evidence&hellip;';
+        ? 'Advanced: severity:High AND target:contains:admin, uniq:owner\u2026'
+        : 'Filter all tables by target, owner, evidence\u2026';
     hideSuggest();
     errorEl.classList.add('hidden');
     input.dispatchEvent(new Event('input', {{ bubbles: true }}));
@@ -10838,6 +12310,11 @@ def render_report(results, tenant_name, db_path, config_path,
     var tgtIdx = Array.prototype.indexOf.call(headerRow.cells, targetTh);
     if (srcIdx < 0 || tgtIdx < 0 || srcIdx === tgtIdx) return;
     headerRow.insertBefore(sourceTh, targetTh);
+    // Legacy (catalog-less) tables sort by the visual index, so restamp it
+    // after every move; otherwise sorting targets the pre-drag column.
+    Array.prototype.forEach.call(headerRow.cells, function(th, i) {{
+      if (!th.classList.contains('no-sort')) th.dataset.colidx = String(i);
+    }});
     // keep colgroup widths aligned with the header order
     var cols = table.querySelectorAll('colgroup col');
     if (cols.length) {{
@@ -10866,6 +12343,11 @@ def render_report(results, tenant_name, db_path, config_path,
     if (!th || th.classList.contains('no-sort') || e.target.closest('.col-resizer')) return;
     var table = th.closest('table.findings');
     if (!table) return;
+    // Catalog-less serve tables (CA analysis results) cannot send a column
+    // order to the server, so paging/sorting would realign rows under the
+    // dragged headers. Keep their server-defined column order stable.
+    if (table.getAttribute('data-serve') === '1'
+        && window.__columns && !window.__columns.isManaged(table)) return;
     e.preventDefault();  // avoid text selection while starting a drag
     dragState = {{ table: table, th: th, startX: e.clientX, moved: false, dropTarget: null }};
   }});
@@ -11071,16 +12553,11 @@ def render_report(results, tenant_name, db_path, config_path,
     }} catch (e) {{}}
   }}
 
-  function syncCols(table) {{
+  function syncCols(table, preservedWidths) {{
     var cg = table.querySelector('colgroup');
     if (!cg || !table.tHead) return;
     var headers = table.tHead.rows[0].cells;
-    var widths = {{}};
-    Array.prototype.forEach.call(cg.children, function(col, i) {{
-      var th = headers[i];
-      var f = th && th.getAttribute('data-field');
-      if (f && col.style && col.style.width) widths[f] = col.style.width;
-    }});
+    var widths = preservedWidths || {{}};
     var meta = columnMeta(table.id);
     var html = '';
     Array.prototype.forEach.call(headers, function(th) {{
@@ -11095,7 +12572,9 @@ def render_report(results, tenant_name, db_path, config_path,
   function extraCell(tid, detailKey, field, meta) {{
     var blob = columnExtras(tid);
     var pair = blob && blob[detailKey] ? blob[detailKey][field] : null;
-    if (!pair) return null;
+    // Always emit a cell so enabling a column cannot shift later cells when a
+    // particular row has no recorded extra value (B-023).
+    if (!pair) pair = ['', ''];
     var td = document.createElement('td');
     if (meta && meta.cls) td.className = meta.cls;
     td.setAttribute('data-field', field);
@@ -11108,6 +12587,18 @@ def render_report(results, tenant_name, db_path, config_path,
     var tid = table.id;
     var meta = columnMeta(tid);
     var theadRow = table.tHead.rows[0];
+    // Capture widths keyed by field before headers/colgroup are reordered, so
+    // syncCols pairs old <col> indices with the *same* fields, not the new
+    // header order (B-098).
+    var preservedWidths = {{}};
+    var oldCg = table.querySelector('colgroup');
+    if (oldCg) {{
+      Array.prototype.forEach.call(oldCg.children, function(col, i) {{
+        var th = theadRow.cells[i];
+        var f = th && th.getAttribute('data-field');
+        if (f && col.style && col.style.width) preservedWidths[f] = col.style.width;
+      }});
+    }}
     var thByField = {{}};
     Array.prototype.forEach.call(theadRow.cells, function(th) {{
       var f = th.getAttribute('data-field');
@@ -11161,7 +12652,7 @@ def render_report(results, tenant_name, db_path, config_path,
       }});
       row.appendChild(frag);
     }});
-    syncCols(table);
+    syncCols(table, preservedWidths);
     if (window.__makeColumnsResizable) window.__makeColumnsResizable(table);
     if (window.__wireTableSort) window.__wireTableSort(table);
     if (window.__applyCurrentFilter) window.__applyCurrentFilter();
@@ -11347,33 +12838,63 @@ def render_report(results, tenant_name, db_path, config_path,
     var pager = table.closest('.table-scroll') ? table.closest('.table-scroll').nextElementSibling : null;
     if (!pager || !pager.classList.contains('table-pager')) return;
     table.__loaderMade = true;
-    var state = {{ page: 1, size: 25, q: '', sort: '', dir: 'asc' }};
+    var state = {{ page: 1, size: 25, q: filterInput ? filterInput.value : '',
+                  sort: '', dir: 'asc' }};
     var tbody = table.tBodies[0];
     var info = pager.querySelector('.tp-info');
     var prev = pager.querySelector('.tp-prev');
     var next = pager.querySelector('.tp-next');
     var sizeSel = pager.querySelector('.tp-size');
     var timer = null;
-    var fieldsKey = null;
-    if (window.__columns && window.__columns.isManaged(table) && !table.__pendingCols) {{
-      fieldsKey = window.__columns.getFields(table).join(',');
+    var reqSeq = 0;
+    var pendingAbort = null;
+
+    function domFieldKey() {{
+      var out = [];
+      if (!table.tHead) return '';
+      Array.prototype.forEach.call(table.tHead.rows[0].cells, function(th) {{
+        var f = th.getAttribute('data-field');
+        if (f) out.push(f);
+      }});
+      return out.join(',');
     }}
+
     function load() {{
+      var adv = document.getElementById('advanced-toggle');
+      var advanced = !!(adv && adv.getAttribute('aria-pressed') === 'true');
+      // Never replace a table with results for a query the client already
+      // rejected as invalid advanced syntax.
+      if (advanced && window.__advancedQueryInvalid) return;
+      var seq = ++reqSeq;
+      if (pendingAbort) {{
+        try {{ pendingAbort.abort(); }} catch (e) {{}}
+      }}
+      pendingAbort = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+
       var params = 'page=' + state.page + '&size=' + state.size;
       if (state.q) params += '&q=' + encodeURIComponent(state.q);
-      var adv = document.getElementById('advanced-toggle');
-      if (adv && adv.getAttribute('aria-pressed') === 'true') params += '&mode=advanced';
+      if (advanced) params += '&mode=advanced';
       if (state.sort) params += '&sort=' + encodeURIComponent(state.sort) + '&dir=' + state.dir;
       var managed = window.__columns && window.__columns.isManaged(table);
       if (managed) params += '&cols=' + encodeURIComponent(window.__columns.getFields(table).join(','));
-      fetch('/api/table/' + encodeURIComponent(table.id) + '?' + params)
-        .then(function(r) {{ return r.json(); }})
+      var opts = pendingAbort ? {{ signal: pendingAbort.signal }} : undefined;
+      fetch('/api/table/' + encodeURIComponent(table.id) + '?' + params, opts)
+        .then(function(r) {{
+          if (r.status === 400) return null;  // parse error: keep the current table
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        }})
         .then(function(d) {{
-          if (!d || d.rows_html == null) return;
+          if (seq !== reqSeq) return;  // an older response lost the race
+          var advNow = document.getElementById('advanced-toggle');
+          if (window.__advancedQueryInvalid && advNow
+              && advNow.getAttribute('aria-pressed') === 'true') return;
+          if (!d || d.error || d.rows_html == null) return;
           if (managed && d.fields && window.__columns) {{
-            var key = d.fields.join(',');
-            if (key !== fieldsKey) {{
-              fieldsKey = key;
+            var newKey = d.fields.join(',');
+            // compare against the DOM, not a captured key: a "Reset to
+            // defaults" must rebuild headers that are still in dragged order
+            if (newKey !== domFieldKey()) {{
               if (d.thead_html != null && table.tHead) table.tHead.rows[0].innerHTML = d.thead_html;
               var cg = table.querySelector('colgroup');
               if (cg && d.colgroup_html != null) cg.innerHTML = d.colgroup_html;
@@ -11388,6 +12909,12 @@ def render_report(results, tenant_name, db_path, config_path,
           pager.classList.remove('hidden');
           prev.disabled = d.page <= 1;
           next.disabled = d.page >= d.pages;
+        }})
+        .catch(function(err) {{
+          if (err && err.name === 'AbortError') return;
+          if (seq !== reqSeq) return;
+          info.textContent = 'Failed to load table';
+          pager.classList.remove('hidden');
         }});
     }}
     table.__reload = function() {{ state.page = 1; load(); }};
@@ -11396,6 +12923,7 @@ def render_report(results, tenant_name, db_path, config_path,
     sizeSel.addEventListener('change', function() {{ state.size = parseInt(sizeSel.value, 10) || 25; state.page = 1; load(); }});
     filterInput.addEventListener('input', function() {{
       clearTimeout(timer);
+      reqSeq += 1;  // immediately stale any in-flight page for the old query
       var v = filterInput.value;
       timer = setTimeout(function() {{ state.q = v; state.page = 1; load(); }}, 250);
     }});
@@ -11506,13 +13034,39 @@ def render_report(results, tenant_name, db_path, config_path,
               if (window.__makeColumnsResizable) window.__makeColumnsResizable(t);
               if (window.__makeLoader) window.__makeLoader(t);
             }});
+        // new loaders seed state.q from the filter input; also re-apply plain
+        // client-side filtering so the visible page matches the filter box
+        if (window.__applyCurrentFilter) window.__applyCurrentFilter();
       }}
     }}
 
     function caPoll(mode) {{
+      var expectedKind = mode === 'single' ? 'single'
+        : (mode === 'compare' ? 'compare' : 'main');
       fetch('/api/ca-analysis/status').then(function(r) {{ return r.json(); }})
         .then(function(d) {{
-          if (!d || !d.steps) return;
+          if (!d || !d.steps) {{
+            caSetBusy(false);
+            var idleEl = mode === 'single' ? caUserStatusEl
+              : (mode === 'compare' ? caCompareStatusEl : caStatusEl);
+            if (idleEl) {{
+              idleEl.classList.remove('hidden');
+              idleEl.classList.add('error');
+              idleEl.textContent = 'The analysis job is no longer running. Start it again.';
+            }}
+            return;
+          }}
+          if (d.kind && d.kind !== expectedKind) {{
+            caSetBusy(false);
+            var kindEl = mode === 'single' ? caUserStatusEl
+              : (mode === 'compare' ? caCompareStatusEl : caStatusEl);
+            if (kindEl) {{
+              kindEl.classList.remove('hidden');
+              kindEl.classList.add('error');
+              kindEl.textContent = 'Another CA analysis (' + d.kind + ') is running. Wait for it to finish.';
+            }}
+            return;
+          }}
           if (mode === 'single') {{
             caStepState(d, caUserStepsEl);
             if (d.status === 'running') {{ caUserTimer = setTimeout(function() {{ caPoll('single'); }}, 600); return; }}
@@ -11533,11 +13087,19 @@ def render_report(results, tenant_name, db_path, config_path,
     }}
 
     function startCa(upn, isUser) {{
+      if (isUser && !(upn || '').trim()) {{
+        caUserStatusEl.classList.remove('hidden');
+        caUserStepsEl.innerHTML = '<li class="error">Enter a user UPN.</li>';
+        if (caUserInput) caUserInput.focus();
+        return;
+      }}
       caSetBusy(true);
       var statusEl = isUser ? caUserStatusEl : caStatusEl;
       var stepsEl = isUser ? caUserStepsEl : caStepsEl;
       var resultsEl = isUser ? caUserResultsEl : caResultsEl;
-      if (!isUser) {{ resultsEl.innerHTML = ''; }}
+      // clear the pane this run owns so a single-user run never displays the
+      // previous tenant-wide result (or vice versa) while it is running
+      resultsEl.innerHTML = '';
       statusEl.classList.remove('hidden');
       stepsEl.innerHTML = '';
       function val(id) {{
@@ -11574,7 +13136,12 @@ def render_report(results, tenant_name, db_path, config_path,
       fetch('/api/ca-analysis', {{
         method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: body
       }})
-        .then(function(r) {{ return r.json(); }})
+        .then(function(r) {{
+          return r.json().then(function(d) {{
+            if (!r.ok) throw new Error((d && d.error) || ('HTTP ' + r.status));
+            return d;
+          }});
+        }})
         .then(function(d) {{
           if (d && d.status === 'running') {{
             if (isUser) caUserTimer = setTimeout(function() {{ caPoll('single'); }}, 600);
@@ -11582,7 +13149,12 @@ def render_report(results, tenant_name, db_path, config_path,
           }} else {{
             caSetBusy(false);
           }}
-        }}).catch(function() {{ caSetBusy(false); }});
+        }}).catch(function(err) {{
+          caSetBusy(false);
+          statusEl.classList.remove('hidden');
+          statusEl.classList.add('error');
+          statusEl.textContent = (err && err.message) || 'Could not start CA analysis.';
+        }});
     }}
 
     function startCaCompare() {{
@@ -11622,14 +13194,24 @@ def render_report(results, tenant_name, db_path, config_path,
         method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
         body: JSON.stringify(payload)
       }})
-        .then(function(r) {{ return r.json(); }})
+        .then(function(r) {{
+          return r.json().then(function(d) {{
+            if (!r.ok) throw new Error((d && d.error) || ('HTTP ' + r.status));
+            return d;
+          }});
+        }})
         .then(function(d) {{
           if (d && d.status === 'running') {{
             caCompareTimer = setTimeout(function() {{ caPoll('compare'); }}, 600);
           }} else {{
             caSetBusy(false);
           }}
-        }}).catch(function() {{ caSetBusy(false); }});
+        }}).catch(function(err) {{
+          caSetBusy(false);
+          caCompareStatusEl.classList.remove('hidden');
+          caCompareStatusEl.classList.add('error');
+          caCompareStatusEl.textContent = (err && err.message) || 'Could not start CA comparison.';
+        }});
     }}
 
     if (caRun) caRun.addEventListener('click', function() {{ startCa('', false); }});
@@ -11689,27 +13271,42 @@ def build_tenant_summary(graph, results=None):
     else:
         engine = "No sync observed"
 
-    writeback = None  # None = unknown, True/False when the sync summary check ran
+    writeback = None  # None = unknown, True/False when sync data is present
     auth_mode = None
+    sync_summary = None
     if results:
         for res in results:
-            if res["id"] != "ad_sync_summary":
-                continue
-            wb = (res["findings"][0].get("writeback") or {})
-            writeback = bool(wb.get("count"))
-            auth_mode = (res["findings"][0].get("auth_mode") or {}).get("short") or None
+            if res["id"] == "ad_sync_summary" and res.get("findings"):
+                sync_summary = res["findings"][0]
+                break
+    # Derive from the graph even when the sync-summary check was filtered out
+    # (min_severity/suppress must not blank the tenant header) (B-086).
+    if sync_summary is None or sync_summary.get("writeback") is None \
+            or (sync_summary.get("auth_mode") or {}).get("short") is None:
+        try:
+            sync_summary = check_ad_sync_summary({"graph": graph})[0]
+        except Exception:
+            sync_summary = sync_summary or {}
+    if sync_summary:
+        wb = sync_summary.get("writeback") or {}
+        writeback = bool(wb.get("count"))
+        auth_mode = (sync_summary.get("auth_mode") or {}).get("short") or None
 
     domains = []
     for d in json_list(graph["tenant"].get("verified_domains")):
         if isinstance(d, dict) and d.get("name"):
-            domains.append({"name": d["name"], "default": bool(d.get("default"))})
+            domains.append({
+                "name": d["name"],
+                "default": bool(d.get("isDefault", d.get("default"))),
+            })
     domains.sort(key=lambda d: (not d["default"], d["name"]))
 
     pim = {
         "providers": list(graph.get("pim_providers") or []),
         "governance": bool(graph.get("pim_resources") or graph.get("pim_alerts")
                            or graph.get("pim_role_assignments")
-                           or graph.get("pim_role_settings")),
+                           or graph.get("pim_role_settings")
+                           or graph.get("pim_role_settings_v2")),
     }
 
     return {
@@ -11744,32 +13341,45 @@ SERVE_STATE = {"shell": "", "user_findings": [], "tables": {},
                "records": [], "db_path": None, "ca_analysis": None,
                "graph": {}, "check_cfg": {}, "group_roles": {},
                "group_eligible_roles": {}, "profile_builder": None,
-               "profiles_lru": {}, "details_lru": {}}
+               "profiles_lru": {}, "details_lru": {}, "generation": 0}
+
+# Guards the mutable serve state (analysis swap, profile builder, LRUs and CA
+# job state). ThreadingHTTPServer serves requests concurrently.
+SERVE_STATE_LOCK = threading.RLock()
+CA_LOCK = SERVE_STATE_LOCK
+
+
+def serve_generation():
+    with SERVE_STATE_LOCK:
+        return SERVE_STATE.get("generation", 0)
 
 
 def _install_analysis_state(results, graph, group_roles, group_eligible_roles,
                             check_cfg, report_html, serve_tables, db_path):
-    SERVE_STATE["shell"] = report_html
-    SERVE_STATE["db_path"] = str(db_path) if db_path is not None else None
-    SERVE_STATE["ca_analysis"] = None
-    SERVE_STATE["tables"] = serve_tables or {}
-    SERVE_STATE["user_findings"] = next(
-        (res["findings"] for res in results if res["id"] == "privileged_users"), [])
-    SERVE_STATE["group_profiles"] = {
-        f["group_id"]: f for res in results if res["id"] == "groups"
-        for f in res["findings"]}
-    SERVE_STATE["policy_profiles"] = {
-        f["policy_id"]: f for res in results if res["id"] == "ca_exposure"
-        for f in res["findings"] if f.get("policy_id")}
-    SERVE_STATE["records"] = build_serve_records(results)
-    SERVE_STATE["graph"] = graph
-    SERVE_STATE["check_cfg"] = check_cfg
-    SERVE_STATE["group_roles"] = group_roles
-    SERVE_STATE["group_eligible_roles"] = group_eligible_roles
-    SERVE_STATE["profile_builder"] = None
-    SERVE_STATE["profiles_lru"] = {}
-    SERVE_STATE["details_lru"] = {}
-    SERVE_STATE.pop("ca_table_ids", None)
+    with SERVE_STATE_LOCK:
+        SERVE_STATE["generation"] = SERVE_STATE.get("generation", 0) + 1
+        SERVE_STATE["shell"] = report_html
+        SERVE_STATE["db_path"] = str(db_path) if db_path is not None else None
+        SERVE_STATE["ca_analysis"] = None
+        SERVE_STATE["tables"] = serve_tables or {}
+        SERVE_STATE["user_findings"] = next(
+            (res["findings"] for res in results if res["id"] == "privileged_users"), [])
+        SERVE_STATE["group_profiles"] = {
+            f["group_id"]: f for res in results if res["id"] == "groups"
+            for f in res["findings"]}
+        SERVE_STATE["policy_profiles"] = {
+            f["policy_id"]: f for res in results if res["id"] == "ca_exposure"
+            for f in res["findings"] if f.get("policy_id")}
+        SERVE_STATE["records"] = build_serve_records(results, graph)
+        SERVE_STATE["graph"] = graph
+        SERVE_STATE["check_cfg"] = check_cfg
+        SERVE_STATE["group_roles"] = group_roles
+        SERVE_STATE["group_eligible_roles"] = group_eligible_roles
+        SERVE_STATE["profile_builder"] = None
+        SERVE_STATE["profile_builder_generation"] = None
+        SERVE_STATE["profiles_lru"] = {}
+        SERVE_STATE["details_lru"] = {}
+        SERVE_STATE["ca_table_ids"] = {}
 
 
 def run_runtime_analysis(db_path, use_cache=True):
@@ -11781,8 +13391,14 @@ def run_runtime_analysis(db_path, use_cache=True):
         raise RuntimeError(f"config not found: {config_path}")
     cache_path, cache_meta_path = cache_paths(db_path)
 
+    config_resources, check_cfg = load_config(config_path)
+    azure_role_sev = load_azure_roles(azure_config)
+    check_cfg["azure_roles"] = azure_role_sev
+    config_fingerprint = compute_config_fingerprint(config_resources, check_cfg)
+    SERVE_STATE["config_fingerprint"] = config_fingerprint
+
     analysis.set_message("Loading database")
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = open_audit_database(db_path)
     try:
         cur = conn.cursor()
         tenant_name = None
@@ -11792,11 +13408,7 @@ def run_runtime_analysis(db_path, use_cache=True):
             tenant_name = row[0] if row else None
         except sqlite3.OperationalError:
             pass
-        fingerprint = compute_db_fingerprint(db_path, cur)
-
-        config_resources, check_cfg = load_config(config_path)
-        azure_role_sev = load_azure_roles(azure_config)
-        check_cfg["azure_roles"] = azure_role_sev
+        fingerprint = compute_db_fingerprint(db_path, cur, config_fingerprint)
 
         analysis.set_message("Building graph")
         graph = build_graph(cur)
@@ -11805,9 +13417,7 @@ def run_runtime_analysis(db_path, use_cache=True):
         conn.close()
 
     cached = load_cache(cache_path) if use_cache else None
-    cache_hit = bool(
-        use_cache and cached and cached.get("version") == CACHE_VERSION
-        and cached.get("fingerprint") == fingerprint)
+    cache_hit = bool(use_cache and cache_fresh(cached, fingerprint))
 
     if cache_hit:
         analysis.set_message("Using cached analysis")
@@ -11860,7 +13470,8 @@ def run_runtime_analysis(db_path, use_cache=True):
     if use_cache and not cache_hit:
         write_analysis_cache(cache_path, cache_meta_path, db_path, fingerprint,
                              cache_meta["generated_at"], results,
-                             tenant_summary, group_roles, group_eligible_roles)
+                             tenant_summary, group_roles, group_eligible_roles,
+                             config_fingerprint=config_fingerprint)
 
 
 PROFILE_LRU_MAX = 4000
@@ -11871,23 +13482,33 @@ DETAIL_LRU_MAX = 4000
 SERVE_FIELD_LABELS = {
     "severity": "Privileges", "owner": "Owner", "ownerUpn": "Owner UPN",
     "ownerStatus": "Owner Status", "app": "Application",
+    "ownerSource": "Owner Source", "ownerAdDn": "Owner AD DN",
+    "ownerAdSid": "Owner SID", "ownerImmutableId": "Owner Immutable ID",
     "resource": "Resource", "permission": "Permission", "spStatus": "SP Status",
     "target": "Target", "targetType": "Target Type", "id": "Object ID",
     "status": "Target Status", "pw": "Passwords", "keys": "Keys", "roleCount": "Role assignment",
     "appId": "App ID", "spType": "SP type", "appDirRoles": "Directory roles",
     "pwLastSet": "Password last set", "pwExpiry": "Expiration date",
-    "userUpn": "UPN", "roles": "Directory roles", "eligible": "Eligible roles",
+    "user": "User", "userUpn": "UPN",
+    "roles": "Directory roles", "eligible": "Eligible roles",
     "privApps": "Privileged apps owned",
     "capGroups": "Role-capable group memberships", "grpOwned": "Groups owned",
     "hybrid": "Account Source", "caExcl": "CA exclusions", "userStatus": "Status",
+    "immutableId": "Immutable ID",
     "group": "Group", "grpType": "Type", "grpRoles": "Directory roles",
     "grpMembers": "Members", "grpPriv": "Privileged members", "grpOwners": "Owners",
     "polName": "Policy", "polState": "State", "polScope": "Scope", "polApps": "Apps",
     "polControls": "Controls", "polInc": "Included users", "polExc": "Excluded users",
+    "polType": "Policy type", "polCreated": "Created", "polModified": "Last modified",
     "dynGroup": "Group", "dynRule": "Membership rule", "dynAttrs": "Referenced attributes",
     "dynMods": "attribute modifiable by",
     "adUser": "User", "adUpn": "UPN", "adCn": "AD CN", "adDn": "AD DN", "adSid": "SID",
     "adPw": "On-prem pw change", "adTags": "Targeting tags", "adStatus": "Status",
+    "arcMachine": "Machine", "arcSub": "Subscription", "arcRg": "Resource Group",
+    "arcResourceId": "Resource ID", "arcStatus": "Status",
+    "arcPrincipal": "Principal", "arcPrincipalType": "Type",
+    "arcTag": "Arc marker", "arcAzRoles": "Azure roles",
+    "arcProvider": "Provider service",
 }
 
 SERVE_DRILLDOWN_COLUMNS = {
@@ -11897,6 +13518,12 @@ SERVE_DRILLDOWN_COLUMNS = {
     "resource":   ["app", "ownerUpn", "permission", "severity", "spStatus"],
     "permission": ["app", "ownerUpn", "resource", "severity", "spStatus"],
     "target":     ["targetType", "id", "roleCount", "pw", "keys", "severity", "status"],
+    # identity cells normally open the profile drawer; these columns are the
+    # fallback for rows without data-profile-id
+    "user":       ["userUpn", "roles", "eligible", "privApps", "severity"],
+    "userUpn":    ["user", "roles", "eligible", "privApps", "severity"],
+    "adUser":     ["adUpn", "adCn", "adDn", "adStatus", "adTags"],
+    "adUpn":      ["adUser", "adCn", "adDn", "adStatus", "adTags"],
     "roles":      ["userUpn", "privApps", "capGroups", "grpOwned", "severity"],
     "eligible":   ["userUpn", "group", "severity"],
     "group":      ["group", "grpType", "grpRoles", "grpMembers", "grpPriv", "grpOwners", "severity"],
@@ -11915,29 +13542,72 @@ CHECK_ID_CATEGORY = {spec["id"]: spec["category"] for spec in CHECK_SPECS}
 
 def _serve_table_id(res_id):
     return {
+        "priv_app_ownership": "owned-table",
         "privileged_users": "privileged-users-table",
         "groups": "groups-table",
         "ad_sync_users": "ad-sync-users-table",
         "app_dir_roles": "app-dir-roles-table",
         "app_inventory": "app-inventory-table",
         "ca_exposure": "table-ca_exposure",
+        "ca_gaps": "table-ca_gaps",
         "azure_arc_machines": "arc-machines-table",
         "azure_arc_sps": "arc-principals-table",
         "azure_arc_providers": "arc-providers-table",
     }.get(res_id, f"table-{res_id}")
 
 
-def serve_field_map(table_id, f, owner=None):
+def _owner_field_map(owners, ctx=None):
+    """Owner columns for a row, aligned with the DOM renderers. When several
+    owners exist the values are comma-joined; owned-table rows pass exactly one
+    owner so the filter/drilldown value matches the displayed cell."""
+    graph = (ctx or {}).get("graph") or {}
+    values = {key: [] for key in
+              ("owner", "ownerUpn", "ownerStatus", "ownerSource",
+               "ownerAdDn", "ownerAdSid", "ownerImmutableId")}
+    for owner in owners or ():
+        if not owner:
+            continue
+        rec = graph_user_record(graph, owner.get("object_id")) or {}
+        values["owner"].append(owner.get("display_name")
+                               or rec.get("displayName") or "")
+        values["ownerUpn"].append(owner.get("upn")
+                                  or rec.get("userPrincipalName") or "")
+        enabled = owner.get("enabled")
+        if enabled is None:
+            enabled = rec.get("accountEnabled") in (1, True)
+        values["ownerStatus"].append("Enabled" if enabled else "Disabled")
+        values["ownerSource"].append(
+            owner.get("source")
+            or ("AD" if rec.get("dirSyncEnabled") in (1, True) else "Cloud"))
+        values["ownerAdDn"].append(
+            owner.get("ad_dn") or rec.get("onPremisesDistinguishedName") or "")
+        values["ownerAdSid"].append(
+            owner.get("ad_sid") or rec.get("onPremisesSecurityIdentifier") or "")
+        values["ownerImmutableId"].append(
+            owner.get("immutable_id") or rec.get("immutableId") or "")
+    return {key: ", ".join(part for part in parts if part is not None)
+            for key, parts in values.items()}
+
+
+def serve_field_map(table_id, f, owner=None, ctx=None):
     """Field map for one finding row in a serve table — mirrors the DOM
     data-field/data-value model plus the implicit 'check' and 'category'
-    fields. Used by the advanced filter and the serve drilldown records."""
+    fields. Used by the advanced filter, table search and drilldown records.
+
+    Every field advertised by TABLE_SPECS is present in the returned map; a
+    module-level validation below fails import if a catalog field is missing,
+    so the server can never silently filter on a non-existent column."""
     fields = {"check": f.get("check_id", ""),
               "category": CHECK_ID_CATEGORY.get(f.get("check_id", ""), "")}
     if table_id.startswith("ca-"):
         # CA-analysis rows carry their own field map
         fields.update(f.get("fields") or {})
         return fields
+    for field in allowed_fields(table_id) or ():
+        fields.setdefault(field, "")
+    graph = (ctx or {}).get("graph") or {}
     if table_id == "privileged-users-table":
+        user = graph_user_record(graph, f.get("user_id")) or {}
         fields.update({
             "user": f.get("user_display") or "", "userUpn": f.get("user_upn") or "",
             "roles": ", ".join(r["name"] for r in f.get("roles", [])),
@@ -11948,41 +13618,51 @@ def serve_field_map(table_id, f, owner=None):
             "caExcl": str(len(f.get("ca_exclusions", []))),
             "hybrid": "AD" if f.get("hybrid") else "Cloud",
             "userStatus": "Enabled" if f.get("user_enabled") else "Disabled",
+            "adDn": user.get("onPremisesDistinguishedName") or "",
+            "adSid": user.get("onPremisesSecurityIdentifier") or "",
+            "immutableId": user.get("immutableId") or "",
             "severity": f.get("severity", "Info"),
         })
     elif table_id == "groups-table":
+        rule = (f.get("dyn_rule") or "").strip()
         fields.update({
             "group": f.get("group_name") or "",
-            "grpType": ", ".join(f.get("types", [])),
+            "grpType": grp_type_value(f),
             "grpRoles": ", ".join(r["name"] for r in f.get("dir_roles", [])),
             "eligible": ", ".join(r["name"] for r in f.get("eligible_roles", [])),
             "grpMembers": str(f.get("member_count", 0)),
             "grpPriv": str(f.get("priv_member_count", 0)),
             "grpOwners": str(len(f.get("owners", []))),
+            "dynRule": rule if rule not in ("", "[]") else "",
             "severity": f.get("severity", "Info"),
         })
     elif table_id == "dynamic-groups-table":
+        rule = (f.get("dyn_rule") or "").strip()
         fields.update({
-            "dynGroup": f.get("group_name") or "", "dynRule": f.get("dyn_rule") or "",
+            "dynGroup": f.get("group_name") or "",
+            "dynRule": rule if rule not in ("", "[]") else "",
             "dynAttrs": ", ".join(f.get("dyn_attrs", [])),
             "dynMods": ", ".join(f.get("dyn_mods", [])),
+            "grpMembers": str(f.get("member_count", 0)),
+            "grpOwners": str(len(f.get("owners", []))),
         })
     elif table_id in ("owned-table", "unowned-table"):
         owners = [owner] if owner is not None else f.get("owners", [])
+        fields.update(_owner_field_map(owners, ctx))
         fields.update({
-            "owner": ", ".join(o.get("display_name") or "" for o in owners),
-            "ownerUpn": ", ".join(o.get("upn") or "" for o in owners),
-            "ownerStatus": ", ".join("Enabled" if o.get("enabled") else "Disabled"
-                                     for o in owners),
             "app": f.get("display_name") or "",
             "pw": str(f.get("pw")) if f.get("pw") is not None else "",
             "keys": str(f.get("keys")) if f.get("keys") is not None else "",
             "resource": f.get("resource_name") or "",
             "permission": f.get("permission") or "",
             "spStatus": "Enabled" if f.get("sp_enabled") else "Disabled",
+            "appId": sp_app_id(f.get("principal_id"), f.get("app_object_id"), graph),
+            "spType": ((graph.get("sp") or {}).get(f.get("principal_id")) or {}
+                       ).get("servicePrincipalType") or "",
             "severity": f.get("severity", "Info"),
         })
     elif table_id == "ad-sync-users-table":
+        user = graph_user_record(graph, f.get("user_id")) or {}
         fields.update({
             "adUser": f.get("user_display") or "", "adUpn": f.get("user_upn") or "",
             "adCn": f.get("ad_cn") or "", "adDn": f.get("ad_dn") or "",
@@ -11990,6 +13670,7 @@ def serve_field_map(table_id, f, owner=None):
             "adTags": ", ".join(f.get("tags", [])),
             "caExcl": str(len(f.get("ca_exclusions", []))),
             "adStatus": "Enabled" if (f.get("status") or {}).get("enabled") else "Disabled",
+            "immutableId": user.get("immutableId") or "",
         })
     elif table_id == "table-ca_exposure":
         fields.update({
@@ -11999,19 +13680,38 @@ def serve_field_map(table_id, f, owner=None):
             "polControls": ", ".join((f.get("conditions_html") or {}).get("controls") or []),
             "polInc": str(len(f.get("included", []))),
             "polExc": str(len(f.get("excluded", []))),
+            "polType": ("" if f.get("policy_type") is None
+                        else str(f.get("policy_type"))),
+            "polCreated": f.get("created") or "",
+            "polModified": f.get("modified") or "",
+            "severity": f.get("severity", "Info"),
+        })
+    elif table_id == "table-ca_gaps":
+        fields.update({
+            "user": f.get("user_display") or "",
+            "userUpn": f.get("user_upn") or "",
+            "userStatus": "Enabled" if f.get("user_enabled") else "Disabled",
+            "caPolicies": ", ".join(f.get("ca_excluded_policies") or []),
+            "caRoles": ", ".join(f.get("privileged_roles") or []),
             "severity": f.get("severity", "Info"),
         })
     elif table_id == "app-dir-roles-table":
         t = f.get("target") or {}
+        sp_id = f.get("sp_id") or (t.get("id") if t.get("type") == "ServicePrincipal" else "")
+        sp_rec = (graph.get("sp") or {}).get(sp_id) or {}
+        fields.update(_owner_field_map([sp_owner_dict(sp_id, graph)] if sp_id else [], ctx))
         fields.update({
             "app": t.get("name") or "", "id": t.get("id") or "",
             "appDirRoles": ", ".join(r["name"] for r in f.get("dir_role_tags", [])),
             "status": (f.get("status") or {}).get("label") or "",
+            "appId": sp_app_id(sp_id, "", graph),
+            "spType": sp_rec.get("servicePrincipalType") or "",
             "severity": f.get("severity", "Info"),
         })
     elif table_id == "app-inventory-table":
         t = f.get("target") or {}
-        owners = f.get("inventory_owners") or []
+        owners = (f.get("inventory_owners") or [])[:1]
+        fields.update(_owner_field_map(owners, ctx))
         fields.update({
             "app": f.get("display_name") or t.get("name") or "",
             "targetType": f.get("inventory_type") or t.get("type") or "",
@@ -12022,43 +13722,51 @@ def serve_field_map(table_id, f, owner=None):
             "keys": str(f.get("keys")) if f.get("keys") is not None else "",
             "roleCount": str(f.get("roles")) if f.get("roles") is not None else "",
             "appDirRoles": ", ".join(r["name"] for r in f.get("dir_role_tags", [])),
-            "owner": ", ".join(o.get("display_name") or "" for o in owners),
-            "ownerUpn": ", ".join(o.get("upn") or "" for o in owners),
-            "ownerStatus": ", ".join("Enabled" if o.get("enabled") else "Disabled"
-                                     for o in owners),
-            "ownerSource": ", ".join(o.get("source") or "" for o in owners),
-            "ownerAdDn": ", ".join(o.get("ad_dn") or "" for o in owners),
-            "ownerAdSid": ", ".join(o.get("ad_sid") or "" for o in owners),
-            "ownerImmutableId": ", ".join(o.get("immutable_id") or "" for o in owners),
             "id": t.get("id") or "",
             "severity": f.get("severity", "Info"),
         })
     elif table_id == "arc-machines-table":
+        oid = (f.get("target") or {}).get("id") or ""
         fields.update({
             "arcMachine": f.get("machine_name") or "",
             "arcSub": f.get("arc_sub") or "",
             "arcRg": f.get("arc_rg") or "",
             "arcResourceId": f.get("arc_resource_id") or "",
             "arcStatus": (f.get("arc_status") or {}).get("label") or "",
+            "appId": sp_app_id(oid, "", graph),
+            "id": oid,
         })
     elif table_id == "arc-principals-table":
+        oid = (f.get("target") or {}).get("id") or ""
+        kind = f.get("arc_principal_type") or ""
         fields.update({
             "arcPrincipal": f.get("arc_principal") or "",
-            "arcPrincipalType": f.get("arc_principal_type") or "",
+            "arcPrincipalType": kind,
             "arcTag": "AzureArcSPN" if f.get("arc_tagged") else "",
             "arcAzRoles": ", ".join(a.get("role", "") for a in f.get("arc_roles", [])),
             "pw": str(f.get("pw")) if f.get("pw") is not None else "",
             "pwLastSet": (f.get("pw_last_set") or "")[:10],
             "pwExpiry": (f.get("pw_expiry") or "")[:10],
             "arcStatus": (f.get("arc_status") or {}).get("label") or "",
+            "appId": sp_app_id(oid, "", graph) if kind == "Service Principal" else "",
         })
+        if kind == "Service Principal":
+            fields.update(_owner_field_map([sp_owner_dict(oid, graph)], ctx))
     elif table_id == "arc-providers-table":
+        oid = (f.get("target") or {}).get("id") or ""
         fields.update({
             "arcProvider": f.get("arc_provider") or "",
             "arcStatus": (f.get("arc_status") or {}).get("label") or "",
+            "appId": sp_app_id(oid, "", graph),
+            "id": oid,
         })
     else:  # generic table-<check_id>
         t = f.get("target") or {}
+        o = f.get("object_ids") or {}
+        sp_id = next(iter(o.get("sp") or ()), "")
+        app_oid = next(iter(o.get("app") or ()), "")
+        owner = row_owner_dict(f, ctx)
+        fields.update(_owner_field_map([owner] if owner else [], ctx))
         fields.update({
             "target": t.get("name") or "", "targetType": t.get("type") or "",
             "id": t.get("id") or "",
@@ -12066,15 +13774,44 @@ def serve_field_map(table_id, f, owner=None):
             "keys": str(f.get("keys")) if f.get("keys") is not None else "",
             "roleCount": str(f.get("roles")) if f.get("roles") is not None else "",
             "status": (f.get("status") or {}).get("label") or "",
+            "appId": sp_app_id(sp_id, app_oid, graph),
+            "spType": ((graph.get("sp") or {}).get(sp_id) or {}
+                       ).get("servicePrincipalType") or "",
             "severity": f.get("severity", "Info"),
         })
     return fields
 
 
-def build_serve_records(results):
+def serve_search_text(table_id, f, owner=None, ctx=None):
+    """Plain search text derived from the same field map that powers advanced
+    filters, so every rendered/selectable value is searchable (B-020)."""
+    field_map = serve_field_map(table_id, f, owner=owner, ctx=ctx)
+    return " ".join(str(value) for value in field_map.values() if value).lower()
+
+
+def validate_serve_field_maps():
+    """Fail at import when a table advertises a column the server field map
+    cannot provide; this is the drift guard for B-022/B-099."""
+    errors = []
+    for table_id in ["table-generic"] + list(TABLE_SPECS):
+        keys = {str(key).lower() for key in serve_field_map(table_id, {}).keys()}
+        missing = [field for field in (allowed_fields(table_id) or [])
+                   if str(field).lower() not in keys]
+        if missing:
+            errors.append(f"{table_id}: {', '.join(missing)}")
+    if errors:
+        raise RuntimeError("serve field map is missing catalog fields:\n  "
+                           + "\n  ".join(errors))
+
+
+validate_serve_field_maps()
+
+
+def build_serve_records(results, graph=None):
     """All findings as drilldown records, mirroring the DOM record model so
     serve-mode drilldowns match over the full dataset (not just loaded pages)."""
     records = []
+    ctx = {"graph": graph or {}}
 
     def add(fields, sp="", app="", owner="", gid="", pid=""):
         rec = {"__ids": {"sp": sp, "app": app, "owner": owner}, "__gid": gid, "__pid": pid}
@@ -12091,7 +13828,7 @@ def build_serve_records(results):
                 owners = f.get("owners") or []
                 if owners:
                     for owner in owners:
-                        add(serve_field_map("owned-table", f, owner),
+                        add(serve_field_map("owned-table", f, owner, ctx),
                             sp=f.get("principal_id", ""), app=f.get("app_object_id") or "",
                             owner=owner.get("object_id", ""))
                 else:
@@ -12099,20 +13836,22 @@ def build_serve_records(results):
                     # but still need a record so permission/app/resource
                     # drilldowns can find them (e.g. app-role permissions on
                     # service principals with no recorded owner).
-                    add(serve_field_map("owned-table", f),
+                    add(serve_field_map("owned-table", f, ctx=ctx),
                         sp=f.get("principal_id", ""), app=f.get("app_object_id") or "")
             elif res["id"] == "groups":
                 gid = f.get("group_id", "")
-                add(serve_field_map("groups-table", f), gid=gid)
-                if f.get("dyn_rule"):
-                    add(serve_field_map("dynamic-groups-table", f), gid=gid)
+                add(serve_field_map("groups-table", f, ctx=ctx), gid=gid)
+                if f.get("dynamic") and (f.get("dyn_rule") or "").strip() not in ("", "[]"):
+                    add(serve_field_map("dynamic-groups-table", f, ctx=ctx), gid=gid)
             elif res["id"] == "ad_sync_users":
-                add(serve_field_map("ad-sync-users-table", f), owner=f.get("user_id", ""))
+                add(serve_field_map("ad-sync-users-table", f, ctx=ctx),
+                    owner=f.get("user_id", ""))
             elif res["id"] == "ca_exposure":
-                add(serve_field_map("table-ca_exposure", f), pid=f.get("policy_id", ""))
+                add(serve_field_map("table-ca_exposure", f, ctx=ctx),
+                    pid=f.get("policy_id", ""))
             else:
                 t = f.get("target") or {}
-                add(serve_field_map(_serve_table_id(res["id"]), f),
+                add(serve_field_map(_serve_table_id(res["id"]), f, ctx=ctx),
                     sp=sp_id, app=app_id, owner=owner_id,
                     pid=t.get("id", "") if t.get("type") == "Policy" else "")
     return records
@@ -12153,10 +13892,13 @@ def serve_table_response(table_id, qs):
     if mode == "advanced" and q:
         try:
             ast = parse_advanced_query(q)
-        except AdvancedParseError:
-            ast = None  # fall back to substring behaviour below
+        except AdvancedParseError as exc:
+            # Do not silently filter by the raw query as a substring: the
+            # client already rejected it and must keep the previous rows.
+            return {"error": f"invalid advanced filter: {exc}"}, 400
         if ast is not None:
             uniq_fields = extract_uniq_fields(ast)
+            row_ctx = entry.get("ctx")
 
             def _uniq_key(field_map):
                 return tuple((field_map.get(f) or "").lower()
@@ -12171,14 +13913,14 @@ def serve_table_response(table_id, qs):
                 for f in findings:
                     owners = [o for o in f.get("owners", [])
                               if evaluate_advanced(
-                                  ast, serve_field_map("owned-table", f, o),
+                                  ast, serve_field_map("owned-table", f, o, row_ctx),
                                   entry["search"](f))]
                     if uniq_fields:
                         deduped_owners = []
                         for o in owners:
                             key = _uniq_key(
                                 {k.lower(): v for k, v in
-                                 serve_field_map("owned-table", f, o).items()})
+                                 serve_field_map("owned-table", f, o, row_ctx).items()})
                             if key in seen:
                                 continue
                             seen.add(key)
@@ -12191,14 +13933,15 @@ def serve_table_response(table_id, qs):
                 findings = filtered
             else:
                 findings = [f for f in findings
-                            if evaluate_advanced(ast, serve_field_map(table_id, f),
+                            if evaluate_advanced(ast, serve_field_map(table_id, f, ctx=row_ctx),
                                                  entry["search"](f))]
                 if uniq_fields:
                     seen = set()
                     deduped = []
                     for f in findings:
                         key = _uniq_key(
-                            {k.lower(): v for k, v in serve_field_map(table_id, f).items()})
+                            {k.lower(): v for k, v in
+                             serve_field_map(table_id, f, ctx=row_ctx).items()})
                         if key in seen:
                             continue
                         seen.add(key)
@@ -12232,29 +13975,47 @@ def serve_table_response(table_id, qs):
 
 
 def _lru_get(cache, key):
-    if key in cache:
-        value = cache[key]
-        del cache[key]
-        cache[key] = value  # move to most-recently-used end
-        return value
+    with SERVE_STATE_LOCK:
+        if key in cache:
+            value = cache[key]
+            del cache[key]
+            cache[key] = value  # move to most-recently-used end
+            return value
     return None
 
 
 def _lru_put(cache, key, value, max_size):
-    cache[key] = value
-    while len(cache) > max_size:
-        cache.pop(next(iter(cache)))
+    with SERVE_STATE_LOCK:
+        cache[key] = value
+        while len(cache) > max_size and cache:
+            cache.pop(next(iter(cache)))
 
 
 def _profile_builder():
-    if SERVE_STATE.get("profile_builder") is None:
-        graph = SERVE_STATE.get("graph") or {}
-        check_cfg = SERVE_STATE.get("check_cfg") or {}
-        builder = make_profile_builder(graph, check_cfg,
-                                       SERVE_STATE.get("group_roles") or {},
-                                       SERVE_STATE.get("group_eligible_roles") or {})
-        SERVE_STATE["profile_builder"] = builder
-    return SERVE_STATE["profile_builder"]
+    """Return the current profile builder, never publishing one built from a
+    replaced analysis generation (database reload can race a slow request)."""
+    for _attempt in range(3):
+        with SERVE_STATE_LOCK:
+            builder = SERVE_STATE.get("profile_builder")
+            if (builder is not None
+                    and SERVE_STATE.get("profile_builder_generation")
+                    == SERVE_STATE.get("generation", 0)):
+                return builder
+            generation = SERVE_STATE.get("generation", 0)
+            graph = SERVE_STATE.get("graph") or {}
+            check_cfg = SERVE_STATE.get("check_cfg") or {}
+            group_roles = SERVE_STATE.get("group_roles") or {}
+            group_eligible_roles = SERVE_STATE.get("group_eligible_roles") or {}
+        builder = make_profile_builder(graph, check_cfg, group_roles,
+                                       group_eligible_roles)
+        with SERVE_STATE_LOCK:
+            if SERVE_STATE.get("generation", 0) == generation:
+                SERVE_STATE["profile_builder"] = builder
+                SERVE_STATE["profile_builder_generation"] = generation
+                return builder
+        # The database was reloaded while building: rebuild against the new
+        # graph instead of publishing stale tenant data.
+    raise RuntimeError("analysis state changed repeatedly while building profile")
 
 
 def _fetch_one_detail(kind, oid):
@@ -12281,20 +14042,25 @@ def _fetch_one_detail(kind, oid):
 
 
 def serve_profile_response(kind, oid):
+    generation = serve_generation()
     if kind == "user":
-        prof = next((f for f in SERVE_STATE["user_findings"] if f.get("user_id") == oid), None)
+        with SERVE_STATE_LOCK:
+            prof = next((f for f in SERVE_STATE["user_findings"]
+                         if f.get("user_id") == oid), None)
     elif kind in ("sp", "app"):
         cache = SERVE_STATE["profiles_lru"]
         prof = _lru_get(cache, (kind, oid))
         if prof is None:
             builder = _profile_builder()
             prof = builder[kind](oid)
-            if prof is not None:
+            if prof is not None and serve_generation() == generation:
                 _lru_put(cache, (kind, oid), prof, PROFILE_LRU_MAX)
     elif kind == "group":
-        prof = SERVE_STATE["group_profiles"].get(oid)
+        with SERVE_STATE_LOCK:
+            prof = SERVE_STATE["group_profiles"].get(oid)
     elif kind == "policy":
-        prof = SERVE_STATE["policy_profiles"].get(oid)
+        with SERVE_STATE_LOCK:
+            prof = SERVE_STATE["policy_profiles"].get(oid)
     else:
         return {"error": f"unknown profile kind: {kind}"}, 400
     if prof is None:
@@ -12305,11 +14071,12 @@ def serve_profile_response(kind, oid):
 def serve_details_response(kind, oid):
     if kind not in ("sp", "app", "user", "device"):
         return {"error": f"unknown detail kind: {kind}"}, 400
+    generation = serve_generation()
     cache = SERVE_STATE["details_lru"]
     rec = _lru_get(cache, (kind, oid))
     if rec is None:
         rec = _fetch_one_detail(kind, oid)
-        if rec is not None:
+        if rec is not None and serve_generation() == generation:
             _lru_put(cache, (kind, oid), rec, DETAIL_LRU_MAX)
     if rec is None:
         return {"error": "not found"}, 404
@@ -12322,12 +14089,24 @@ def serve_drilldown_response(qs):
     columns = SERVE_DRILLDOWN_COLUMNS.get(field)
     if not columns:
         return {"error": f"unsupported drilldown field: {field}"}, 400
+    if not value:
+        # An empty value must never match rows whose target field is absent or
+        # empty (it previously opened an "all tables" style modal).
+        return {"error": "drilldown value is required"}, 400
     contains = field in SERVE_CONTAINS_FIELDS
+    wanted = [x.strip() for x in value.split(",") if x.strip()]
     matches = []
     for rec in SERVE_STATE["records"]:
+        if field not in rec:
+            continue
         v = rec.get(field, "") or ""
+        if not v:
+            continue
         if contains:
-            hit = value in [x.strip() for x in v.split(",")]
+            # A cell can display several comma-separated values (e.g. two
+            # PIM-eligible roles); require every requested token to be present.
+            have = [x.strip() for x in str(v).split(",")]
+            hit = bool(wanted) and all(x in have for x in wanted)
         else:
             hit = v == value
         if hit:
@@ -12347,6 +14126,10 @@ def serve_drilldown_response(qs):
           <td class="expand-cell">{EXPAND_BUTTON_HTML}</td>
           {cells}
         </tr>{drawer_for_html(key, len(columns) + 1)}""")
+    if not rows_html:
+        rows_html.append(
+            f'<tr><td colspan="{len(columns) + 1}" class="muted">'
+            'No matching findings.</td></tr>')
     return {
         "title": f"{SERVE_FIELD_LABELS.get(field, field)}: {value}",
         "subtitle": f"{len(matches)} matching finding(s) in the collected set",
@@ -12372,18 +14155,224 @@ CA_ANALYSIS_STEPS = [
 
 CA_GUEST_TOKENS = {
     "AllGuestUsers", "AllExternalUsers", "GuestOrExternalUsers",
-    "GuestsOrExternalUsers", "GuestsAndExternalUsers",
+    "GuestsOrExternalUsers", "GuestsAndExternalUsers", "Guests",
+    "Guest", "AllGuests", "ExternalUsers",
 }
 
+# ROADrecon/AAD Graph legacy client tokens, normalized to lower case. Graph's
+# replaceable clientAppTypes use exchangeActiveSync/other/all instead, so both
+# vocabularies are recognized wherever legacy clients are matched.
 CA_LEGACY_CLIENT_TYPES = {
-    "EasSupported", "EasUnsupported", "OtherLegacy", "LegacySmtp", "LegacyPop",
-    "LegacyImap", "LegacyMapi", "LegacyOffice",
+    "eassupported", "easunsupported", "otherlegacy", "legacysmtp", "legacypop",
+    "legacyimap", "legacymapi", "legacyoffice",
 }
+CA_LEGACY_CLIENT_VALUES = CA_LEGACY_CLIENT_TYPES | {"exchangeactivesync", "other"}
 
 CA_CLIENT_APP_TYPES = ["browser", "mobileAppsAndDesktopClients",
                        "exchangeActiveSync", "other"]
 
 CA_ALL_PLATFORMS = {"android", "windows", "windows_phone", "macos", "linux", "ios"}
+
+# The Conditional Access "Office365" target is a suite, not a single appId.
+# These well-known first-party IDs are the stable core of the suite; display
+# names cover the rest of Microsoft's documented suite (which changes over
+# time and is tenant-populated). An explicit custom appId never matches.
+CA_OFFICE365_APP_IDS = {
+    "00000002-0000-0ff1-ce00-000000000000",  # Exchange Online
+    "00000003-0000-0ff1-ce00-000000000000",  # SharePoint Online
+    "00000004-0000-0ff1-ce00-000000000000",  # Skype for Business Online
+    "00000005-0000-0ff1-ce00-000000000000",  # Yammer / Viva Engage
+    "00000006-0000-0ff1-ce00-000000000000",  # Office 365 portal / Office.com
+    "c5393580-f805-4401-95e8-94b7a6ef2fc2",  # Office 365 Management APIs
+    "1fec8e78-bce4-4aaf-ab1b-5451cc387264",  # Microsoft Teams
+    "5e3ce6c0-2b1f-4285-8d4b-75ee78787346",  # Microsoft Teams (web)
+    "2d4d3d8e-2be3-4bef-9f87-7875a61c29de",  # Microsoft Teams services
+    "7df0a125-d3be-4c96-aa54-591f83ff541c",  # Power Automate
+}
+CA_OFFICE365_NAME_PREFIXES = (
+    "office 365", "microsoft 365", "office.com", "microsoft office",
+    "office online", "exchange online", "sharepoint online", "onedrive",
+    "microsoft teams", "microsoft forms", "microsoft planner",
+    "power automate", "microsoft flow", "microsoft powerapps", "powerapps",
+    "microsoft yammer", "yammer", "viva engage", "skype for business",
+    "office delve", "microsoft sway", "sway", "microsoft whiteboard",
+    "microsoft loop",
+)
+# Hard ceiling on path scenarios across the whole request (per-path caps still
+# apply); protects "all users" runs from unbounded CPU/memory use.
+CA_PATH_GLOBAL_SCENARIO_BUDGET = 200000
+
+
+def ca_user_is_guest(user_record):
+    """Guest/external users for guest-scoped CA include/exclude evaluation."""
+    rec = user_record or {}
+    utype = str(rec.get("type") or "").strip().lower()
+    if utype in ("guest", "external", "guestuser"):
+        return True
+    upn = str(rec.get("upn") or rec.get("userPrincipalName") or "").lower()
+    return "#ext#" in upn
+
+
+def ca_policy_includes_user(policy, uid, users):
+    """Whether a policy's user include scope covers `uid`.
+
+    Guest-only scopes must not cover member users; All users includes guests.
+    """
+    if policy.get("inc_all"):
+        return True
+    if policy.get("inc_guest") and ca_user_is_guest((users or {}).get(uid)):
+        return True
+    return uid in (policy.get("inc_users") or ())
+
+
+def ca_policy_excludes_user(policy, uid, users):
+    """Whether a policy's user exclusions cover `uid` (including guest scope)."""
+    if uid in (policy.get("exc_users") or ()):
+        return True
+    return bool(policy.get("exc_guest")
+                and ca_user_is_guest((users or {}).get(uid)))
+
+
+def ca_client_matches(client_inc, client_exc, client_app):
+    """Evaluate a client-app axis. Returns (True/False/None, reason)."""
+    if not client_inc and not client_exc:
+        return True, None
+    if not client_app:
+        return None, "client app not specified"
+    client = str(client_app).lower()
+    inc = [str(c).lower() for c in client_inc]
+    exc = [str(c).lower() for c in client_exc]
+    if "all" in exc or client in exc:
+        return False, "client app excluded"
+    if "all" in inc or client in inc:
+        return True, None
+    if client in ("exchangeactivesync", "other") and any(
+            c in CA_LEGACY_CLIENT_TYPES for c in inc):
+        return True, None
+    if inc and client in ("exchangeactivesync", "other"):
+        return None, "legacy client mapping uncertain"
+    return False, "client app not targeted"
+
+
+def ca_policy_blocks_legacy(policy):
+    """True when an enabled block policy targets legacy clients."""
+    if not policy.get("block"):
+        return False
+    inc = {str(c).lower() for c in policy.get("client_inc") or []}
+    return "all" in inc or bool(inc & CA_LEGACY_CLIENT_VALUES)
+
+
+def ca_app_is_office365(app_id, app_name=""):
+    """Whether an application belongs to the Conditional Access Office365 suite."""
+    low_id = str(app_id or "").strip().lower()
+    if low_id and low_id in CA_OFFICE365_APP_IDS:
+        return True
+    name = str(app_name or "").strip().lower()
+    if not name:
+        return False
+    return any(name == prefix or name.startswith(prefix + " ")
+               or name.startswith(prefix + " -")
+               or name.startswith(prefix + " (")
+               for prefix in CA_OFFICE365_NAME_PREFIXES)
+
+
+def ca_app_covered(apps_inc, apps_exc, app_id, app_name=""):
+    """Whether a policy's application scope covers one appId.
+
+    Unlike a plain `Office365 in inc` check, this restricts Office365 to the
+    Microsoft 365 suite instead of treating it as "all applications".
+    """
+    low = str(app_id or "").strip().lower()
+    inc = [str(a).lower() for a in apps_inc or [] if a]
+    exc = [str(a).lower() for a in apps_exc or [] if a]
+    office365 = ca_app_is_office365(low, app_name)
+    if "all" in exc or (low and low in exc) or ("office365" in exc and office365):
+        return False
+    if "all" in inc or (low and low in inc):
+        return True
+    return "office365" in inc and office365
+
+
+def ca_location_verdict(policy, scenario, locations):
+    """Evaluate named/trusted location conditions.
+
+    The what-if scenario only knows whether the sign-in is trusted, not which
+    named location it came from. Named-location conditions therefore stay
+    signal-dependent (None) unless the scenario identifies an exact location;
+    a first non-matching named location must not hide a later match.
+    """
+    inc_l = list(policy.get("locations_inc") or [])
+    exc_l = list(policy.get("locations_exc") or [])
+    trust_inc = bool(policy.get("trusted_locations"))
+    if not inc_l and not exc_l and not trust_inc:
+        return True, None
+    trusted = scenario.get("trusted_location")
+    selected = scenario.get("location_id") or scenario.get("named_location")
+    selected_low = str(selected).strip().lower() if selected else ""
+    unknown = []
+
+    def _same_location(loc):
+        return bool(selected_low) and str(loc).strip().lower() == selected_low
+
+    for loc in exc_l:
+        low = str(loc).lower()
+        if low == "all":
+            return False, "all locations excluded"
+        if low == "alltrusted":
+            if trusted is True:
+                return False, "trusted locations excluded"
+            if trusted is None:
+                unknown.append("trusted location not specified")
+            continue
+        rec = locations.get(loc)
+        if selected_low:
+            if _same_location(loc):
+                return False, f"location '{rec['name'] if rec else loc}' excluded"
+            continue
+        if rec is None:
+            unknown.append("named location excluded (not found)")
+        else:
+            unknown.append(f"location '{rec['name']}' excluded (not identified)")
+
+    include_match = False
+    include_unknown = False
+    include_all = False
+    if trust_inc or any(str(loc).lower() == "alltrusted" for loc in inc_l):
+        if trusted is True:
+            include_match = True
+        elif trusted is None:
+            include_unknown = True
+    for loc in inc_l:
+        low = str(loc).lower()
+        if low == "all":
+            include_all = True
+            continue
+        if low == "alltrusted":
+            continue
+        rec = locations.get(loc)
+        if selected_low:
+            if _same_location(loc):
+                include_match = True
+            continue
+        include_unknown = True
+        if rec is None:
+            unknown.append("named location (not found)")
+        else:
+            unknown.append(f"location '{rec['name']}' include not identified")
+
+    if include_all:
+        include_match = True
+    if include_match:
+        if unknown:
+            return None, "; ".join(unknown)
+        return True, None
+    if include_unknown:
+        return None, "; ".join(unknown or ["named location include not identified"])
+    if inc_l or trust_inc:
+        return False, "location not targeted"
+    if unknown:
+        return None, "; ".join(unknown)
+    return True, None
 
 
 def fmt_platforms(inc, exc):
@@ -12407,12 +14396,23 @@ def fmt_platforms(inc, exc):
 
 
 def _ca_policy_inner(detail):
+    """Decode a CA policyDetail column that may be a dict, a JSON string, a
+    one-element list holding either, or an empty/None value."""
     parsed = json_safe_value(detail)
     try:
-        inner = json.loads(parsed[0]) if parsed and isinstance(parsed, list) \
-            and isinstance(parsed[0], str) else (parsed[0] if parsed else None)
+        if isinstance(parsed, list):
+            if not parsed:
+                return {}
+            first = parsed[0]
+            inner = json.loads(first) if isinstance(first, str) else first
+        elif isinstance(parsed, dict):
+            inner = parsed
+        elif isinstance(parsed, str):
+            inner = json.loads(parsed) if parsed else {}
+        else:
+            inner = parsed
         return inner if isinstance(inner, dict) else {}
-    except (json.JSONDecodeError, ValueError, TypeError, IndexError):
+    except (json.JSONDecodeError, ValueError, TypeError, IndexError, KeyError):
         return {}
 
 
@@ -12428,6 +14428,7 @@ def load_ca_dataset(db_path):
         "group_member_user": defaultdict(set),
         "group_member_group": defaultdict(set),
         "role_member_user": defaultdict(set),
+        "role_member_group": defaultdict(set),
         "role_template_members": defaultdict(set),
         "role_template_by_oid": {},
     }
@@ -12441,14 +14442,9 @@ def load_ca_dataset(db_path):
         # named locations (policyType 6) with trusted classification
         cur.execute("SELECT objectId, displayName, policyDetail FROM Policys WHERE policyType = 6")
         for oid, name, detail in cur.fetchall():
-            trusted = False
-            try:
-                parsed = json_safe_value(detail)
-                inner = json.loads(parsed[0]) if parsed and isinstance(parsed, list) \
-                    and isinstance(parsed[0], str) else {}
-                trusted = "trusted" in [str(c).lower() for c in (inner.get("Categories") or [])]
-            except (json.JSONDecodeError, ValueError, TypeError, IndexError):
-                pass
+            inner = _ca_policy_inner(detail)
+            trusted = "trusted" in [str(c).lower()
+                                    for c in (inner.get("Categories") or [])]
             data["locations"][oid] = {"name": name or oid, "trusted": trusted}
         cur.execute("SELECT objectId, displayName FROM Groups")
         for oid, disp in cur.fetchall():
@@ -12480,7 +14476,8 @@ def load_ca_dataset(db_path):
         for table, left, right, target in (
                 ("lnk_group_member_user", "Group", "User", "group_member_user"),
                 ("lnk_group_member_group", "Group", "childGroup", "group_member_group"),
-                ("lnk_role_member_user", "DirectoryRole", "User", "role_member_user")):
+                ("lnk_role_member_user", "DirectoryRole", "User", "role_member_user"),
+                ("lnk_role_member_group", "DirectoryRole", "Group", "role_member_group")):
             try:
                 cur.execute(f'SELECT "{left}", "{right}" FROM {table}')
                 bucket = data[target]
@@ -12634,15 +14631,18 @@ def _normalize_ca_policy(inner):
 def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
                     assume_groups=None, assume_roles=None,
                     assume_groups_b=None, assume_roles_b=None,
-                    scenario=None, options=None):
+                    scenario=None, options=None, user_findings=None,
+                    records=None):
     """Conditional Access coverage analysis. `progress(step_id, detail)` marks
-    each step complete as it finishes. When `target_upn` is given, the analysis
-    is scoped to that single user. `compare_upns` switches to two-user policy
-    comparison; assume_groups/roles apply to the first user and the _b variants
-    to the second. `scenario` is an optional what-if sign-in context (platform,
-    client app, trusted location, risk levels, device state, auth flow, device
-    filter, ACR). `options` controls path-audit population, resource/client
-    filters, fast/full mode, and the scenario cap.
+    each step complete as it finishes; pass running=True at phase start. When
+    `target_upn` is given, the analysis is scoped to that single user.
+    `compare_upns` switches to two-user policy comparison; assume_groups/roles
+    apply to the first user and the _b variants to the second. `scenario` is an
+    optional what-if sign-in context (platform, client app, trusted location,
+    risk levels, device state, auth flow, device filter, ACR). `options`
+    controls path-audit population, resource/client filters, fast/full mode, and
+    the scenario caps. user_findings/records default to the live serve state;
+    start_ca_analysis passes snapshots so a database reload cannot mix tenants.
     Returns {summary_html, sections_html, tables}."""
     assume_groups = assume_groups or []
     assume_roles = assume_roles or []
@@ -12650,7 +14650,11 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
     assume_roles_b = assume_roles_b or []
     scenario = scenario or {}
     options = options or {}
-    progress("load")
+    if user_findings is None:
+        user_findings = SERVE_STATE.get("user_findings", [])
+    if records is None:
+        records = SERVE_STATE.get("records", [])
+    progress("load", running=True)
     data = load_ca_dataset(db_path)
     if target_upn:
         needle = (target_upn or "").strip().lower()
@@ -12661,8 +14665,12 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
                 break
         if target_uid is None:
             raise ValueError(f"user '{target_upn}' not found in the collected users")
+    progress("load", f"{len(data['policies'])} policy(ies), "
+                     f"{len(data['users'])} user(s), {len(data['groups'])} group(s)")
 
-    progress("scopes")
+    progress("scopes", running=True)
+
+    group_memo = {}
 
     def _expand_group(gid, memo):
         if gid in memo:
@@ -12693,11 +14701,45 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
                 out.add(template_id)
         return out
 
+    # Role membership inherited through groups: direct role groups plus every
+    # nested child group. Policies refer to DirectoryRole object IDs or role
+    # template IDs, so expand into both views.
+    role_group_members = defaultdict(set)
+    role_template_group_members = defaultdict(set)
+    for role_oid, gids in data["role_member_group"].items():
+        members = set()
+        for gid in gids:
+            members |= _expand_group(gid, group_memo)
+        role_group_members[role_oid] |= members
+        template_id = data["role_template_by_oid"].get(role_oid)
+        if template_id:
+            role_template_group_members[template_id] |= members
+
     def _role_members(rid):
-        return data["role_member_user"].get(rid, set()) | data["role_template_members"].get(rid, set())
+        return (data["role_member_user"].get(rid, set())
+                | data["role_template_members"].get(rid, set())
+                | role_group_members.get(rid, set())
+                | role_template_group_members.get(rid, set()))
+
+    def _user_role_ids(uid):
+        """Role IDs (directory role + template) the user holds directly or
+        through direct/nested group membership."""
+        roles = {rid for rid, members in data["role_member_user"].items()
+                 if uid in members}
+        roles |= {rid for rid, members in data["role_template_members"].items()
+                  if uid in members}
+        for rid, gids in data["role_member_group"].items():
+            if any(uid in _expand_group(gid, group_memo) for gid in gids):
+                roles.add(rid)
+                template_id = data["role_template_by_oid"].get(rid)
+                if template_id:
+                    roles.add(template_id)
+        return roles
+
+    def _is_guest(uid):
+        return ca_user_is_guest(data["users"].get(uid))
 
     policies = []
-    group_memo = {}
     for p in data["policies"]:
         inner = _normalize_ca_policy(p["inner"])
         control_blocks = []
@@ -12737,11 +14779,13 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
                 if rid not in inc_role_list:
                     inc_role_list.append(rid)
                 inc_users |= _role_members(rid)
-        exc_users = set()
+        exc_users, exc_guest = set(), False
         exc_group_list, exc_role_list = [], []
         for block in _ca_blocks(inner, "Users", "Exclude"):
             for uid in block.get("Users") or []:
-                if uid not in CA_GUEST_TOKENS and uid != "All":
+                if uid in CA_GUEST_TOKENS:
+                    exc_guest = True
+                elif uid != "All":
                     exc_users.add(uid)
             for gid in block.get("Groups") or []:
                 if gid not in exc_group_list:
@@ -12820,7 +14864,7 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             "compliant": any(c.lower() in ("requirecompliantdevice", "compliantdevice") for c in controls),
             "auth_strength": auth_strength,
             "inc_users": inc_users, "inc_all": inc_all, "inc_guest": inc_guest,
-            "exc_users": exc_users,
+            "exc_users": exc_users, "exc_guest": exc_guest,
             "inc_group_list": inc_group_list, "inc_role_list": inc_role_list,
             "exc_group_list": exc_group_list, "exc_role_list": exc_role_list,
             "apps_inc": apps_inc, "apps_exc": apps_exc,
@@ -12838,10 +14882,19 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
     progress("scopes", f"{len(policies)} policy(ies), {len(enabled)} enabled")
 
     def would_include(p, uid):
-        return bool(p["inc_all"] or p["inc_guest"] or uid in p["inc_users"])
+        return ca_policy_includes_user(p, uid, data["users"])
+
+    def _excluded(p, uid):
+        return ca_policy_excludes_user(p, uid, data["users"])
 
     def applies_to(p, uid):
-        return would_include(p, uid) and uid not in p["exc_users"]
+        return would_include(p, uid) and not _excluded(p, uid)
+
+    app_name_by_id = {}
+    for sp in data["sps"].values():
+        app_id = (sp.get("appId") or "").lower()
+        if app_id:
+            app_name_by_id[app_id] = sp.get("name") or app_id
 
     def _path_app_axis(p, sc):
         acr = sc.get("acr")
@@ -12859,41 +14912,27 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             return False, "user-action policy only"
         inc = [str(a).lower() for a in p.get("apps_inc") or []]
         exc = [str(a).lower() for a in p.get("apps_exc") or []]
-        app_id = sc.get("app_id")
-        if app_id and app_id.lower() in exc:
+        app_id = (sc.get("app_id") or "").lower()
+        if app_id and app_id in exc:
             return False, "resource excluded"
         if "all" in exc:
             return False, "all resources excluded"
         if not inc and not exc:
             return True, None
-        if "all" in inc or "office365" in inc:
+        if "all" in inc or (app_id and app_id in inc):
+            return True, None
+        if "office365" in inc and app_id and ca_app_is_office365(
+                app_id, app_name_by_id.get(app_id, "")):
             return True, None
         if sc.get("resource_unscoped"):
             return False, "resource not specifically targeted"
         if not app_id:
             return None, "resource not specified"
-        if app_id.lower() in inc:
-            return True, None
         return False, "resource not targeted"
 
     def _path_client_axis(p, sc):
-        if not p["client_inc"] and not p["client_exc"]:
-            return True, None
-        client = sc.get("client_app")
-        if not client:
-            return None, "client app not specified"
-        inc = [str(c).lower() for c in p["client_inc"]]
-        exc = [str(c).lower() for c in p["client_exc"]]
-        if "all" in exc or client.lower() in exc:
-            return False, "client app excluded"
-        if "all" in inc or client.lower() in inc:
-            return True, None
-        if client.lower() in ("exchangeactivesync", "other") and any(
-                str(c).lower() in CA_LEGACY_CLIENT_TYPES for c in inc):
-            return True, None
-        if inc and client.lower() in ("exchangeactivesync", "other"):
-            return None, "legacy client mapping uncertain"
-        return False, "client app not targeted"
+        return ca_client_matches(p["client_inc"], p["client_exc"],
+                                 sc.get("client_app"))
 
     def _path_platform_axis(p, sc):
         if not p["platforms_inc"] and not p["platforms_exc"]:
@@ -12934,40 +14973,7 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
         return False, "device state not targeted"
 
     def _path_location_axis(p, sc):
-        inc_l, exc_l = p["locations_inc"], p["locations_exc"]
-        if not inc_l and not exc_l and not p["trusted_locations"]:
-            return True, None
-        trusted = sc.get("trusted_location")
-        for loc in exc_l:
-            low = str(loc).lower()
-            if low == "all":
-                return False, "all locations excluded"
-            if low == "alltrusted":
-                if trusted is True:
-                    return False, "trusted locations excluded"
-                continue
-            rec = data["locations"].get(loc)
-            if rec is None:
-                return None, "named location excluded (not found)"
-            if trusted is not None and rec["trusted"] == trusted:
-                return False, f"location '{rec['name']}' excluded"
-        if p["trusted_locations"] or any(str(l).lower() == "alltrusted" for l in inc_l):
-            if trusted is None:
-                return None, "trusted location not specified"
-            return bool(trusted), None
-        for loc in inc_l:
-            low = str(loc).lower()
-            if low == "all":
-                return True, None
-            rec = data["locations"].get(loc)
-            if rec is None:
-                return None, "named location (not found)"
-            if trusted is None:
-                return None, f"location '{rec['name']}' not specified"
-            if rec["trusted"] == trusted:
-                return True, None
-            return False, f"location '{rec['name']}' does not match"
-        return True, None
+        return ca_location_verdict(p, sc, data["locations"])
 
     def _path_risk_axis(name, policy_list, sc_value):
         if not policy_list:
@@ -13043,6 +15049,7 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             "require": (payload.get("require") or "").strip().lower(),
             "trusted_location": (None if payload.get("trusted_location") in (None, "")
                                  else str(payload["trusted_location"]).lower() == "true"),
+            "location_id": payload.get("location_id") or payload.get("named_location") or None,
         }
 
     def _control_label(control):
@@ -13102,7 +15109,7 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
     requested_upns = {str(u).strip().lower()
                       for u in (options.get("users") or []) if str(u).strip()}
     sev_by_uid = {f.get("user_id"): f.get("severity", "Info")
-                  for f in SERVE_STATE.get("user_findings", [])
+                  for f in user_findings
                   if f.get("user_id")}
     priv_users = {}
 
@@ -13135,7 +15142,7 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             if (rec.get("upn") or "").strip().lower() in requested_upns:
                 _add_user(uid, rec)
     else:
-        for f in SERVE_STATE.get("user_findings", []):
+        for f in user_findings:
             if is_privileged(f.get("severity", "Info")):
                 uid = f.get("user_id")
                 if not uid:
@@ -13148,16 +15155,16 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
         "all": "All users", "list": "Listed users",
     }.get(population, "Privileged users")
 
-    progress("users")
+    progress("users", running=True)
     zero_coverage, no_mfa, no_compliant, report_only_bypass = [], [], [], []
     excluded_bypass = []
     for uid in sorted(priv_users, key=lambda u: (severity_rank(priv_users[u]["severity"]),
                                                  priv_users[u]["upn"].lower())):
         applying = [p for p in enabled if applies_to(p, uid)]
         reporting = [p for p in policies
-                     if p["state"] != "Enabled" and applies_to(p, uid)]
+                     if p["state"] == "Reporting" and applies_to(p, uid)]
         excluded = [p for p in enabled
-                    if would_include(p, uid) and uid in p["exc_users"]]
+                    if would_include(p, uid) and _excluded(p, uid)]
         if not applying:
             zero_coverage.append(priv_users[uid])
             if excluded:
@@ -13180,33 +15187,29 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
                       f"{len(report_only_bypass)} report-only bypass, "
                       f"{len(excluded_bypass)} excluded bypass")
 
-    progress("apps")
+    progress("apps", running=True)
     priv_sp_ids = {}
-    for rec in SERVE_STATE.get("records", []):
+    for rec in records:
         if is_privileged(rec.get("severity", "Info")):
             sid = (rec.get("__ids") or {}).get("sp")
             if sid and sid not in priv_sp_ids:
                 priv_sp_ids[sid] = rec.get("severity", "Info")
-    def app_covered(p, app_id):
-        inc = [str(a).lower() for a in p["apps_inc"] if a]
-        exc = [str(a).lower() for a in p["apps_exc"] if a]
-        if "all" in exc or app_id in exc:
-            return False
-        return "all" in inc or "office365" in inc or app_id in inc
+    def app_covered(p, app_id, app_name=""):
+        return ca_app_covered(p["apps_inc"], p["apps_exc"], app_id, app_name)
 
     app_gaps = []
     for sid in sorted(priv_sp_ids):
         sp = data["sps"].get(sid) or {"name": sid, "appId": ""}
         app_id = (sp.get("appId") or "").lower()
-        if app_id and not any(app_covered(p, app_id) for p in enabled):
-            app_gaps.append({"sp_id": sid, "name": sp.get("name") or sid,
+        app_name = sp.get("name") or ""
+        if app_id and not any(app_covered(p, app_id, app_name) for p in enabled):
+            app_gaps.append({"sp_id": sid, "app_id": sp.get("appId") or "",
+                             "name": sp.get("name") or sid,
                              "severity": priv_sp_ids[sid]})
     progress("apps", f"{len(app_gaps)} privileged app(s) without coverage")
 
-    progress("legacy")
-    legacy_blockers = [p for p in enabled if p["block"] and (
-        any(t in CA_LEGACY_CLIENT_TYPES for t in p["client_inc"])
-        or "All" in p["client_inc"])]
+    progress("legacy", running=True)
+    legacy_blockers = [p for p in enabled if ca_policy_blocks_legacy(p)]
     legacy_gap = sorted(
         (priv_users[uid] for uid in priv_users
          if not any(applies_to(p, uid) for p in legacy_blockers)),
@@ -13215,12 +15218,12 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
              f"{len(legacy_blockers)} legacy-auth block policy(ies), "
              f"{len(legacy_gap)} privileged user(s) outside them")
 
-    progress("exclusions")
+    progress("exclusions", running=True)
     excl_rows = []
     for uid in sorted(priv_users, key=lambda u: (severity_rank(priv_users[u]["severity"]),
                                                  priv_users[u]["upn"].lower())):
         exclusions = [p for p in enabled
-                      if would_include(p, uid) and uid in p["exc_users"]]
+                      if would_include(p, uid) and _excluded(p, uid)]
         if exclusions:
             excl_rows.append({
                 **priv_users[uid],
@@ -13239,6 +15242,11 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
         path_max = 24 if raw_max in (None, "") else max(0, min(500, int(raw_max)))
     except (TypeError, ValueError):
         path_max = 24
+    raw_total = options.get("max_total_scenarios", CA_PATH_GLOBAL_SCENARIO_BUDGET)
+    try:
+        path_total_max = max(0, int(raw_total))
+    except (TypeError, ValueError):
+        path_total_max = CA_PATH_GLOBAL_SCENARIO_BUDGET
     path_active = set()
     for p in policies:
         if p["locations_inc"] or p["locations_exc"] or p["trusted_locations"]:
@@ -13255,12 +15263,6 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             path_active.add("device_filter")
         if p["device_states_inc"] or p["device_states_exc"]:
             path_active.add("device_state")
-
-    app_name_by_id = {}
-    for sp in data["sps"].values():
-        app_id = (sp.get("appId") or "").lower()
-        if app_id:
-            app_name_by_id[app_id] = sp.get("name") or app_id
 
     def _resource_label(resource_id):
         if resource_id == "__unscoped__":
@@ -13353,9 +15355,14 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             "req_policies": req_outcome["policies"] if req_outcome else [],
         }
 
-    def _evaluate_path(uid, app_id, resource_label, unscoped, acr, client_app):
+    def _evaluate_path(uid, app_id, resource_label, unscoped, acr, client_app,
+                       scenario_limit=None):
         outcomes = {}
         scenarios_evaluated = 0
+        scenario_cap = path_max
+        if scenario_limit is not None:
+            scenario_cap = (scenario_limit if not scenario_cap
+                            else min(scenario_cap, scenario_limit))
         for base_sc in _iter_path_scenarios():
             sc = dict(base_sc)
             sc.update({"app_id": app_id, "acr": acr,
@@ -13367,13 +15374,13 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
                     continue
                 verdict, _note = condition_verdict(p, sc)
                 if p["enabled"]:
-                    if uid in p["exc_users"]:
+                    if _excluded(p, uid):
                         if verdict == "yes":
                             excluded_apply.append(p)
                     elif verdict == "yes":
                         enabled_apply.append(p)
-                elif p["state"] not in ("Disabled", "Unknown"):
-                    if uid not in p["exc_users"] and verdict == "yes":
+                elif p["state"] == "Reporting":
+                    if not _excluded(p, uid) and verdict == "yes":
                         reporting_apply.append(p)
             blocked = next((p for p in enabled_apply if p["block"]), None)
             if blocked:
@@ -13415,17 +15422,15 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
                 o = outcomes[key] = {
                     "controls": controls, "gap_type": gap_type,
                     "blocked": bool(blocked), "policies": [],
-                    "controls_display": display, "conditions": [],
+                    "controls_display": display,
                     "scenario_count": 0,
                 }
             o["scenario_count"] += 1
             for name in responsible:
                 if name and name not in o["policies"]:
                     o["policies"].append(name)
-            if len(o["conditions"]) < 10:
-                o["conditions"].append(dict(sc))
             scenarios_evaluated += 1
-            if path_max and scenarios_evaluated >= path_max:
+            if scenario_cap and scenarios_evaluated >= scenario_cap:
                 break
         outcome_list = list(outcomes.values())
         for o in outcome_list:
@@ -13436,21 +15441,38 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             **summary,
         }
 
+    progress("paths", running=True)
+    path_budget_used = 0
+    path_budget_exhausted = False
     if not target_upn and not compare_upns and priv_users:
         for uid in sorted(priv_users, key=lambda u: (
                 severity_rank(priv_users[u]["severity"]),
                 priv_users[u]["upn"].lower())):
+            if path_budget_exhausted:
+                break
             user = priv_users[uid]
             for app_id, resource_label, unscoped, acr in path_resources:
+                if path_budget_exhausted:
+                    break
                 for client_app in path_clients:
+                    remaining = (None if not path_total_max
+                                 else max(0, path_total_max - path_budget_used))
+                    if remaining is not None and remaining <= 0:
+                        path_budget_exhausted = True
+                        break
                     result = _evaluate_path(uid, app_id, resource_label,
-                                            unscoped, acr, client_app)
+                                            unscoped, acr, client_app,
+                                            scenario_limit=remaining)
+                    path_budget_used += result["scenarios_evaluated"]
                     path_records.append({
                         "uid": uid, "user": user["name"], "upn": user["upn"],
                         "severity": user["severity"], "resource": resource_label,
                         "resource_id": app_id or "", "acr": acr or "",
                         "client_app": client_app, **result,
                     })
+                    if path_total_max and path_budget_used >= path_total_max:
+                        path_budget_exhausted = True
+                        break
         path_records.sort(key=lambda r: (
             0 if r["has_gap"] else 1 if r["has_req"] else 2,
             r["upn"].lower(), r["resource"].lower(), r["client_app"]))
@@ -13460,9 +15482,10 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
     path_scenarios = sum(r["scenarios_evaluated"] for r in path_records)
     progress("paths", "single-user what-if" if target_upn else
              f"{len(path_records)} path(s), {len(path_gap_records)} gap path(s), "
-             f"{path_scenarios} scenario(s)")
+             f"{path_scenarios} scenario(s)"
+             + (" (global scenario budget reached)" if path_budget_exhausted else ""))
 
-    progress("render")
+    progress("render", running=True)
 
     def build_table(tid, title, cols, rows, sort_fields, subtitle=""):
         """cols: [(label, width), ...] for data columns (expand col implicit);
@@ -13481,7 +15504,7 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
     <h2>{esc(title)}</h2>
     {subtitle}
     <div class="table-scroll">
-    <table id="{esc(tid)}" class="findings" data-serve="1">
+    <table id="{esc(tid)}" class="findings" data-serve="1" data-ca-result="1">
       <colgroup>{colgroup}</colgroup>
       <thead><tr>{''.join(cells)}</tr></thead>
       <tbody></tbody>
@@ -13502,10 +15525,11 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
                 f'<td class="clickable" data-field="userUpn" data-value="{esc(r["upn"])}">{esc(r["upn"])}</td>'
                 f'{extra_cell}</tr>{drawer_for_html(key, 4 + (1 if extra_cell else 0))}')
         return {"_html": html, "_text": text,
-                "fields": {"severity": sev, "user": r["name"], "upn": r["upn"]}}
+                "fields": {"severity": sev, "user": r["name"],
+                           "upn": r["upn"], "userUpn": r["upn"]}}
 
     user_cols = [("Privileges", "100px"), ("User", "220px"), ("UPN", "260px")]
-    user_sort = {"1": "severity", "3": "upn"}
+    user_sort = {"1": "severity", "2": "user", "3": "upn"}
 
     def user_rows_for(entries, key_prefix, extra=None):
         out = []
@@ -13521,7 +15545,7 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
     for i, r in enumerate(app_gaps):
         sev = r.get("severity") or "High"
         app_rows.append({
-            "_html": (f'<tr data-sp-id="{esc(r["sp_id"])}" data-detail-key="ca-apps-{i}">'
+            "_html": (f'<tr data-sp-id="{esc(r["sp_id"])}" data-app-id="{esc(r.get("app_id") or "")}" data-detail-key="ca-apps-{i}">'
                       f'<td class="expand-cell">{EXPAND_BUTTON_HTML}</td>'
                       f'<td data-field="severity" data-value="{sev}">{severity_badge(sev)}</td>'
                       f'<td class="clickable" data-field="app" data-value="{esc(r["name"])}">{esc(r["name"])}</td>'
@@ -13627,7 +15651,7 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             "ca-reportonly-table",
             "REPORT_ONLY_BYPASS (privileged users covered only by report-only policies)",
             [("Privileges", "100px"), ("User", "220px"), ("UPN", "240px"), ("Coverage", "110px")],
-            ro_rows, {"1": "severity", "3": "upn"}))
+            ro_rows, {"1": "severity", "2": "user", "3": "userUpn", "4": "ro"}))
     if excluded_bypass:
         eb_rows = []
         for i, r in enumerate(excluded_bypass):
@@ -13639,7 +15663,7 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             "ca-excluded-table",
             "EXCLUDED_BYPASS (no other enabled policy applies)",
             [("Privileges", "100px"), ("User", "220px"), ("UPN", "240px"), ("Coverage", "110px")],
-            eb_rows, {"1": "severity", "3": "upn"}))
+            eb_rows, {"1": "severity", "2": "user", "3": "userUpn", "4": "excluded"}))
     if path_records:
         path_rows = []
         for i, r in enumerate(path_records):
@@ -13658,7 +15682,8 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             policies_text = ", ".join(r["gap_policies"] or r["req_policies"] or [])
             gap_text = r["gap_type"] or "—"
             fields = {
-                "user": r["user"], "upn": r["upn"], "resource": r["resource"],
+                "user": r["user"], "upn": r["upn"], "userUpn": r["upn"],
+                "resource": r["resource"],
                 "clientapp": r["client_app"], "result": result_text,
                 "gaptype": r["gap_type"] or "", "policies": policies_text,
                 "scenarios": str(r["scenarios_evaluated"]),
@@ -13689,7 +15714,8 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
                         "5": "result", "6": "gaptype", "7": "policies", "8": "scenarios"},
             subtitle=f'<p class="sub">Mode: {esc(path_mode)} · '
                      f'active dims: {esc(", ".join(sorted(path_active)) or "none")} · '
-                     f'scenario cap: {path_max or "none"}</p>'))
+                     f'scenarios/path: {path_max or "none"} · '
+                     f'global scenario budget: {path_total_max or "none"}</p>'))
     if app_rows:
         tables.append(build_table("ca-apps-table", "Privileged apps with no CA coverage",
                                   [("Privileges", "100px"), ("Application", "240px")],
@@ -13710,14 +15736,20 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             excl_table_rows.append(row)
         tables.append(build_table("ca-excl-table", "CA exclusions (privileged users)",
                                   [("Privileges", "100px"), ("User", "220px"), ("UPN", "260px"), ("Exclusions", "80px")],
-                                  excl_table_rows, {"1": "severity", "3": "upn", "4": "caexcl"}))
+                                  excl_table_rows, {"1": "severity", "2": "user",
+                                                    "3": "upn", "4": "caexcl"}))
     if enabled:
         tables.append(build_table("ca-conditions-table", "Enabled CA policy conditions",
                                   [("Policy", "240px"), ("State", "90px"), ("Controls", "170px"),
                                    ("Apps", "130px"), ("Platforms", "150px"), ("Device states", "130px"),
                                    ("Locations", "150px"), ("Risk", "120px"), ("Client types", "160px"),
                                    ("Auth flows", "120px"), ("Device filter", "100px"), ("ACR", "150px")],
-                                  conds_rows, {"1": "polname", "2": "polstate"}))
+                                  conds_rows, {"1": "polname", "2": "polstate",
+                                               "3": "polcontrols", "4": "polapps",
+                                               "5": "platforms", "6": "devicestates",
+                                               "7": "locations", "8": "risk",
+                                               "9": "clients", "10": "authflows",
+                                               "11": "devfilter", "12": "acrs"}))
 
     sections_html = "".join(t["section"] for t in tables if t)
     if not legacy_blockers:
@@ -13759,11 +15791,7 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
                 + ("unresolved assumed role(s): " + ", ".join(missing_r) if missing_r else ""))
 
         # ---- the user's memberships, for targeting reasons -----------------
-        user_roles = {rid for rid, members in data["role_member_user"].items()
-                      if target_uid in members}
-        for template_id, members in data["role_template_members"].items():
-            if target_uid in members:
-                user_roles.add(template_id)
+        user_roles = _user_role_ids(target_uid)
         user_groups = {gid for gid, members in data["group_member_user"].items()
                        if target_uid in members}
         referenced_gids = set()
@@ -13784,16 +15812,14 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             return f"{label}" + ("" if rid not in assumed_rids or rid in user_roles else " (assumed)")
 
         def _included_sim(p):
-            if p["inc_all"] or p["inc_guest"]:
-                return True
-            if target_uid in p["inc_users"]:
+            if would_include(p, target_uid):
                 return True
             if any(g in containing for g in p["inc_group_list"]):
                 return True
             return any(r in all_roles for r in p["inc_role_list"])
 
         def _excluded_sim(p):
-            if target_uid in p["exc_users"]:
+            if _excluded(p, target_uid):
                 return True
             if any(g in containing for g in p["exc_group_list"]):
                 return True
@@ -13802,6 +15828,8 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
         def _include_reason(p):
             if p["inc_all"]:
                 return "All users"
+            if p["inc_guest"] and _is_guest(target_uid):
+                return "guest/external users"
             matched = [g for g in p["inc_group_list"] if g in containing]
             if matched:
                 return "via group: " + ", ".join(_gname(g) for g in matched[:3])
@@ -13815,6 +15843,8 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
         def _exclude_reason(p):
             if target_uid in p["exc_users"]:
                 return "direct user"
+            if p["exc_guest"] and _is_guest(target_uid):
+                return "guest/external users"
             matched = [g for g in p["exc_group_list"] if g in containing]
             if matched:
                 return "via group: " + ", ".join(_gname(g) for g in matched[:3])
@@ -13824,7 +15854,7 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             return "excluded"
 
         applying = [p for p in enabled if _included_sim(p) and not _excluded_sim(p)]
-        excl_pols = [p for p in enabled if _excluded_sim(p)]
+        excl_pols = [p for p in enabled if _included_sim(p) and _excluded_sim(p)]
 
         # ---- what-if condition evaluation ----------------------------------
         sc = build_scenario(scenario)
@@ -13850,7 +15880,7 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
         def_en = [r for r in whatif_rows
                   if r["verdict"]["applies"] == "yes" and r["state"] == "Enabled"]
         def_rep = [r for r in whatif_rows
-                   if r["verdict"]["applies"] == "yes" and r["state"] != "Enabled"]
+                   if r["verdict"]["applies"] == "yes" and r["state"] == "Reporting"]
         require = sc["require"]
         require_label = {"mfa": "MFA", "compliant": "compliant device",
                          "mfa_compliant": "MFA + compliant device"}.get(require)
@@ -13889,7 +15919,8 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
         tables = [build_table("ca-apply-table", f"Policies applying to {target['upn']}",
                               [("Policy", "240px"), ("Controls", "150px"), ("MFA", "55px"),
                                ("Compliant", "80px"), ("Why", "220px")],
-                              apply_rows, {"1": "polname"})]
+                              apply_rows, {"1": "polname", "2": "controls",
+                                            "3": "mfa", "4": "compliant", "5": "why"})]
 
         # what-if table
         def _loc_label(lid):
@@ -13981,7 +16012,7 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             drawer = (f'<tr class="drawer" data-detail-for="ca-whatif-{i}">'
                       f'<td colspan="7"><div class="drawer-body">{drawer_body}</div></td></tr>')
             wi_rows.append({
-                "_html": (f'<tr data-detail-key="ca-whatif-{i}">'
+                "_html": (f'<tr data-policy-id="{esc(r["id"])}" data-detail-key="ca-whatif-{i}">'
                           f'<td class="expand-cell">{EXPAND_BUTTON_HTML}</td>{cells}</tr>'
                           f'{drawer}'),
                 "_text": " ".join(fields.values()).lower(),
@@ -14007,7 +16038,8 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             "ca-whatif-table", "What-if evaluation",
             [("Policy", "240px"), ("State", "90px"), ("Controls", "170px"),
              ("Effect", "70px"), ("Verdict", "150px"), ("Note", "240px")],
-            wi_rows, {"1": "polname"},
+            wi_rows, {"1": "polname", "2": "state", "3": "controls",
+                      "4": "effect", "5": "verdict", "6": "note"},
             subtitle=f'<p class="sub">Scenario: {esc(" · ".join(wi_scenario)) if wi_scenario else "unspecified (all signal-dependent axes flagged)"}</p>'
                      + gap_html))
 
@@ -14111,11 +16143,7 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
                      if missing_g else "")
                     + ("unresolved assumed role(s): " + ", ".join(missing_r)
                        if missing_r else ""))
-            user_roles = {rid for rid, members in data["role_member_user"].items()
-                          if uid in members}
-            for template_id, members in data["role_template_members"].items():
-                if uid in members:
-                    user_roles.add(template_id)
+            user_roles = _user_role_ids(uid)
             user_groups = {gid for gid, members in data["group_member_user"].items()
                            if uid in members}
             referenced_gids = set()
@@ -14128,16 +16156,14 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             all_roles = user_roles | _role_ids_with_templates(assumed_rids)
 
             def included(p):
-                if p["inc_all"] or p["inc_guest"]:
-                    return True
-                if uid in p["inc_users"]:
+                if would_include(p, uid):
                     return True
                 if any(g in containing for g in p["inc_group_list"]):
                     return True
                 return any(r in all_roles for r in p["inc_role_list"])
 
             def excluded(p):
-                if uid in p["exc_users"]:
+                if _excluded(p, uid):
                     return True
                 if any(g in containing for g in p["exc_group_list"]):
                     return True
@@ -14175,9 +16201,15 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             va, na = status_for(scope_a, p)
             vb, nb = status_for(scope_b, p)
             if va == "yes":
-                (def_en_a if p["enabled"] else def_rep_a).append(p)
+                if p["enabled"]:
+                    def_en_a.append(p)
+                elif p["state"] == "Reporting":
+                    def_rep_a.append(p)
             if vb == "yes":
-                (def_en_b if p["enabled"] else def_rep_b).append(p)
+                if p["enabled"]:
+                    def_en_b.append(p)
+                elif p["state"] == "Reporting":
+                    def_rep_b.append(p)
             if va == "excluded" and p["enabled"]:
                 excl_a.append(p)
             if vb == "excluded" and p["enabled"]:
@@ -14311,7 +16343,9 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             f"<tr><th>Path audit population</th><td>{esc(roster_label)}</td></tr>"
             f"<tr><th>Path audit mode</th><td>{esc(path_mode)} · "
             f"active dims: {esc(', '.join(sorted(path_active)) or 'none')} · "
-            f"cap: {path_max or 'none'}</td></tr>"
+            f"scenarios/path: {path_max or 'none'} · "
+            f"global scenario budget: {path_total_max or 'none'}"
+            f"{' (reached)' if path_budget_exhausted else ''}</td></tr>"
             f"<tr><th>Paths evaluated</th><td>{len(path_records)}</td></tr>"
             f"<tr><th>Gap paths</th><td>{len(path_gap_records)} ({path_gap_users} user(s))</td></tr>"
             f"<tr><th>Path scenarios evaluated</th><td>{path_scenarios}</td></tr>"
@@ -14367,47 +16401,74 @@ def make_ca_rows_fn():
     return rows_fn
 
 
-def register_ca_tables(tables):
-    """Register (or refresh) the CA-analysis result tables in the serve table
-    pipeline so they paginate/sort/filter like the built-in tables."""
-    for tid in SERVE_STATE.get("ca_table_ids") or []:
-        SERVE_STATE["tables"].pop(tid, None)
-    ids = []
-    for t in tables:
-        if not t:
-            continue
-        ids.append(t["id"])
-        SERVE_STATE["tables"][t["id"]] = {
-            "findings": t["rows"],
-            "rows": make_ca_rows_fn(),
-            "search": lambda f: (f or {}).get("_text", ""),
-            "sort_keys": {str(i): field for i, field in (t.get("sort_fields") or {}).items()},
-            "colspan": t.get("colspan", 4),
-        }
-    SERVE_STATE["ca_table_ids"] = ids
+def register_ca_tables(tables, kind="main"):
+    """Register (or refresh) one CA view's result tables in the serve table
+    pipeline so they paginate/sort/filter like the built-in tables. IDs are
+    scoped per view: installing single-user results must not unregister the
+    tenant-wide view's tables (and vice versa)."""
+    with SERVE_STATE_LOCK:
+        table_ids = SERVE_STATE.get("ca_table_ids")
+        if not isinstance(table_ids, dict):
+            table_ids = {}
+        for tid in table_ids.pop(kind, []) or []:
+            SERVE_STATE["tables"].pop(tid, None)
+        ids = []
+        for t in tables:
+            if not t:
+                continue
+            tid = t["id"]
+            ids.append(tid)
+            SERVE_STATE["tables"][tid] = {
+                "findings": t["rows"],
+                "rows": make_ca_rows_fn(),
+                "search": lambda f, _tid=tid: serve_search_text(_tid, f),
+                "sort_keys": {str(i): field for i, field in (t.get("sort_fields") or {}).items()},
+                "colspan": t.get("colspan", 4),
+            }
+        table_ids[kind] = ids
+        SERVE_STATE["ca_table_ids"] = table_ids
 
 
 def start_ca_analysis(upn=None, compare_upns=None, assume_groups=None,
                       assume_roles=None, assume_groups_b=None,
                       assume_roles_b=None, scenario=None, options=None):
-    """Kick off the analysis in a background thread; returns the status dict."""
-    state = SERVE_STATE["ca_analysis"]
-    if state and state.get("status") == "running":
-        return state
-    steps = [{"id": sid, "label": label, "status": "pending", "detail": ""}
-             for sid, label in CA_ANALYSIS_STEPS]
-    state = {"status": "running", "steps": steps, "result": None, "error": None}
-    SERVE_STATE["ca_analysis"] = state
+    """Kick off the analysis in a background thread; returns the status dict.
 
-    def progress(sid, detail=""):
-        for step in steps:
-            if step["id"] == sid:
-                step["status"] = "done"
-                step["detail"] = detail
+    The job snapshots its database/generation/result kind. A second start while
+    a job is running is rejected; completion only installs results/tables when
+    the analysis generation is still current.
+    """
+    kind = "compare" if compare_upns else ("single" if upn else "main")
+    with SERVE_STATE_LOCK:
+        state = SERVE_STATE.get("ca_analysis")
+        if state and state.get("status") == "running":
+            running_kind = state.get("kind") or "unknown"
+            raise RuntimeError(
+                f"a CA analysis ({running_kind}) is already running; "
+                "wait for it to finish or reload the report")
+        db_path = SERVE_STATE.get("db_path")
+        if not db_path:
+            raise RuntimeError("no database is loaded")
+        user_findings = list(SERVE_STATE.get("user_findings") or [])
+        records = list(SERVE_STATE.get("records") or [])
+        generation = SERVE_STATE.get("generation", 0)
+        steps = [{"id": sid, "label": label, "status": "pending", "detail": ""}
+                 for sid, label in CA_ANALYSIS_STEPS]
+        state = {"status": "running", "steps": steps, "result": None,
+                 "error": None, "kind": kind, "generation": generation,
+                 "db": str(db_path)}
+        SERVE_STATE["ca_analysis"] = state
+
+    def progress(sid, detail="", running=False):
+        with SERVE_STATE_LOCK:
+            for step in steps:
+                if step["id"] == sid:
+                    step["status"] = "running" if running else "done"
+                    step["detail"] = detail
 
     def worker():
         try:
-            result = run_ca_analysis(SERVE_STATE["db_path"], progress,
+            result = run_ca_analysis(db_path, progress,
                                      target_upn=upn,
                                      compare_upns=compare_upns,
                                      assume_groups=assume_groups,
@@ -14415,19 +16476,66 @@ def start_ca_analysis(upn=None, compare_upns=None, assume_groups=None,
                                      assume_groups_b=assume_groups_b,
                                      assume_roles_b=assume_roles_b,
                                      scenario=scenario,
-                                     options=options)
-            register_ca_tables(result.get("tables") or [])
-            state["result"] = {
-                "summary_html": result.get("summary_html", ""),
-                "sections_html": result.get("sections_html", ""),
-            }
-            state["status"] = "done"
+                                     options=options,
+                                     user_findings=user_findings,
+                                     records=records)
+            with SERVE_STATE_LOCK:
+                if (SERVE_STATE.get("ca_analysis") is not state
+                        or SERVE_STATE.get("generation", 0) != generation):
+                    state["status"] = "stale"
+                    state["error"] = ("the database/report was reloaded while this "
+                                      "CA analysis was running")
+                    return
+                register_ca_tables(result.get("tables") or [], kind)
+                state["result"] = {
+                    "summary_html": result.get("summary_html", ""),
+                    "sections_html": result.get("sections_html", ""),
+                }
+                state["status"] = "done"
         except Exception as exc:  # noqa: BLE001 - surfaced to the UI
-            state["status"] = "error"
-            state["error"] = str(exc)
+            with SERVE_STATE_LOCK:
+                state["status"] = "error"
+                state["error"] = str(exc)
 
     threading.Thread(target=worker, daemon=True).start()
     return state
+
+
+def parse_http_range(header, length):
+    """Parse a single-range `bytes=` header.
+
+    Returns (start, end) inclusive, None when the header is absent/unsupported
+    (server should ignore it), or False when syntactically valid but
+    unsatisfiable (server should answer 416).
+    """
+    if not header or not isinstance(header, str):
+        return None
+    unit, sep, spec = header.strip().partition("=")
+    if not sep or unit.strip().lower() != "bytes":
+        return None
+    spec = spec.strip()
+    if not spec or "," in spec:  # multiple ranges are not implemented
+        return None
+    start_s, sep, end_s = spec.partition("-")
+    if not sep:
+        return None
+    try:
+        if start_s == "":
+            suffix = int(end_s)
+            if suffix <= 0:
+                return False
+            start = max(0, length - suffix)
+            return (start, length - 1) if length else False
+        start = int(start_s)
+        end = int(end_s) if end_s else length - 1
+    except ValueError:
+        return None
+    if start < 0 or end < start:
+        return False
+    if length == 0 or start >= length:
+        return False
+    end = min(end, length - 1)
+    return start, end
 
 
 class AuditServeHandler(http.server.BaseHTTPRequestHandler):
@@ -14441,7 +16549,29 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
-        self.wfile.write(body_bytes)
+        if self.command != "HEAD":
+            self.wfile.write(body_bytes)
+
+    def _send_rangeable(self, body_bytes, ctype, code=200, headers=None):
+        """GET/HEAD response with single-range support (shell/document bytes)."""
+        headers = dict(headers or {})
+        headers.setdefault("Accept-Ranges", "bytes")
+        parsed = (parse_http_range(self.headers.get("Range"), len(body_bytes))
+                  if code == 200 and self.command in ("GET", "HEAD") else None)
+        if parsed is False:
+            self._send(b"", ctype, 416,
+                       headers={**headers,
+                                "Content-Range": f"bytes */{len(body_bytes)}"})
+            return
+        if isinstance(parsed, tuple):
+            start, end = parsed
+            headers["Content-Range"] = f"bytes {start}-{end}/{len(body_bytes)}"
+            self._send(body_bytes[start:end + 1], ctype, 206, headers=headers)
+            return
+        self._send(body_bytes, ctype, code, headers=headers)
+
+    def do_HEAD(self):
+        self.do_GET()
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -14449,7 +16579,8 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
         try:
             path = parsed.path
             if path in ("/", "/index.html"):
-                self._send(SERVE_STATE["shell"].encode("utf-8"), "text/html; charset=utf-8")
+                self._send_rangeable(SERVE_STATE["shell"].encode("utf-8"),
+                                     "text/html; charset=utf-8")
             elif path == "/api/drilldown":
                 data, code = serve_drilldown_response(qs)
                 self._send(json.dumps(data).encode("utf-8"), "application/json; charset=utf-8", code)
@@ -14526,12 +16657,16 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                                           if cache_file.is_file() else None)
                             if cache_meta and cache_meta.get("version") == CACHE_VERSION:
                                 fingerprint = cache_meta.get("fingerprint") or []
+                                current_config = SERVE_STATE.get("config_fingerprint") or ""
+                                meta_config = cache_meta.get("config_fingerprint") or ""
                                 # The list only needs a cheap freshness check; the
                                 # full row-count fingerprint is recomputed when an
                                 # analysis actually starts.
                                 if (len(fingerprint) >= 2
                                         and fingerprint[0] == stat.st_mtime_ns
-                                        and fingerprint[1] == stat.st_size):
+                                        and fingerprint[1] == stat.st_size
+                                        and (not current_config or not meta_config
+                                             or meta_config == current_config)):
                                     cached = True
                                     cached_at = cache_meta.get("generated_at") or ""
                         except (OSError, sqlite3.Error):
@@ -14559,13 +16694,12 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                 self._send(json.dumps(analysis.get_status()).encode("utf-8"),
                            "application/json; charset=utf-8")
             elif path == "/api/ca-analysis/status":
-                state = SERVE_STATE.get("ca_analysis")
-                if state is None:
-                    self._send(b'{"status": "idle", "steps": []}',
-                               "application/json; charset=utf-8")
-                else:
-                    self._send(json.dumps(state, default=str).encode("utf-8"),
-                               "application/json; charset=utf-8")
+                with SERVE_STATE_LOCK:
+                    state = SERVE_STATE.get("ca_analysis")
+                    body = (b'{"status": "idle", "steps": []}'
+                            if state is None
+                            else json.dumps(state, default=str).encode("utf-8"))
+                self._send(body, "application/json; charset=utf-8")
             else:
                 self._send(b'{"error": "not found"}', "application/json; charset=utf-8", 404)
         except Exception as exc:  # noqa: BLE001 - surface errors for debugging
@@ -14856,16 +16990,28 @@ class AuditServeHandler(http.server.BaseHTTPRequestHandler):
                     "mode": (payload.get("mode") or "fast").strip().lower(),
                     "max_scenarios": max_scenarios,
                 }
-                state = start_ca_analysis(
-                    upn=(payload.get("upn") or "").strip(),
-                    compare_upns=_csv("compare_upns"),
-                    assume_groups=_csv("assume_groups"),
-                    assume_roles=_csv("assume_roles"),
-                    assume_groups_b=_csv("assume_groups_b"),
-                    assume_roles_b=_csv("assume_roles_b"),
-                    scenario=scenario,
-                    options=options)
-                self._send(json.dumps({"status": state["status"]}).encode("utf-8"),
+                try:
+                    max_total = int(payload.get("max_total_scenarios")
+                                    or CA_PATH_GLOBAL_SCENARIO_BUDGET)
+                except (TypeError, ValueError):
+                    max_total = CA_PATH_GLOBAL_SCENARIO_BUDGET
+                options["max_total_scenarios"] = max_total
+                try:
+                    state = start_ca_analysis(
+                        upn=(payload.get("upn") or "").strip(),
+                        compare_upns=_csv("compare_upns"),
+                        assume_groups=_csv("assume_groups"),
+                        assume_roles=_csv("assume_roles"),
+                        assume_groups_b=_csv("assume_groups_b"),
+                        assume_roles_b=_csv("assume_roles_b"),
+                        scenario=scenario,
+                        options=options)
+                except RuntimeError as exc:
+                    self._send(json.dumps({"error": str(exc)}).encode("utf-8"),
+                               "application/json; charset=utf-8", 409)
+                    return
+                self._send(json.dumps({"status": state["status"],
+                                       "kind": state.get("kind")}).encode("utf-8"),
                            "application/json; charset=utf-8")
             else:
                 self._send(b'{"error": "not found"}', "application/json; charset=utf-8", 404)
@@ -14878,14 +17024,22 @@ def start_serve(port, total=None, after_start=None):
     """Start the HTTP server (in a daemon thread), optionally run a callback
     (e.g. the cache write) once it is accepting connections, then idle until
     Ctrl+C. Serving first keeps the report usable while the cache is written."""
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), AuditServeHandler)
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", port),
+                                                 AuditServeHandler)
+    except (OSError, OverflowError) as exc:
+        print(f"error: cannot listen on 127.0.0.1:{port}: {exc}", file=sys.stderr)
+        return 1
     count = f" ({total} findings)" if total else ""
     print(f"Serving audit report{count} on http://127.0.0.1:{port} (Ctrl+C to stop)",
           flush=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     if after_start:
-        after_start()
+        try:
+            after_start()
+        except Exception as exc:  # noqa: BLE001 - cache write must not kill serving
+            print(f"warning: post-start task failed: {exc}", file=sys.stderr)
     try:
         while True:
             time.sleep(3600)
@@ -14894,6 +17048,7 @@ def start_serve(port, total=None, after_start=None):
     finally:
         server.shutdown()
         server.server_close()
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -14904,13 +17059,47 @@ def start_serve(port, total=None, after_start=None):
 # when the database fingerprint is unchanged; when the database changed, the
 # new analysis is diffed against the cached one and surfaced in the report.
 
-CACHE_VERSION = 7
+CACHE_VERSION = 9
 CACHE_DIR = SCRIPT_DIR / "data" / "databases" / ".cache"
 
 CACHE_FINGERPRINT_TABLES = (
     "Users", "ServicePrincipals", "Applications", "Groups", "Devices",
     "RoleAssignments", "AppRoleAssignments", "AZroleAssignments", "Policys",
 )
+
+
+def compute_config_fingerprint(config_resources, check_cfg):
+    """Deterministic digest of the *effective* analysis config.
+
+    Includes the resource/role mapping, check config (directory roles,
+    severities, suppression, enabled checks, labels) and Azure role mapping.
+    Any config edit therefore invalidates cached findings.
+    """
+    payload = {"resources": config_resources or {},
+               "checks": check_cfg or {}}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                         default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def cache_payload_valid(payload):
+    """A cache payload is only useful when the analysis result shape is intact."""
+    if not isinstance(payload, dict):
+        return False
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return False
+    for res in results:
+        if not isinstance(res, dict) or not isinstance(res.get("findings"), list):
+            return False
+    return True
+
+
+def cache_fresh(cached, fingerprint):
+    return bool(
+        cache_payload_valid(cached)
+        and cached.get("version") == CACHE_VERSION
+        and cached.get("fingerprint") == fingerprint)
 
 
 def cache_paths(db_path):
@@ -14922,13 +17111,15 @@ def cache_paths(db_path):
             CACHE_DIR / f"{safe}-{digest}.meta.json")
 
 
-def save_cache_sidecar(path, db_path, fingerprint, generated_at):
+def save_cache_sidecar(path, db_path, fingerprint, generated_at,
+                       config_fingerprint=None):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({
             "version": CACHE_VERSION,
             "db": str(Path(db_path).resolve()),
             "fingerprint": fingerprint,
+            "config_fingerprint": config_fingerprint or "",
             "generated_at": generated_at,
         }, indent=2), encoding="utf-8")
     except OSError as exc:
@@ -14945,10 +17136,12 @@ def load_cache_sidecar(path):
 
 def write_analysis_cache(cache_path, meta_path, db_path, fingerprint,
                          generated_at, results, tenant_summary,
-                         group_roles, group_eligible_roles):
+                         group_roles, group_eligible_roles,
+                         config_fingerprint=None):
     wrote = save_cache(cache_path, {
         "version": CACHE_VERSION,
         "fingerprint": fingerprint,
+        "config_fingerprint": config_fingerprint or "",
         "generated_at": generated_at,
         "results": results,
         "tenant_summary": tenant_summary,
@@ -14956,12 +17149,15 @@ def write_analysis_cache(cache_path, meta_path, db_path, fingerprint,
         "group_eligible_roles": group_eligible_roles,
     })
     if wrote:
-        save_cache_sidecar(meta_path, db_path, fingerprint, generated_at)
+        save_cache_sidecar(meta_path, db_path, fingerprint, generated_at,
+                           config_fingerprint)
 
 
-def compute_db_fingerprint(db_path, cur):
-    """Cheap fingerprint of the audited database: file metadata plus row
-    counts of the core tables. Any change triggers a reanalysis."""
+def compute_db_fingerprint(db_path, cur, config_fingerprint=None):
+    """Cheap fingerprint of the audited database plus the effective config:
+    file metadata, core-table row counts and a deterministic config hash. Any
+    change to the database or to severity/suppression/role mappings triggers a
+    reanalysis instead of reusing stale findings."""
     parts = [db_path.stat().st_mtime_ns, db_path.stat().st_size]
     for table in CACHE_FINGERPRINT_TABLES:
         try:
@@ -14969,6 +17165,7 @@ def compute_db_fingerprint(db_path, cur):
             parts.append(cur.fetchone()[0])
         except sqlite3.OperationalError:
             parts.append(-1)
+    parts.append(config_fingerprint or "")
     return parts
 
 
@@ -15022,27 +17219,76 @@ def save_cache(path, payload):
 
 
 def load_cache(path):
+    """Load and validate a cache payload.
+
+    A truncated gzip stream, corrupt JSON, wrong top-level type or missing
+    result list is treated as a cache miss (None) instead of crashing startup
+    or a runtime analysis. Legacy uncompressed caches remain supported.
+    """
+    payload = None
     try:
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, EOFError, gzip.BadGzipFile, ValueError, UnicodeError,
+            TypeError):
+        # older caches were written uncompressed
         try:
-            with gzip.open(path, "rt", encoding="utf-8") as fh:
-                payload = json.loads(fh.read())
-        except (OSError, ValueError):
-            # older caches were written uncompressed
-            payload = json.loads(path.read_text())
-    except (OSError, ValueError):
+            with open(path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except (OSError, ValueError, UnicodeError, TypeError):
+            return None
+    if not cache_payload_valid(payload):
         return None
     _restore_object_ids(payload.get("results"))
     return payload
 
 
+def _finding_identity(f):
+    """Stable diff identity for one finding.
+
+    (check_id, primary_id) alone collapses checks like priv_app_ownership that
+    emit one finding per grant/principal. Include the target, permission,
+    resource and policy/user/group identity fields when present, then let the
+    index add an ordinal for genuinely identical duplicates.
+    """
+    target = f.get("target") or {}
+    parts = [str(f.get("check_id") or ""), str(f.get("primary_id") or "")]
+    for key in ("permission", "resource_name", "resource", "policy_id",
+                "user_id", "group_id", "sp_id", "device_id", "role_id",
+                "app_role_id", "principal_id", "policyIds"):
+        value = f.get(key)
+        if value not in (None, "", [], {}, ()):
+            parts.append(f"{key}={value}")
+    if isinstance(target, dict):
+        for key in ("type", "id"):
+            value = target.get(key)
+            if value not in (None, ""):
+                parts.append(f"target.{key}={value}")
+    return tuple(parts)
+
+
+def _index_findings(results):
+    """Map stable identity (+ duplicate ordinal) to findings."""
+    indexed = {}
+    seen = Counter()
+    for res in results or []:
+        if not isinstance(res, dict):
+            continue
+        for f in res.get("findings") or []:
+            if not isinstance(f, dict):
+                continue
+            key = _finding_identity(f)
+            ordinal = seen[key]
+            seen[key] += 1
+            indexed[(key, ordinal)] = f
+    return indexed
+
+
 def compute_diff(old_results, new_results):
-    """Compare two analysis runs keyed on (check_id, primary_id): added and
-    removed findings, plus changed severity/title/evidence for survivors."""
-    def index(results):
-        return {(f["check_id"], str(f["primary_id"])): f
-                for res in results for f in res["findings"]}
-    old_map = index(old_results)
-    new_map = index(new_results)
+    """Compare two analysis runs by stable finding identity: added and removed
+    findings, plus changed severity/title/evidence for survivors."""
+    old_map = _index_findings(old_results)
+    new_map = _index_findings(new_results)
     added = [new_map[k] for k in sorted(new_map) if k not in old_map]
     removed = [old_map[k] for k in sorted(old_map) if k not in new_map]
     changed = []
@@ -15094,7 +17340,8 @@ def main():
             check_cfg["role_labels"] = loaded_cfg.get("role_labels") or {}
             check_cfg["directory_role_descriptions"] = (
                 loaded_cfg.get("directory_role_descriptions") or {})
-        except (OSError, ValueError):
+        except ConfigError as exc:
+            print(f"warning: {exc} (using built-in defaults)", file=sys.stderr)
             check_cfg["role_labels"] = {}
             check_cfg["directory_role_descriptions"] = {}
         check_cfg["azure_roles"] = {}
@@ -15116,8 +17363,7 @@ def main():
         SERVE_STATE["group_roles"] = group_roles
         SERVE_STATE["group_eligible_roles"] = group_eligible_roles
         SERVE_STATE["profile_builder"] = None
-        start_serve(args.port, 0)
-        return 0
+        return start_serve(args.port, 0)
 
     if not db_path.exists():
         print(f"error: database not found: {db_path}", file=sys.stderr)
@@ -15126,7 +17372,11 @@ def main():
         print(f"error: config not found: {config_path}", file=sys.stderr)
         return 1
 
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        conn = open_audit_database(db_path)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     cur = conn.cursor()
 
     tenant_name = None
@@ -15137,7 +17387,16 @@ def main():
     except sqlite3.OperationalError:
         pass
 
-    config_resources, check_cfg = load_config(config_path)
+    try:
+        config_resources, check_cfg = load_config(config_path)
+        azure_role_sev = load_azure_roles(args.azure_config)
+    except ConfigError as exc:
+        conn.close()
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    check_cfg["azure_roles"] = azure_role_sev
+    config_fingerprint = compute_config_fingerprint(config_resources, check_cfg)
+    SERVE_STATE["config_fingerprint"] = config_fingerprint
 
     def timed(label, fn):
         t0 = time.perf_counter()
@@ -15150,15 +17409,11 @@ def main():
         return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
     cache_path, cache_meta_path = cache_paths(db_path)
-    fingerprint = compute_db_fingerprint(db_path, cur)
+    fingerprint = compute_db_fingerprint(db_path, cur, config_fingerprint)
     cached = None if (args.refresh or args.no_cache) else load_cache(cache_path)
-    cache_hit = bool(
-        cached and cached.get("version") == CACHE_VERSION
-        and cached.get("fingerprint") == fingerprint)
+    cache_hit = cache_fresh(cached, fingerprint)
 
     graph = timed("build_graph", lambda: build_graph(cur))
-    azure_role_sev = load_azure_roles(args.azure_config)
-    check_cfg["azure_roles"] = azure_role_sev
     timed("apply_azure_severity", lambda: apply_azure_severity(graph, azure_role_sev))
 
     if cache_hit:
@@ -15227,7 +17482,7 @@ def main():
     SERVE_STATE["policy_profiles"] = {
         f["policy_id"]: f for res in results if res["id"] == "ca_exposure"
         for f in res["findings"] if f.get("policy_id")}
-    SERVE_STATE["records"] = build_serve_records(results)
+    SERVE_STATE["records"] = build_serve_records(results, graph)
     # lazy drawer inputs: the graph, role resolution and config stay resident;
     # raw details are read from the database on demand
     SERVE_STATE["graph"] = graph
@@ -15240,21 +17495,21 @@ def main():
         import resource
         print(f"[timing] peak RSS: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.0f} MB")
     if args.no_cache or cache_hit:
-        start_serve(args.port, total)
+        return start_serve(args.port, total)
     else:
         def write_cache_now():
             print(f"Writing analysis cache to {cache_path}...", flush=True)
             write_analysis_cache(cache_path, cache_meta_path, db_path,
                                  fingerprint, cache_meta["generated_at"],
                                  results, tenant_summary, group_roles,
-                                 group_eligible_roles)
+                                 group_eligible_roles,
+                                 config_fingerprint=config_fingerprint)
             try:
                 size = cache_path.stat().st_size
                 print(f"Analysis cache written ({size:,} bytes)", flush=True)
             except OSError:
                 print("Analysis cache written", flush=True)
-        start_serve(args.port, total, after_start=write_cache_now)
-    return 0
+        return start_serve(args.port, total, after_start=write_cache_now)
 
 
 if __name__ == "__main__":

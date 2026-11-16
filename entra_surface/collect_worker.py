@@ -39,9 +39,14 @@ from graphcollect.aadgraph import (  # noqa: E402
     AAD_GRAPH_AUDIENCES, AAD_GRAPH_RES, AadGraphClient, collect_aadgraph,
     collect_gatherall)
 from graphcollect.client import ArmClient, GraphClient  # noqa: E402
-from graphcollect.collectors import Runner, collect_all  # noqa: E402
+from graphcollect.collectors import Runner, Section, collect_all  # noqa: E402
 from graphcollect.store import Store  # noqa: E402
 from graphcollect.tls import InsecureTLSAdapter  # noqa: E402
+
+
+EXIT_NO_CORE = 2
+EXIT_PARTIAL = 3
+CORE_TABLES = ("Users", "Groups", "ServicePrincipals", "TenantDetails")
 
 
 try:
@@ -49,6 +54,11 @@ try:
         TokenProvider.__init__).parameters
 except (TypeError, ValueError):
     _TOKEN_PROVIDER_HAS_UA = False
+try:
+    _TOKEN_PROVIDER_HAS_TENANT = "tenant" in inspect.signature(
+        TokenProvider.__init__).parameters
+except (TypeError, ValueError):
+    _TOKEN_PROVIDER_HAS_TENANT = False
 
 
 class SavingProvider(TokenProvider):
@@ -56,14 +66,19 @@ class SavingProvider(TokenProvider):
 
     def __init__(self, refresh_token: str, client_id: str, token_out: str,
                  access_out: str = "", proxies: dict | None = None,
-                 verify: bool = True, user_agent: str = ""):
+                 verify: bool = True, user_agent: str = "",
+                 tenant: str = ""):
         kwargs = {}
         if _TOKEN_PROVIDER_HAS_UA:
             kwargs["user_agent"] = user_agent
+        if _TOKEN_PROVIDER_HAS_TENANT:
+            kwargs["tenant"] = tenant
         super().__init__(refresh_token, client_id=client_id, proxies=proxies,
                          verify=verify, **kwargs)
         self._token_out = token_out
         self._access_out = access_out
+        self._saved_rt = ""
+        self._saved_access = ""
         self._save()
 
     def _write(self, value: str, path_name: str) -> None:
@@ -86,17 +101,28 @@ class SavingProvider(TokenProvider):
             except OSError:
                 pass
 
+    def _write_changed(self, value: str, path_name: str, attr: str) -> bool:
+        if not path_name or value == getattr(self, attr):
+            return False
+        self._write(value, path_name)
+        setattr(self, attr, value)
+        return True
+
     def _save(self) -> None:
         if not self._token_out:
             return
         with self._lock:
-            self._write(self._rt, self._token_out)
+            # Broker refresh tokens rotate on every redemption.  Persist the
+            # new value immediately, but do not rewrite the file for cached
+            # token lookups.
+            self._write_changed(self._rt, self._token_out, "_saved_rt")
 
     def get_token(self, resource: str) -> str:
         token = super().get_token(resource)
         self._save()
         if resource.rstrip("/") == GRAPH_RES:
-            self._write(token, self._access_out)
+            with self._lock:
+                self._write_changed(token, self._access_out, "_saved_access")
         return token
 
 
@@ -194,7 +220,7 @@ def _principal(provider: SavingProvider,
         "scopes": scopes,
         "roles": roles,
         "access_expires_at": (
-            dt.datetime.fromtimestamp(expires, dt.UTC).isoformat(timespec="seconds")
+            dt.datetime.fromtimestamp(expires, dt.timezone.utc).isoformat(timespec="seconds")
             if expires else ""),
         "identity": identity,
     }, token
@@ -253,7 +279,8 @@ def probe(args) -> int:
         user_agent = surface_settings.effective_user_agent("tokens")
         provider = SavingProvider(args.refresh_token, args.client_id,
                                   args.token_out, proxies=proxies,
-                                  verify=verify, user_agent=user_agent)
+                                  verify=verify, user_agent=user_agent,
+                                  tenant=getattr(args, "tenant", "") or "")
         resource = (getattr(args, "resource_uri", "") or "").strip()
         if not resource:
             resource = PROBE_RESOURCES.get(args.resource, GRAPH_RES)
@@ -274,58 +301,103 @@ def probe(args) -> int:
     return 0
 
 
-def run(args) -> int:
+def _now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def _remove_db_files(path: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        try:
+            Path(str(path) + suffix).unlink()
+        except OSError:
+            pass
+
+
+def _replace_database(tmp_path: Path, out_path: Path) -> None:
+    """Atomically swap a completed collection into the destination path."""
+    _remove_db_files(tmp_path)
+    # A stale WAL/SHM from the previous database must not be paired with the
+    # new main file.
+    _remove_db_files(out_path)
+    os.replace(tmp_path, out_path)
+
+
+def _discard_database(path: Path) -> None:
+    _remove_db_files(path)
     try:
-        proxies, no_proxy, verify = _load_proxy_config()
-        user_agent = surface_settings.effective_user_agent(
-            "collect", args.user_agent)
-        token_user_agent = user_agent
-        evade = bool(getattr(args, "evade", False))
-        if evade and not user_agent:
-            user_agent = "Microsoft ADO.NET Data Services"
-        provider = SavingProvider(args.refresh_token, args.client_id,
-                                  args.token_out, args.access_out,
-                                  proxies=proxies, verify=verify,
-                                  user_agent=token_user_agent)
-        claims = provider.claims
-    except AuthError as exc:
-        print(f"[auth] failed: {exc}")
-        return 1
-    except ValueError as exc:
-        print(f"[settings] {exc}")
-        return 1
-    except RuntimeError as exc:
-        print(f"[proxy] {exc}")
-        return 1
-    print(f"[auth] {provider.identity} (tid: {claims.get('tid')})")
-    graph = GraphClient(lambda: provider.get_token(GRAPH_RES), verbose=args.verbose,
-                        user_agent=user_agent, batch=evade,
-                        proxies=proxies, no_proxy=no_proxy, verify=verify)
-    arm = None
-    try:
-        provider.get_token(ARM_RES)
-        arm = ArmClient(lambda: provider.get_token(ARM_RES), verbose=args.verbose,
-                        user_agent=user_agent, proxies=proxies,
-                        no_proxy=no_proxy, verify=verify)
-    except AuthError as exc:
-        print(f"[arm] no Azure Resource Manager token ({exc}); "
-              f"Azure tables will be skipped")
-
-    return _run_collection(graph, arm, args, provider.identity,
-                           claims.get("tid") or "")
+        path.unlink()
+    except OSError:
+        pass
 
 
-def _run_collection(graph: GraphClient, arm, args, identity: str,
-                    tenant_id: str) -> int:
-    Path(args.out).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-    store = Store(args.out)
-    store.reset()
-    store.set_meta("started_at", dt.datetime.now(dt.UTC).isoformat())
-    store.set_meta("identity", identity)
-    store.set_meta("tenant_id", tenant_id)
+class NoCoreData(Exception):
+    pass
 
-    runner = collect_all(graph, arm, store, verbose=args.verbose)
 
+class _AtomicDatabase:
+    """Collect into a temporary database and replace the destination on success.
+
+    The previous snapshot remains untouched on failure, early exit or a
+    process kill; only a completed run with core directory data is swapped in.
+    """
+
+    def __init__(self, out_path: Path, meta: dict | None = None):
+        self.out_path = Path(out_path).expanduser().resolve()
+        self.out_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(
+            prefix=f".{self.out_path.name}.",
+            suffix=".tmp", dir=str(self.out_path.parent))
+        os.close(fd)
+        self.tmp_path = Path(name)
+        self.store = Store(str(self.tmp_path))
+        self.store.reset()
+        for key, value in (meta or {}).items():
+            self.store.set_meta(key, value)
+
+    def __enter__(self) -> Store:
+        return self.store
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        sidecar = self.out_path.with_name(self.out_path.name + ".failed.json")
+        if exc_type is None:
+            self.store.set_meta("finished_at", _now())
+            self.store.commit()
+            self.store.checkpoint()
+            self.store.close()
+            _replace_database(self.tmp_path, self.out_path)
+            try:
+                sidecar.unlink()
+            except OSError:
+                pass
+            return False
+        # Record the failure in the disposable copy and in a small sidecar;
+        # the previous database itself is never modified.
+        failed_at = _now()
+        message = str(exc)[:500] if exc is not None else "cancelled"
+        try:
+            self.store.set_meta("failed_at", failed_at)
+            self.store.set_meta("failure", message)
+            self.store.commit()
+        except Exception:
+            pass
+        try:
+            sidecar.write_text(json.dumps({
+                "failed_at": failed_at,
+                "error": message,
+                "destination": str(self.out_path),
+                "temporary_database": str(self.tmp_path),
+            }, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+        try:
+            self.store.close()
+        except Exception:
+            pass
+        _discard_database(self.tmp_path)
+        return False
+
+
+def _print_summary(runner, graph, arm) -> None:
     print("\n=== collection summary ===")
     for sec in runner.sections:
         flag = {"ok": "+", "partial": "~", "degraded": "!", "skipped": "-",
@@ -342,8 +414,111 @@ def _run_collection(graph: GraphClient, arm, args, identity: str,
     if getattr(graph, "throttled", 0):
         print(f"throttled (429) responses: {graph.throttled}")
 
-    store.close()
-    print(f"\nwrote {args.out}")
+
+def run(args) -> int:
+    try:
+        proxies, no_proxy, verify = _load_proxy_config()
+    except RuntimeError as exc:
+        print(f"[proxy] {exc}")
+        return 1
+    try:
+        user_agent = surface_settings.effective_user_agent(
+            "collect", args.user_agent)
+        token_user_agent = user_agent
+        evade = bool(getattr(args, "evade", False))
+        if evade and not user_agent:
+            user_agent = "Microsoft ADO.NET Data Services"
+    except ValueError as exc:
+        print(f"[settings] {exc}")
+        return 1
+
+    tenant = str(getattr(args, "tenant", "") or "").strip()
+    access_fallback = str(getattr(args, "access_token", "") or "").strip()
+    provider = None
+    claims = {}
+    try:
+        provider = SavingProvider(args.refresh_token, args.client_id,
+                                  args.token_out, args.access_out,
+                                  proxies=proxies, verify=verify,
+                                  user_agent=token_user_agent,
+                                  tenant=tenant)
+        claims = provider.claims
+        identity = provider.identity
+    except AuthError as exc:
+        # A stale/revoked refresh token should not block a collection when the
+        # saved record still has a valid access token for Graph.
+        fallback_claims = _claims(access_fallback)
+        expires = fallback_claims.get("exp")
+        if (not access_fallback or not fallback_claims
+                or not _is_graph_access_token(fallback_claims)
+                or (expires and int(expires) <= int(time.time()))):
+            print(f"[auth] failed: {exc}")
+            return 1
+        claims = fallback_claims
+        identity = (claims.get("upn") or claims.get("unique_name")
+                    or claims.get("oid") or "?")
+        provider = None
+        print(f"[auth] refresh failed ({exc}); using the saved access token")
+    except (ValueError, RuntimeError) as exc:
+        print(f"[settings] {exc}")
+        return 1
+    print(f"[auth] {identity} (tid: {claims.get('tid')})")
+
+    def get_graph_token() -> str:
+        if provider is not None:
+            return provider.get_token(GRAPH_RES)
+        return access_fallback
+
+    graph = GraphClient(get_graph_token, verbose=args.verbose,
+                        user_agent=user_agent, batch=evade,
+                        proxies=proxies, no_proxy=no_proxy, verify=verify)
+    arm = None
+    if provider is not None:
+        try:
+            provider.get_token(ARM_RES)
+            arm = ArmClient(lambda: provider.get_token(ARM_RES),
+                            verbose=args.verbose, user_agent=user_agent,
+                            proxies=proxies, no_proxy=no_proxy, verify=verify)
+        except Exception as exc:
+            print(f"[arm] no Azure Resource Manager token ({exc}); "
+                  f"Azure tables will be skipped")
+
+    return _run_collection(graph, arm, args, identity,
+                           claims.get("tid") or tenant or "")
+
+
+def _run_collection(graph: GraphClient, arm, args, identity: str,
+                    tenant_id: str) -> int:
+    out_path = Path(args.out).expanduser().resolve()
+    meta = {
+        "started_at": _now(),
+        "identity": identity,
+        "tenant_id": tenant_id,
+        "backend": "graph",
+    }
+    try:
+        with _AtomicDatabase(out_path, meta) as store:
+            runner = collect_all(graph, arm, store, verbose=args.verbose)
+            _print_summary(runner, graph, arm)
+            counts = {
+                name: store.count(name)
+                for name in ("Users", "Groups", "ServicePrincipals",
+                             "Applications", "Devices", "RoleAssignments",
+                             "AppRoleAssignments", "Policys", "TenantDetails")
+            }
+            if not any(counts[name] for name in CORE_TABLES):
+                raise NoCoreData(
+                    "no directory data was collected; check the token's "
+                    "Microsoft Graph permissions")
+            print("\ntables: " + ", ".join(
+                f"{key}={value}" for key, value in counts.items()))
+    except NoCoreData as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return EXIT_NO_CORE
+    except Exception as exc:
+        print(f"[error] collection failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"\nwrote {out_path}")
     return 0
 
 
@@ -408,7 +583,10 @@ def run_aadgraph(args) -> int:
     token_user_agent = user_agent
     if args.evade and not user_agent:
         user_agent = "Microsoft ADO.NET Data Services"
+    access_claims = _claims(access) if access else {}
+    tenant_hint = (args.tenant or "").strip() or access_claims.get("tid") or ""
     provider = None
+    refresh_failed = False
     if refresh:
         if not client_id:
             print("[auth] failed: client id is required when a refresh token "
@@ -416,7 +594,8 @@ def run_aadgraph(args) -> int:
             return 1
         provider = SavingProvider(refresh, client_id, args.token_out,
                                   proxies=proxies, verify=verify,
-                                  user_agent=token_user_agent)
+                                  user_agent=token_user_agent,
+                                  tenant=tenant_hint)
 
     use_autotoken = bool((args.autotoken and provider is not None)
                          or (refresh and not access))
@@ -428,8 +607,20 @@ def run_aadgraph(args) -> int:
         try:
             token = provider.get_token(AAD_GRAPH_RES)
         except AuthError as exc:
-            print(f"[auth] failed: {exc}", file=sys.stderr)
-            return 1
+            # Fall back to a valid saved AAD Graph access token rather than
+            # failing the whole collection on a stale refresh token.
+            fallback = _claims(access)
+            expires = fallback.get("exp")
+            if (access and fallback and _is_aadgraph_access_token(fallback)
+                    and not (expires and int(expires) <= int(time.time()))):
+                print(f"[auth] refresh failed ({exc}); using the saved "
+                      "AAD Graph access token")
+                token = access
+                use_autotoken = False
+                refresh_failed = True
+            else:
+                print(f"[auth] failed: {exc}", file=sys.stderr)
+                return 1
     else:
         token = access
     claims = _claims(token)
@@ -457,76 +648,97 @@ def run_aadgraph(args) -> int:
             return token
 
     out_path = Path(args.out).expanduser().resolve()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    store = Store(str(out_path))
-    store.reset()
-    store.set_meta("backend", "aadgraph")
-    store.set_meta("started_at", dt.datetime.now(dt.UTC).isoformat())
-    store.set_meta("identity", identity)
-    store.set_meta("tenant_id", tenant_id)
-    store.set_meta("evade", "1" if args.evade else "0")
-    store.set_meta("gather_all", "1" if args.gather_all else "0")
-
-    client = AadGraphClient(
-        token_getter, tenant_id, user_agent=user_agent,
-        evade=args.evade, verbose=args.verbose, proxies=proxies,
-        no_proxy=no_proxy, verify=verify)
-    runner = Runner(client, store, verbose=args.verbose)
-    info = collect_aadgraph(runner, mfa=args.mfa)
-
-    extra_sections = []
-    if args.gather_all:
-        if provider is None:
-            print("[gatherall] skipped: a refresh token is required for "
-                  "Microsoft Graph and ARM")
-        else:
-            graph = GraphClient(
-                lambda: provider.get_token(GRAPH_RES),
-                verbose=args.verbose, user_agent=user_agent,
-                proxies=proxies, no_proxy=no_proxy, verify=verify)
-            arm = None
-            try:
-                provider.get_token(ARM_RES)
-                arm = ArmClient(
-                    lambda: provider.get_token(ARM_RES),
-                    verbose=args.verbose, user_agent=user_agent,
-                    proxies=proxies, no_proxy=no_proxy, verify=verify)
-            except AuthError as exc:
-                print(f"[arm] no Azure Resource Manager token ({exc}); "
-                      "Azure tables will be skipped")
-            try:
-                extra_sections = collect_gatherall(
-                    graph, arm, store, info.get("groups") or [],
-                    verbose=args.verbose)
-            except Exception as exc:
-                print(f"[gatherall] failed: {str(exc)[:250]}")
-
-    store.set_meta("finished_at", dt.datetime.now(dt.UTC).isoformat())
-    store.commit()
-    counts = {
-        name: store.count(name)
-        for name in ("Users", "Groups", "ServicePrincipals", "Applications",
-                     "Devices", "RoleAssignments", "AppRoleAssignments",
-                     "Policys", "TenantDetails")
+    meta = {
+        "backend": "aadgraph",
+        "started_at": _now(),
+        "identity": identity,
+        "tenant_id": tenant_id,
+        "evade": "1" if args.evade else "0",
+        "gather_all": "1" if args.gather_all else "0",
     }
-    store.close()
+    gatherall_failed = False
+    try:
+        with _AtomicDatabase(out_path, meta) as store:
+            client = AadGraphClient(
+                token_getter, tenant_id, user_agent=user_agent,
+                evade=args.evade, verbose=args.verbose, proxies=proxies,
+                no_proxy=no_proxy, verify=verify)
+            runner = Runner(client, store, verbose=args.verbose)
+            info = collect_aadgraph(runner, mfa=args.mfa)
 
-    print("\n=== AAD Graph collection summary ===")
-    for sec in list(runner.sections) + list(extra_sections):
-        flag = {"ok": "+", "partial": "~", "degraded": "!", "skipped": "-",
-                "error": "X"}.get(sec.status, "?")
-        print(f"  {flag} {sec.name:52s} {sec.status:8s} {sec.count or ''}"
-              + (f"  [{sec.note}]" if sec.note else ""))
-    print("\ntables: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
-    print(f"{client.requests_made} AAD Graph requests")
-    if getattr(client, "throttled", 0):
-        print(f"throttled (429) responses: {client.throttled}")
-    print(f"\nwrote {out_path}")
-    if not any(counts[name] for name in
-               ("Users", "Groups", "ServicePrincipals", "TenantDetails")):
-        print("[error] no directory data was collected; check the token's "
-              "AAD Graph permissions", file=sys.stderr)
+            extra_sections = []
+            if args.gather_all:
+                if provider is None or refresh_failed:
+                    print("[gatherall] skipped: a working refresh token is "
+                          "required for Microsoft Graph and ARM")
+                    gatherall_failed = True
+                else:
+                    graph = GraphClient(
+                        lambda: provider.get_token(GRAPH_RES),
+                        verbose=args.verbose, user_agent=user_agent,
+                        proxies=proxies, no_proxy=no_proxy, verify=verify)
+                    arm = None
+                    try:
+                        provider.get_token(ARM_RES)
+                        arm = ArmClient(
+                            lambda: provider.get_token(ARM_RES),
+                            verbose=args.verbose, user_agent=user_agent,
+                            proxies=proxies, no_proxy=no_proxy, verify=verify)
+                    except Exception as exc:
+                        print(f"[arm] no Azure Resource Manager token ({exc}); "
+                              "Azure tables will be skipped")
+                    try:
+                        extra_sections = collect_gatherall(
+                            graph, arm, store, info.get("groups") or [],
+                            verbose=args.verbose)
+                    except Exception as exc:
+                        print(f"[gatherall] failed: {str(exc)[:250]}")
+                        failed = Section("gatherall")
+                        failed.status = "error"
+                        failed.note = str(exc)[:200]
+                        extra_sections = [failed]
+                        gatherall_failed = True
+                    if any(sec.status in ("error", "degraded")
+                           or (sec.name == "AZ (ARM)"
+                               and sec.status == "skipped")
+                           for sec in extra_sections):
+                        gatherall_failed = True
+
+            counts = {
+                name: store.count(name)
+                for name in ("Users", "Groups", "ServicePrincipals",
+                             "Applications", "Devices", "RoleAssignments",
+                             "AppRoleAssignments", "Policys", "TenantDetails")
+            }
+            if not any(counts[name] for name in CORE_TABLES):
+                raise NoCoreData(
+                    "no directory data was collected; check the token's "
+                    "AAD Graph permissions")
+
+            print("\n=== AAD Graph collection summary ===")
+            for sec in list(runner.sections) + list(extra_sections):
+                flag = {"ok": "+", "partial": "~", "degraded": "!",
+                        "skipped": "-", "error": "X"}.get(sec.status, "?")
+                print(f"  {flag} {sec.name:52s} {sec.status:8s} "
+                      f"{sec.count or ''}"
+                      + (f"  [{sec.note}]" if sec.note else ""))
+            print("\ntables: " + ", ".join(
+                f"{key}={value}" for key, value in counts.items()))
+            print(f"{client.requests_made} AAD Graph requests")
+            if getattr(client, "throttled", 0):
+                print(f"throttled (429) responses: {client.throttled}")
+    except NoCoreData as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return EXIT_NO_CORE
+    except Exception as exc:
+        print(f"[error] collection failed: {exc}", file=sys.stderr)
         return 1
+    print(f"\nwrote {out_path}")
+    if gatherall_failed:
+        print("[partial] gather-all did not complete every requested "
+              "section; the core AAD Graph snapshot was saved",
+              file=sys.stderr)
+        return EXIT_PARTIAL
     return 0
 
 
@@ -541,6 +753,8 @@ def main(argv=None) -> int:
     p.add_argument("--resource", choices=sorted(PROBE_RESOURCES), default="graph")
     p.add_argument("--resource-uri", default="",
                    help="arbitrary resource URI or application ID")
+    p.add_argument("--tenant", default="",
+                   help="tenant ID/domain for the token authority")
     p.set_defaults(func=probe)
 
     t = sub.add_parser("proxy-test")
@@ -557,6 +771,10 @@ def main(argv=None) -> int:
     r.add_argument("-v", "--verbose", action="count", default=0)
     r.add_argument("--token-out", default="")
     r.add_argument("--access-out", default="")
+    r.add_argument("-at", "--access-token", default="",
+                   help="fallback access token when the refresh token fails")
+    r.add_argument("-t", "--tenant", default="",
+                   help="tenant ID/domain for the token authority")
     r.add_argument("--evade", action="store_true",
                    help="batch relationship requests and use the evade UA")
     r.set_defaults(func=run)

@@ -1,5 +1,9 @@
 .entra-surface-auth.json
+.entra-surface-auth.json.lock
 .entra-surface-settings.json
 data/databases/*
 !data/databases/.gitkeep
 data/token-resources/
+tests/
+__pycache__/
+*.pyc

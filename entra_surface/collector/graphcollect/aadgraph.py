@@ -10,6 +10,8 @@ in a one-part ``multipart/mixed`` request to ``/$batch``.
 """
 from __future__ import annotations
 
+import datetime as dt
+import email.utils
 import json
 import re
 import threading
@@ -109,6 +111,27 @@ class AadGraphClient:
         return f"{AAD_GRAPH_BASE}/{self.tenant_id}/{path.lstrip('/')}"
 
     @staticmethod
+    def _retry_after(headers, default: int = 5) -> int:
+        """Parse delta-seconds or HTTP-date Retry-After values."""
+        headers = headers or {}
+        raw = (headers.get("Retry-After") or headers.get("retry-after")
+               or default)
+        value = default
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            try:
+                when = email.utils.parsedate_to_datetime(str(raw))
+                if when is not None:
+                    if when.tzinfo is None:
+                        when = when.replace(tzinfo=dt.timezone.utc)
+                    value = int(
+                        (when - dt.datetime.now(dt.timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                value = default
+        return max(0, min(value, 60))
+
+    @staticmethod
     def _add_api_version(url: str) -> str:
         if "api-version=" in url:
             return url
@@ -150,7 +173,7 @@ class AadGraphClient:
                 with self._count_lock:
                     self.throttled += 1
                     total = self.throttled
-                wait = int(response.headers.get("Retry-After", "5") or 5)
+                wait = self._retry_after(response.headers)
                 pause = min(wait, 60) + 1
                 log_throttle("aadgraph", pause, f"total {total}")
                 time.sleep(pause)
@@ -195,7 +218,7 @@ class AadGraphClient:
                 with self._count_lock:
                     self.throttled += 1
                     total = self.throttled
-                wait = int(response.headers.get("Retry-After", "5") or 5)
+                wait = self._retry_after(response.headers)
                 pause = min(wait, 60) + 1
                 log_throttle("aadgraph", pause, f"batch, total {total}")
                 time.sleep(pause)
@@ -206,7 +229,25 @@ class AadGraphClient:
             if response.status_code >= 400:
                 raise Degraded(response.status_code, batch_url,
                                response.text[:500])
-            return self._parse_batch(response, url)
+            parsed = self._parse_batch(response, url)
+            # A $batch outer response can be HTTP 200 with a throttled or
+            # failed inner part.  Retry those using the inner Retry-After.
+            if parsed.status_code == 429:
+                with self._count_lock:
+                    self.throttled += 1
+                    total = self.throttled
+                wait = self._retry_after(parsed.headers)
+                pause = min(wait, 60) + 1
+                log_throttle("aadgraph", pause,
+                             f"batch inner 429, total {total}")
+                time.sleep(pause)
+                continue
+            if parsed.status_code in (500, 502, 503, 504) and attempt < retries - 1:
+                time.sleep(1 + attempt)
+                continue
+            if parsed.status_code >= 400:
+                raise Degraded(parsed.status_code, url, parsed.text[:500])
+            return parsed
         raise Degraded(0, url, "batch retries exhausted")
 
     @staticmethod
@@ -243,8 +284,6 @@ class AadGraphClient:
                     key, value = line.split(":", 1)
                     inner_headers[key.strip()] = value.strip()
             body = inner_body.encode("latin-1")
-            if status >= 400:
-                raise Degraded(status, url, body.decode("utf-8", "replace")[:500])
             return BatchResponse(status, inner_headers, body)
         raise Degraded(0, url, "no application/http part in batch response")
 
@@ -347,6 +386,50 @@ def _object_id(obj: dict) -> str:
     return str((obj or {}).get("objectId") or "")
 
 
+def _synthetic_app_role_key(obj: dict, resource_id: str = "") -> str:
+    """Build a stable key when an appRoleAssignment omits objectId.
+
+    In AAD Graph ``id`` is the app-role GUID, not the assignment object id, so
+    using it as objectId collapses every assignment of the same role.
+    """
+    parts = (
+        obj.get("appRoleId") or obj.get("id") or "",
+        obj.get("principalId") or "",
+        obj.get("resourceId") or resource_id or "",
+        obj.get("principalType") or "",
+    )
+    return "ara:" + ":".join(str(part) for part in parts if part)
+
+
+def _resource_scope_text(obj: dict) -> str:
+    scope = obj.get("resourceScopes")
+    if scope is None:
+        scope = obj.get("directoryScopeId") or obj.get("scope") or "/"
+    if isinstance(scope, (list, tuple)):
+        scope = ",".join(sorted(str(item) for item in scope if item))
+    return str(scope or "/")
+
+
+def _synthetic_role_assignment_key(obj: dict, role_id: str) -> str:
+    """Synthesize a role-assignment key including every distinguishing field."""
+    return "ra:{0}:{1}:{2}:{3}:{4}".format(
+        role_id, obj.get("principalId") or "",
+        _resource_scope_text(obj),
+        obj.get("condition") or "",
+        obj.get("conditionVersion") or "")
+
+
+def _collect_paged(client: AadGraphClient, path: str) -> tuple[list, str]:
+    """Collect a paged endpoint, keeping pages received before a failure."""
+    items = []
+    try:
+        for item in client.paged(path):
+            items.append(item)
+    except Exception as exc:
+        return items, str(exc)[:120]
+    return items, ""
+
+
 def dump_objects(runner: Runner, path: str, table: str, pk: str,
                  keep: bool = False, extra: str = "") -> list:
     """Dump one paged collection into a table; return objects when requested."""
@@ -412,10 +495,10 @@ def _fetch_group_links(client: AadGraphClient, group: dict) -> tuple:
     for key, path in (
             ("members", f"/groups/{gid}/$links/members"),
             ("owners", f"/groups/{gid}/$links/owners")):
-        try:
-            data[key] = list(client.paged(path))
-        except Exception as exc:
-            data["errors"].append(f"{key}: {str(exc)[:80]}")
+        items, error = _collect_paged(client, path)
+        data[key] = items
+        if error:
+            data["errors"].append(f"{key}: {error}")
     return gid, data
 
 
@@ -461,34 +544,39 @@ def collect_group_links(runner: Runner, groups: list) -> None:
 def collect_au_links(runner: Runner, units: list) -> None:
     section = runner.section("Administrative unit members")
     count = 0
+    errors = 0
     for unit in units:
         uid = _object_id(unit)
         if not uid:
             continue
-        try:
-            links = list(runner.c.paged(
-                f"/administrativeUnits/{uid}/$links/members"))
-        except Exception:
-            continue
+        links, error = _collect_paged(
+            runner.c, f"/administrativeUnits/{uid}/$links/members")
+        if error:
+            errors += 1
         count += _write_link_list(runner.s, "AdministrativeUnit", uid,
                                   "au_member", links)
-    runner.finish(section, "ok" if not count else "ok", count)
+    note = f"{errors} request errors" if errors else ""
+    runner.finish(section, "ok" if not errors else
+                  ("partial" if count else "degraded"), count, note=note)
 
 
 def collect_role_links(runner: Runner, roles: list) -> None:
     section = runner.section("Directory role members")
     count = 0
+    errors = 0
     for role in roles:
         rid = _object_id(role)
         if not rid:
             continue
-        try:
-            links = list(runner.c.paged(f"/directoryRoles/{rid}/$links/members"))
-        except Exception:
-            continue
+        links, error = _collect_paged(
+            runner.c, f"/directoryRoles/{rid}/$links/members")
+        if error:
+            errors += 1
         count += _write_link_list(runner.s, "DirectoryRole", rid,
                                   "role_member", links)
-    runner.finish(section, "ok", count)
+    note = f"{errors} request errors" if errors else ""
+    runner.finish(section, "ok" if not errors else
+                  ("partial" if count else "degraded"), count, note=note)
 
 
 def _fetch_sp_links(client: AadGraphClient, sp: dict) -> tuple:
@@ -502,16 +590,15 @@ def _fetch_sp_links(client: AadGraphClient, sp: dict) -> tuple:
             ("assigned", f"/servicePrincipals/{sid}/appRoleAssignedTo"),
             ("assignments", f"/servicePrincipals/{sid}/appRoleAssignments"),
             ("owners", f"/servicePrincipals/{sid}/$links/owners")):
-        try:
-            data[key] = list(client.paged(path))
-        except Exception as exc:
-            data["errors"].append(f"{key}: {str(exc)[:80]}")
+        items, error = _collect_paged(client, path)
+        data[key] = items
+        if error:
+            data["errors"].append(f"{key}: {error}")
     if app_id:
-        try:
-            data["apprefs"] = list(client.paged(
-                f"/servicePrincipals/{app_id}/applicationRefs"))
-        except Exception as exc:
-            data["errors"].append(f"apprefs: {str(exc)[:80]}")
+        data["apprefs"], error = _collect_paged(
+            client, f"/servicePrincipals/{app_id}/applicationRefs")
+        if error:
+            data["errors"].append(f"apprefs: {error}")
     try:
         data["keys"] = client.get_json(
             f"/servicePrincipals/{sid}?$select=keyCredentials,objectId")
@@ -532,10 +619,12 @@ def collect_service_principal_links(runner: Runner,
         for sid, app_id, data in results:
             errors += len(data["errors"])
             for obj in data["assigned"] + data["assignments"]:
-                if isinstance(obj, dict) and obj.get("id"):
+                if isinstance(obj, dict) and (
+                        obj.get("id") or obj.get("appRoleId")
+                        or obj.get("principalId")):
                     obj = dict(obj)
                     if not obj.get("objectId"):
-                        obj["objectId"] = obj.get("id")
+                        obj["objectId"] = _synthetic_app_role_key(obj, sid)
                     if obj.get("objectId"):
                         runner.s.upsert("AppRoleAssignments", "objectId", obj)
                         count += 1
@@ -560,11 +649,10 @@ def _fetch_application_links(client: AadGraphClient, app: dict) -> tuple:
     data = {"owners": [], "keys": None, "errors": []}
     if not aid:
         return aid, data
-    try:
-        data["owners"] = list(client.paged(
-            f"/applications/{aid}/$links/owners"))
-    except Exception as exc:
-        data["errors"].append(f"owners: {str(exc)[:80]}")
+    data["owners"], error = _collect_paged(
+        client, f"/applications/{aid}/$links/owners")
+    if error:
+        data["errors"].append(f"owners: {error}")
     try:
         data["keys"] = client.get_json(
             f"/applications/{aid}?$select=keyCredentials,objectId")
@@ -600,10 +688,10 @@ def _fetch_role_assignments(client: AadGraphClient, role: dict) -> tuple:
     for key, path in (
             ("assignments", f"/roleAssignments?$filter=roleDefinitionId eq '{rid}'"),
             ("eligible", f"/eligibleRoleAssignments?$filter=roleDefinitionId eq '{rid}'")):
-        try:
-            data[key] = list(client.paged(path))
-        except Exception as exc:
-            data["errors"].append(f"{key}: {str(exc)[:80]}")
+        items, error = _collect_paged(client, path)
+        data[key] = items
+        if error:
+            data["errors"].append(f"{key}: {error}")
     return rid, data
 
 
@@ -624,7 +712,7 @@ def collect_role_assignments(runner: Runner, roles: list) -> None:
                         continue
                     if not obj.get("id"):
                         obj = dict(obj)
-                        obj["id"] = f"{rid}:{obj.get('principalId', '')}"
+                        obj["id"] = _synthetic_role_assignment_key(obj, rid)
                     runner.s.upsert(table, "id", obj)
                     count += 1
     note = f"{errors} request errors" if errors else ""
@@ -718,29 +806,44 @@ def _role_users(store, role_template_id: str) -> set:
 def _criteria_users(store, criteria: dict) -> set:
     if not isinstance(criteria, dict):
         return set()
+
+    def guest_users() -> set:
+        return {row[0] for row in store.conn.execute(
+            'SELECT objectId FROM Users WHERE lower(userType)=?',
+            ("guest",))}
+
     users = set()
     for kind, values in criteria.items():
+        key = str(kind).lower()
         values = _as_list(values)
         lowered = [str(value).lower() for value in values]
+        if key in ("guests", "guestsorexternalusers", "guestorexternalusers"):
+            # AAD Graph nests guest criteria in a dict; the value itself is not
+            # a user identifier.  Expand the actual guest population instead.
+            users |= guest_users()
+            continue
         if "all" in lowered:
             return {"ALLUSERS"}
         if "none" in lowered:
             continue
-        key = str(kind).lower()
         if key == "users":
-            users |= {str(value) for value in values if value}
+            for value in values:
+                if not isinstance(value, str):
+                    continue
+                lowered_value = value.lower()
+                if lowered_value in ("guests", "guestsorexternalusers"):
+                    users |= guest_users()
+                elif lowered_value not in ("all", "none"):
+                    users.add(value)
         elif key == "groups":
             seen = set()
             for group_id in values:
-                users |= _group_users(store, str(group_id), seen)
+                if isinstance(group_id, str):
+                    users |= _group_users(store, group_id, seen)
         elif key == "roles":
             for role_id in values:
-                users |= _role_users(store, str(role_id))
-        elif key in ("guests", "guestsorexternalusers"):
-            if key == "guests" or "guests" in lowered:
-                users |= {row[0] for row in store.conn.execute(
-                    'SELECT objectId FROM Users WHERE lower(userType)=?',
-                    ("guest",))}
+                if isinstance(role_id, str):
+                    users |= _role_users(store, role_id)
         # Applications / ServicePrincipals / filter rules only apply to
         # non-user scopes and are intentionally skipped here.
     return users
@@ -831,6 +934,9 @@ def collect_aadgraph(runner: Runner, mfa: bool = False) -> dict:
                  "objectId")
     dump_objects(runner, "/authorizationPolicy", "AuthorizationPolicys", "id")
     dump_objects(runner, "/settings", "DirectorySettings", "id")
+    # Commit the object phase before relationship collectors so a failure in a
+    # later section does not unwind the core AAD Graph snapshot.
+    store.commit()
 
     collect_group_links(runner, groups)
     collect_au_links(runner, administrative_units)
@@ -860,7 +966,7 @@ def collect_gatherall(graph, arm, store, groups: list,
     Core directory objects deliberately come from the legacy AAD Graph pass;
     this adds the APIs that ROADrecon's ``gatherall`` handles separately.
     """
-    from .collectors import (Runner as GraphRunner, check_arm, collect_arm,
+    from .collectors import (Runner as GraphRunner, arm_paged, collect_arm,
                              collect_ig, collect_pim_directory,
                              collect_pim_groups, collect_pim_static)
 
@@ -872,11 +978,20 @@ def collect_gatherall(graph, arm, store, groups: list,
     collect_ig(runner)
     if arm is not None:
         try:
-            subscriptions = check_arm(arm)
-        except Exception:
-            subscriptions = []
-        if subscriptions:
+            subscriptions, error = arm_paged(
+                arm, "https://management.azure.com/subscriptions"
+                     "?api-version=2022-12-01")
+        except Exception as exc:
+            subscriptions, error = [], str(exc)[:180]
+        if error:
+            section = runner.section("AZ (ARM)")
+            runner.finish(section, "degraded",
+                          note=f"subscription check failed: {error}")
+        elif subscriptions:
             collect_arm(arm, runner, subscriptions)
+        else:
+            section = runner.section("AZ (ARM)")
+            runner.finish(section, "skipped", note="no subscriptions")
     else:
         section = runner.section("AZ (ARM)")
         runner.finish(section, "skipped", note="no ARM token")

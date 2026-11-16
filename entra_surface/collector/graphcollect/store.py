@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
+from typing import Iterable
 
 BUNDLED_SCHEMA = os.path.join(os.path.dirname(__file__), "schema.sql")
 
@@ -21,6 +23,7 @@ class Store:
             "CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)")
         self._columns_cache = {}
         self._link_seen = set()
+        self._warned_columns = set()
 
     def reset(self) -> None:
         """Empty every table so a collection starts from a clean snapshot."""
@@ -51,23 +54,47 @@ class Store:
             return int(v)
         return json.dumps(v, separators=(",", ":"), default=str)
 
+    @staticmethod
+    def _pk_columns(pk) -> tuple[str, ...]:
+        if isinstance(pk, str):
+            return (pk,)
+        return tuple(pk)
+
+    def _warn_unknown(self, table: str, unknown: Iterable[str]) -> None:
+        """Report schema drift instead of silently dropping collected fields."""
+        for name in sorted(set(unknown)):
+            if not name:
+                continue
+            key = (table, name)
+            if key in self._warned_columns:
+                continue
+            self._warned_columns.add(key)
+            print(f"[store] warning: {table} has no column for {name}",
+                  file=sys.stderr, flush=True)
+
     def set_meta(self, key: str, value: str) -> None:
         self.conn.execute(
             "INSERT OR REPLACE INTO _meta (key, value) VALUES (?, ?)", (key, value))
 
     # -- object tables -------------------------------------------------
-    def upsert(self, table: str, pk: str, row: dict) -> None:
+    def upsert(self, table: str, pk, row: dict) -> None:
+        """Upsert one row; ``pk`` may name a single or composite primary key."""
         cols = self._columns(table)
-        if pk not in row:
+        pk_cols = self._pk_columns(pk)
+        if not pk_cols or any(col not in row or row[col] is None
+                              for col in pk_cols):
             return
+        self._warn_unknown(table, (key for key in row if key not in cols))
         keep = {k: self._encode(v) for k, v in row.items() if k in cols}
         if not keep:
             return
         names = ", ".join(f'"{c}"' for c in keep)
         placeholders = ", ".join("?" for _ in keep)
+        target = ", ".join(f'"{c}"' for c in pk_cols)
+        update_cols = [c for c in keep if c not in pk_cols] or list(keep)
         sql = (f'INSERT INTO "{table}" ({names}) VALUES ({placeholders}) '
-               f'ON CONFLICT("{pk}") DO UPDATE SET ' +
-               ", ".join(f'"{c}"=excluded."{c}"' for c in keep))
+               f'ON CONFLICT({target}) DO UPDATE SET ' +
+               ", ".join(f'"{c}"=excluded."{c}"' for c in update_cols))
         self.conn.execute(sql, list(keep.values()))
 
     # -- link tables ---------------------------------------------------
@@ -77,9 +104,13 @@ class Store:
             "AND name LIKE 'lnk_%'").fetchall()]
         for t in tables:
             self.conn.execute(f'DELETE FROM "{t}"')
+        # Link insertion is deduplicated in memory; clearing only the tables
+        # would make a later re-add of the same edge silently disappear.
+        self._link_seen.clear()
 
     def add_link(self, table: str, row: dict) -> None:
         cols = self._columns(table)
+        self._warn_unknown(table, (key for key in row if key not in cols))
         keep = {k: v for k, v in row.items() if k in cols}
         if not keep:
             return
@@ -95,6 +126,14 @@ class Store:
 
     def commit(self) -> None:
         self.conn.commit()
+
+    def checkpoint(self) -> None:
+        """Flush the WAL so the database file can be moved atomically."""
+        try:
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self.conn.commit()
+        except sqlite3.Error:
+            pass
 
     def count(self, table: str) -> int:
         try:

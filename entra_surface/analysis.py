@@ -129,6 +129,11 @@ window.ENTRA_ANALYSIS = (function() {
           setTimeout(function() { window.location.reload(); }, 400);
         } else if (data.status === 'error') {
           onStatus(data.error || 'Analysis failed.', true);
+        } else if (data.status === 'idle' || !data.status) {
+          onStatus('Analysis job is no longer running (the server may have '
+            + 'restarted). Start the analysis again.', true);
+        } else {
+          onStatus('Analysis stopped with unexpected status: ' + data.status, true);
         }
       })
       .catch(function() {
