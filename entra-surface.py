@@ -3161,6 +3161,47 @@ def build_role_applications(graph, group_roles, group_eligible_roles=None):
     return dict(index)
 
 
+def build_permission_applications(results):
+    """Permission value -> principals holding it for the permission drilldown.
+
+    Mirrors build_role_applications for app-role permissions: drives the
+    'Applications' tab of the permission drilldown, with the recorded owners
+    of each principal in the 'Users' tab."""
+    priv = next((res for res in results
+                 if res.get("id") == "priv_app_ownership"), None)
+    index = {}
+    if not priv:
+        return index
+    for f in priv.get("findings") or []:
+        permission = f.get("permission") or ""
+        principal_id = f.get("principal_id") or ""
+        if not permission or not principal_id:
+            continue
+        resource = f.get("resource_name") or ""
+        entries = index.setdefault(permission, [])
+        entry = next((e for e in entries
+                      if e["id"] == principal_id and e["resource"] == resource), None)
+        if entry is None:
+            entry = {
+                "id": principal_id,
+                "name": (f.get("display_name") or f.get("sp_display_name")
+                         or principal_id),
+                "app_object_id": f.get("app_object_id") or "",
+                "resource": resource,
+                "owners": [],
+            }
+            entries.append(entry)
+        seen = {(o.get("object_id"), o.get("upn")) for o in entry["owners"]}
+        for owner in f.get("owners") or []:
+            key = (owner.get("object_id"), owner.get("upn"))
+            if key not in seen:
+                entry["owners"].append(owner)
+                seen.add(key)
+    for entries in index.values():
+        entries.sort(key=lambda e: (e.get("name") or "").lower())
+    return index
+
+
 def compute_group_eligible_roles(graph, check_cfg):
     """{group_id: [{"name", "severity"}]} - PIM-eligible directory roles carried
     by each group (EligibleRoleAssignments whose principal is a group). Marker
@@ -7503,6 +7544,9 @@ def render_report(results, tenant_name, db_path, config_path,
     role_apps_json = json.dumps(
         build_role_applications(graph, group_roles, group_eligible_roles),
         default=str).replace("</", "<\\/")
+    permission_apps_json = json.dumps(
+        build_permission_applications(results),
+        default=str).replace("</", "<\\/")
     # distinct values per field for advanced-filter autocomplete (capped)
     SUGGEST_VALUE_FIELDS = {
         "severity", "category", "check", "roles", "eligible", "grproles",
@@ -8456,6 +8500,8 @@ def render_report(results, tenant_name, db_path, config_path,
 
 <script type="application/json" id="role-apps-data">{role_apps_json}</script>
 
+<script type="application/json" id="permission-apps-data">{permission_apps_json}</script>
+
 <script type="application/json" id="table-catalog-data">{catalog_json}</script>
 
 {extras_scripts_html}
@@ -8949,6 +8995,8 @@ def render_report(results, tenant_name, db_path, config_path,
 
   var ROLE_APPS = {{}};
   try {{ ROLE_APPS = JSON.parse(document.getElementById('role-apps-data').textContent); }} catch (e) {{}}
+  var PERMISSION_APPS = {{}};
+  try {{ PERMISSION_APPS = JSON.parse(document.getElementById('permission-apps-data').textContent); }} catch (e) {{}}
 
   function closeDrilldown() {{
     overlay.classList.add('hidden');
@@ -8969,7 +9017,9 @@ def render_report(results, tenant_name, db_path, config_path,
     adUser: 1, adUpn: 1, adCn: 1, adDn: 1, adSid: 1, adPw: 1, adTags: 1, adStatus: 1
   }};
 
-  function isRoleDrilldown(field) {{ return field === 'roles'; }}
+  function isRoleDrilldown(field) {{
+    return field === 'roles' || field === 'permission';
+  }}
 
   function openDrilldown(field, value) {{
     if (isRoleDrilldown(field)) {{ openRoleDrilldown(field, value); return; }}
@@ -9056,12 +9106,12 @@ def render_report(results, tenant_name, db_path, config_path,
     }});
   }}
 
-  function fillAppsPane(role) {{
-    var entries = ROLE_APPS[role] || [];
+  function fillAppsPane(value, isPermission) {{
+    var entries = (isPermission ? PERMISSION_APPS[value] : ROLE_APPS[value]) || [];
     appsTbody.innerHTML = '';
     appsThead.innerHTML = '';
     appsThead.appendChild(document.createElement('th'));
-    ['Application', 'ObjectId', 'Assignment'].forEach(function(label) {{
+    ['Application', 'ObjectId', isPermission ? 'Resource' : 'Assignment'].forEach(function(label) {{
       var th = document.createElement('th');
       th.textContent = label;
       appsThead.appendChild(th);
@@ -9071,16 +9121,19 @@ def render_report(results, tenant_name, db_path, config_path,
       var td = document.createElement('td');
       td.colSpan = 4;
       td.className = 'muted';
-      td.textContent = 'No service principals hold this directory role.';
+      td.textContent = isPermission
+          ? 'No service principals hold this permission.'
+          : 'No service principals hold this directory role.';
       tr.appendChild(td);
       appsTbody.appendChild(tr);
       return;
     }}
     entries.forEach(function(a, i) {{
-      var key = 'ra-' + i;
+      var rowKey = 'ra-' + i;
       var tr = document.createElement('tr');
       tr.setAttribute('data-sp-id', a.id);
-      tr.setAttribute('data-detail-key', key);
+      if (a.app_object_id) tr.setAttribute('data-app-id', a.app_object_id);
+      tr.setAttribute('data-detail-key', rowKey);
       var expandTd = document.createElement('td');
       expandTd.className = 'expand-cell';
       var btn = document.createElement('button');
@@ -9098,12 +9151,16 @@ def render_report(results, tenant_name, db_path, config_path,
       idTd.textContent = a.id;
       tr.appendChild(idTd);
       var assignTd = document.createElement('td');
-      assignTd.textContent = (a.eligible ? '(eligible) ' : '') + (a.path ? ('via ' + a.path.join(' \u2192 ')) : 'Direct');
+      if (isPermission) {{
+        assignTd.textContent = a.resource || '\u2014';
+      }} else {{
+        assignTd.textContent = (a.eligible ? '(eligible) ' : '') + (a.path ? ('via ' + a.path.join(' \u2192 ')) : 'Direct');
+      }}
       tr.appendChild(assignTd);
       appsTbody.appendChild(tr);
       var tdr = document.createElement('tr');
       tdr.className = 'drawer';
-      tdr.setAttribute('data-detail-for', key);
+      tdr.setAttribute('data-detail-for', rowKey);
       var tdc = document.createElement('td');
       tdc.colSpan = 4;
       var tdb = document.createElement('div');
@@ -9114,7 +9171,93 @@ def render_report(results, tenant_name, db_path, config_path,
     }});
   }}
 
+  function fillPermissionUsersPane(permission) {{
+    var entries = PERMISSION_APPS[permission] || [];
+    var seen = {{}};
+    var rows = [];
+    entries.forEach(function(a) {{
+      (a.owners || []).forEach(function(o) {{
+        var ownerKey = (o.object_id || o.upn || o.display_name || '') + '|' + (a.id || '');
+        if (seen[ownerKey]) return;
+        seen[ownerKey] = 1;
+        rows.push({{owner: o, app: a}});
+      }});
+    }});
+    theadRow.innerHTML = '';
+    theadRow.appendChild(document.createElement('th'));
+    ['Owner', 'Owner UPN', 'Status', 'Application', 'Permission'].forEach(function(label) {{
+      var th = document.createElement('th');
+      th.textContent = label;
+      theadRow.appendChild(th);
+    }});
+    tbody.innerHTML = '';
+    if (!rows.length) {{
+      var tr = document.createElement('tr');
+      var td = document.createElement('td');
+      td.colSpan = 6;
+      td.className = 'muted';
+      td.textContent = 'No recorded owners for principals holding this permission.';
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+      return;
+    }}
+    rows.forEach(function(r, i) {{
+      var o = r.owner;
+      var tr = document.createElement('tr');
+      if (o.object_id) {{
+        tr.setAttribute('data-owner-id', o.object_id);
+        tr.setAttribute('data-profile-id', o.object_id);
+      }}
+      tr.setAttribute('data-detail-key', 'pd-' + i);
+      var expandTd = document.createElement('td');
+      expandTd.className = 'expand-cell';
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'icon-btn expand-btn';
+      btn.setAttribute('aria-label', 'View full details');
+      btn.textContent = '+';
+      expandTd.appendChild(btn);
+      tr.appendChild(expandTd);
+      var nameTd = document.createElement('td');
+      nameTd.textContent = o.display_name || o.upn || o.object_id || '';
+      tr.appendChild(nameTd);
+      var upnTd = document.createElement('td');
+      upnTd.className = 'mono';
+      upnTd.textContent = o.upn || '\u2014';
+      tr.appendChild(upnTd);
+      var statusTd = document.createElement('td');
+      statusTd.textContent = o.enabled ? 'Enabled' : 'Disabled';
+      tr.appendChild(statusTd);
+      var appTd = document.createElement('td');
+      appTd.textContent = r.app.name || '';
+      tr.appendChild(appTd);
+      var permTd = document.createElement('td');
+      permTd.textContent = permission;
+      tr.appendChild(permTd);
+      tbody.appendChild(tr);
+      var tdr = document.createElement('tr');
+      tdr.className = 'drawer';
+      tdr.setAttribute('data-detail-for', tr.getAttribute('data-detail-key'));
+      var tdc = document.createElement('td');
+      tdc.colSpan = 6;
+      var tdb = document.createElement('div');
+      tdb.className = 'drawer-body';
+      tdc.appendChild(tdb);
+      tdr.appendChild(tdc);
+      tbody.appendChild(tdr);
+    }});
+  }}
+
   function openRoleDrilldown(field, value) {{
+    var isPermission = field === 'permission';
+    var entries = (isPermission ? PERMISSION_APPS[value] : ROLE_APPS[value]) || [];
+    var ownerSeen = {{}};
+    entries.forEach(function(a) {{
+      (a.owners || []).forEach(function(o) {{
+        ownerSeen[(o.object_id || o.upn || o.display_name || '') + '|' + (a.id || '')] = 1;
+      }});
+    }});
+    var ownerCount = Object.keys(ownerSeen).length;
     titleEl.textContent = (FIELD_LABELS[field] || field) + ': ' + value;
     tabsWrap.innerHTML = '';
     var mkTab = function(id, label, active) {{
@@ -9125,14 +9268,18 @@ def render_report(results, tenant_name, db_path, config_path,
       b.textContent = label;
       return b;
     }};
-    var entries = ROLE_APPS[value] || [];
-    tabsWrap.appendChild(mkTab('users', 'Users', true));
-    tabsWrap.appendChild(mkTab('apps', 'Applications (' + entries.length + ')', false));
+    tabsWrap.appendChild(mkTab('users', 'Users' + (isPermission ? ' (' + ownerCount + ')' : ''), !isPermission));
+    tabsWrap.appendChild(mkTab('apps', 'Applications (' + entries.length + ')', isPermission));
     tabsWrap.classList.remove('hidden');
-    usersScroll.classList.remove('hidden');
-    appsScroll.classList.add('hidden');
-    fillAppsPane(value);
-    if (SERVE_DRILLDOWN_FIELDS[field]) {{
+    usersScroll.classList.toggle('hidden', isPermission);
+    appsScroll.classList.toggle('hidden', !isPermission);
+    fillAppsPane(value, isPermission);
+    if (isPermission) {{
+      fillPermissionUsersPane(value);
+      subtitleEl.textContent = entries.length
+          + (entries.length === 1 ? ' principal holds this permission' : ' principals hold this permission')
+          + (ownerCount ? ' \u00b7 ' + ownerCount + ' recorded owner(s)' : ' \u00b7 no recorded owners');
+    }} else if (SERVE_DRILLDOWN_FIELDS[field]) {{
       fetch('/api/drilldown?field=' + encodeURIComponent(field) + '&value=' + encodeURIComponent(value))
         .then(function(r) {{ return r.json(); }})
         .then(function(d) {{
@@ -11941,10 +12088,19 @@ def build_serve_records(results):
             app_id = next(iter(o.get("app", set())), "")
             owner_id = next(iter(o.get("user", set())), "")
             if res["id"] == "priv_app_ownership":
-                for owner in f.get("owners", []):
-                    add(serve_field_map("owned-table", f, owner),
-                        sp=f.get("principal_id", ""), app=f.get("app_object_id") or "",
-                        owner=owner.get("object_id", ""))
+                owners = f.get("owners") or []
+                if owners:
+                    for owner in owners:
+                        add(serve_field_map("owned-table", f, owner),
+                            sp=f.get("principal_id", ""), app=f.get("app_object_id") or "",
+                            owner=owner.get("object_id", ""))
+                else:
+                    # Unowned findings have no owner row in the owned table,
+                    # but still need a record so permission/app/resource
+                    # drilldowns can find them (e.g. app-role permissions on
+                    # service principals with no recorded owner).
+                    add(serve_field_map("owned-table", f),
+                        sp=f.get("principal_id", ""), app=f.get("app_object_id") or "")
             elif res["id"] == "groups":
                 gid = f.get("group_id", "")
                 add(serve_field_map("groups-table", f), gid=gid)
