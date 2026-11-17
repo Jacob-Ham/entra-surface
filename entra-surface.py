@@ -11704,6 +11704,13 @@ def render_report(results, tenant_name, db_path, config_path,
     if (!drawer || drawer.dataset.filled || drawer.dataset.loading) return;
     var body = drawer.querySelector('.drawer-body');
     if (!body) return;
+    // Some rows (for example the CA what-if evaluation) ship a drawer that is
+    // already rendered server-side. Keep it instead of clearing it and
+    // fetching a generic profile.
+    if (drawer.dataset.prefilled) {{
+      markDrawerFilled(drawer);
+      return;
+    }}
     drawer.dataset.loading = '1';
     body.innerHTML = '';
     var returnTab = drawer.__returnTab || '';
@@ -16009,7 +16016,12 @@ def run_ca_analysis(db_path, progress, target_upn=None, compare_upns=None,
             drawer_body = (summary
                            + '<div class="detail-section"><h4>Dependent signals</h4>'
                            + signals_html(r) + "</div>")
-            drawer = (f'<tr class="drawer" data-detail-for="ca-whatif-{i}">'
+            # The drawer is rendered server-side with the per-scenario summary
+            # and the policy's dependent signals. Mark it prefilled so the
+            # generic drawer loader does not clear it and replace it with the
+            # policy profile.
+            drawer = (f'<tr class="drawer" data-detail-for="ca-whatif-{i}" '
+                      f'data-prefilled="1">'
                       f'<td colspan="7"><div class="drawer-body">{drawer_body}</div></td></tr>')
             wi_rows.append({
                 "_html": (f'<tr data-policy-id="{esc(r["id"])}" data-detail-key="ca-whatif-{i}">'
