@@ -38,8 +38,6 @@ Checks (config: privileged_roles.json -> "checks"):
                             and privileged / SP members
   ca_exposure             - Conditional Access policy inventory: states, scopes,
                             conditions and exclusions
-  ca_gaps                 - Conditional Access gaps: privileged users excluded
-                            from enabled sign-on / MFA policies that target them
   ad_sync_summary         - sync summary card: engine in use (Entra Connect on-prem
                             vs likely Cloud Sync), connector host, password-writeback
                             channel, Desktop SSO status
@@ -463,7 +461,7 @@ def _directory_role_disabled(role_record):
 ADV_LIST_FIELDS = {
     "roles", "eligible", "grproles", "grptype", "dynmods", "dynattrs",
     "azroles", "azusrroles", "azsproles", "adtags", "appdirroles",
-    "polapps", "polcontrols", "arcazroles", "capolicies", "caroles",
+    "polapps", "polcontrols", "arcazroles",
     # serve-side owned-table rows merge all owners into one map
     "owner", "ownerupn", "ownerstatus",
 }
@@ -505,8 +503,6 @@ ADV_COLUMN_ALIASES = {
     "controls": ["polcontrols"], "polcontrols": ["polcontrols"],
     "included": ["polinc"], "polinc": ["polinc"],
     "excluded": ["polexc"], "polexc": ["polexc"],
-    "capolicies": ["capolicies"], "excludedpolicies": ["capolicies"],
-    "caroles": ["caroles"], "privilegedroles": ["caroles"],
     "application": ["app"], "app": ["app"],
     "owner": ["owner"], "ownerupn": ["ownerupn"],
     "resource": ["resource"], "permission": ["permission"],
@@ -556,8 +552,6 @@ ADV_DISPLAY_PHRASES = [
     ("App ID", "appid"), ("SP type", "spty"), ("Policy type", "poltype"),
     ("Created", "polcreated"), ("Last modified", "polmodified"),
     ("Immutable ID", "immutableid"),
-    ("Excluded policies", "capolicies"),
-    ("Privileged roles", "caroles"),
 ]
 ADV_PHRASE_RES = [
     (re.compile(r"\b" + re.escape(phrase) + r"(?=\s*:)", re.IGNORECASE), canonical)
@@ -4318,7 +4312,7 @@ def check_ca_exposure(ctx):
     """Conditional Access policy inventory: per-policy posture (state, scope,
     exclusions) plus a full policy profile (included/excluded users, roles,
     groups, applications, controls, conditions) for the drawer. Per-user
-    exposure gaps are emitted separately by check_ca_gaps."""
+    exclusion gaps are evaluated on demand in the CA coverage analysis."""
     graph = ctx["graph"]
     role_sev = ctx["check_cfg"]["directory_roles"]
 
@@ -4411,8 +4405,8 @@ def check_ca_exposure(ctx):
             evidence=" · ".join(bits),
             remediation=("Confirm the policy state, scope, and exclusions; Reporting "
                          "policies do not enforce, and excluded users bypass the "
-                         "policy's sign-on requirements. Privileged excluded "
-                         "users get their own per-user findings."),
+                         "policy's sign-on requirements. Use the CA coverage "
+                         "analysis to evaluate per-user exclusion gaps."),
             primary_id=pol,
             object_ids={},
             target={"type": "Policy", "name": name, "id": pol},
@@ -4436,103 +4430,6 @@ def check_ca_exposure(ctx):
         f["created"] = inner.get("CreatedDateTime", "")
         f["modified"] = inner.get("ModifiedDateTime", "")
         f["template_id"] = inner.get("TemplateId", "")
-        findings.append(f)
-
-    findings.sort(key=lambda f: (severity_rank(f["severity"]),
-                                 (f["target"]["name"] or "").lower()))
-    return findings
-
-
-def check_ca_gaps(ctx):
-    """Conditional Access gaps: privileged users explicitly excluded from an
-    enabled policy that otherwise targets them. An exclusion only counts when
-    the policy also includes the user (all users or an explicit include link).
-    Severity follows the most critical privileged directory role the user
-    holds, including roles inherited through group membership."""
-    graph = ctx["graph"]
-    role_sev = ctx["check_cfg"]["directory_roles"]
-    group_roles = ctx.get("group_roles") or {}
-
-    def policy_state(pol_id):
-        rec = graph["policy"].get(pol_id)
-        return policy_state_from_record(rec) if rec else "Unknown"
-
-    def _group_label(gid):
-        rec = graph["group"].get(gid)
-        return rec.get("displayName") if rec else gid
-
-    privileges = defaultdict(dict)  # uid -> role name -> severity
-    for uid, roles in direct_directory_roles_by_user(graph, role_sev).items():
-        for r in roles:
-            privileges[uid].setdefault(r["name"], r["severity"])
-    for gid, members in graph["group_member_user"].items():
-        inherited = resolve_group_role_paths(
-            gid, group_roles, graph["group_member_group"], _group_label)
-        for uid in members:
-            for r in inherited:
-                privileges[uid].setdefault(r["name"], r["severity"])
-
-    ca_policies = [oid for oid, rec in graph["policy"].items()
-                   if rec.get("policyType") == 18]
-    excluded_from = defaultdict(list)
-    for pol in ca_policies:
-        rec = graph["policy"][pol]
-        if _ca_state_label(policy_state(pol)) != "Enabled":
-            continue
-        included_all = pol in graph["policy_include_allusers"]
-        included_uids = {uid for p, uid in graph["policy_user_include"] if p == pol}
-        excluded_uids = {uid for p, uid in graph["policy_user_exclude"] if p == pol}
-        if not excluded_uids:
-            continue
-        name = rec.get("displayName") or pol
-        for uid in sorted(excluded_uids):
-            # Exclusions only matter for users the policy otherwise targets
-            # (all users, or an explicit include link).
-            if not (included_all or uid in included_uids):
-                continue
-            excluded_from[uid].append({"id": pol, "name": name})
-
-    findings = []
-    for uid, policies_excluded in sorted(excluded_from.items()):
-        roles = privileges.get(uid) or {}
-        active = [(name, sev) for name, sev in roles.items() if is_privileged(sev)]
-        if not active:
-            continue
-        severity = min((sev for _, sev in active), key=severity_rank)
-        user = graph["user"].get(uid) or {}
-        display = user.get("displayName") or user.get("userPrincipalName") or uid
-        upn = user.get("userPrincipalName") or ""
-        policy_names = sorted({p["name"] for p in policies_excluded},
-                              key=lambda x: x.lower())
-        role_entries = sorted(
-            ({"name": name, "severity": sev} for name, sev in active),
-            key=lambda r: (severity_rank(r["severity"]), r["name"].lower()))
-        role_names = [r["name"] for r in role_entries]
-        f = make_finding(
-            check_id="ca_gaps", category="configs", severity=severity,
-            title=f"Privileged user excluded from Conditional Access: {display}",
-            evidence=(f"excluded from {len(policy_names)} enabled CA policy(ies): "
-                      + ", ".join(policy_names)
-                      + (" · privileged directory role(s): " + ", ".join(role_names)
-                         if role_names else "")),
-            remediation=("Do not exclude privileged accounts from sign-on / MFA "
-                         "Conditional Access policies. Scope the policy to emergency-"
-                         "access accounts only, or replace the exclusion with a "
-                         "stronger control and monitored break-glass process."),
-            primary_id=uid,
-            object_ids={"user": {uid}},
-            target={"type": "User", "name": display, "id": uid},
-            status={"label": "Excluded"},
-        )
-        f["user_id"] = uid
-        f["user_display"] = display
-        f["user_upn"] = upn
-        f["user_type"] = user.get("userType") or "Member"
-        f["user_enabled"] = bool(user.get("accountEnabled"))
-        f["ca_excluded_policies"] = policy_names
-        f["ca_exclusion_count"] = len(policy_names)
-        f["privileged_roles"] = role_names
-        f["privileged_role_entries"] = role_entries
         findings.append(f)
 
     findings.sort(key=lambda f: (severity_rank(f["severity"]),
@@ -4910,16 +4807,6 @@ CHECK_SPECS = [
                         "with a full policy profile in the drawer. Group-targeted "
                         "scope cannot be resolved from the captured links."),
         "run": check_ca_exposure,
-    },
-    {
-        "id": "ca_gaps",
-        "category": "configs",
-        "title": "Conditional Access gaps",
-        "description": ("Privileged users explicitly excluded from enabled sign-on / "
-                        "MFA Conditional Access policies that otherwise target them. "
-                        "Severity follows the user's privileged directory roles, "
-                        "including roles inherited through group membership."),
-        "run": check_ca_gaps,
     },
     {
         "id": "ad_sync_summary",
@@ -5734,8 +5621,6 @@ FIELD_META = {
     "polCreated": {"label": "Created", "width": 170},
     "polModified": {"label": "Last modified", "width": 170},
     # --- CA gaps (per-user exclusions) --------------------------------------
-    "caPolicies": {"label": "Excluded policies", "width": 300},
-    "caRoles": {"label": "Privileged roles", "width": 260},
     # --- group --------------------------------------------------------------
     "group": {"label": "Group", "width": 220, "cls": "clickable"},
     "grpType": {"label": "Type", "width": 180},
@@ -6183,28 +6068,6 @@ def _cell_pol_modified(f, r):
     return (esc(v) if v else DASH_INNER), v
 
 
-def _cell_ca_policies(f, r):
-    names = f.get("ca_excluded_policies") or []
-    if not names:
-        return DASH_INNER, ""
-    chips = "".join(
-        f'<span class="badge badge-info" title="{esc(name)}">{esc(name)}</span> '
-        for name in names)
-    return chips, ", ".join(names)
-
-
-def _cell_ca_roles(f, r):
-    roles = f.get("privileged_role_entries") or []
-    if not roles:
-        return DASH_INNER, ""
-    chips = "".join(
-        f'<span class="badge {severity_class(role.get("severity"))} role-badge" '
-        f'data-role="{esc(role.get("name") or "")}" data-role-field="roles" '
-        f'title="{esc(role.get("name") or "")}">{esc(role.get("name") or "")}</span> '
-        for role in roles)
-    return chips, ", ".join(role.get("name") or "" for role in roles)
-
-
 def _cell_group(f, r):
     v = f.get("group_name") or ""
     return esc(v), v
@@ -6499,8 +6362,6 @@ FIELD_RENDERERS = {
     "polType": _cell_pol_type,
     "polCreated": _cell_pol_created,
     "polModified": _cell_pol_modified,
-    "caPolicies": _cell_ca_policies,
-    "caRoles": _cell_ca_roles,
     "group": _cell_group,
     "grpType": _cell_grp_type,
     "grpRoles": _cell_grp_roles,
@@ -6580,12 +6441,6 @@ TABLE_SPECS = {
                      "polControls", "polInc", "polExc"],
         "extras": [("polType", "policy"), ("polCreated", "policy"),
                    ("polModified", "policy")],
-    },
-    "table-ca_gaps": {
-        "family": "user",
-        "defaults": ["severity", "user", "userUpn", "caPolicies", "caRoles",
-                     "userStatus"],
-        "extras": [],
     },
     "groups-table": {
         "family": "group",
@@ -7577,7 +7432,7 @@ JS_FILTER_MODULE = """<script id="filter-module">
 (function() {
   var LIST_FIELDS = {roles:1, eligible:1, grproles:1, grptype:1, dynmods:1, dynattrs:1,
     azroles:1, azusrroles:1, azsproles:1, adtags:1, appdirroles:1,
-    polapps:1, polcontrols:1, arcazroles:1, capolicies:1, caroles:1,
+    polapps:1, polcontrols:1, arcazroles:1,
     owner:1, ownerupn:1, ownerstatus:1};
 
   // column-name aliases -> DOM field names (any-match), mirrored from Python
@@ -7610,8 +7465,6 @@ JS_FILTER_MODULE = """<script id="filter-module">
     controls: ['polcontrols'], polcontrols: ['polcontrols'],
     included: ['polinc'], polinc: ['polinc'],
     excluded: ['polexc'], polexc: ['polexc'],
-    capolicies: ['capolicies'], excludedpolicies: ['capolicies'],
-    caroles: ['caroles'], privilegedroles: ['caroles'],
     application: ['app'], app: ['app'],
     owner: ['owner'], ownerupn: ['ownerupn'],
     resource: ['resource'], permission: ['permission'],
@@ -7659,7 +7512,6 @@ JS_FILTER_MODULE = """<script id="filter-module">
     onprempwchange: 'On-prem pw change', targetingtags: 'Targeting tags',
     appid: 'App ID', spty: 'SP type', poltype: 'Policy type',
     polcreated: 'Created', polmodified: 'Last modified', immutableid: 'Immutable ID',
-    capolicies: 'Excluded policies', caroles: 'Privileged roles',
     check: 'Check', category: 'Category'
   };
 
@@ -7683,8 +7535,6 @@ JS_FILTER_MODULE = """<script id="filter-module">
     ['App ID', 'appid'], ['SP type', 'spty'], ['Policy type', 'poltype'],
     ['Created', 'polcreated'], ['Last modified', 'polmodified'],
     ['Immutable ID', 'immutableid'],
-    ['Excluded policies', 'capolicies'],
-    ['Privileged roles', 'caroles']
   ];
 
   var BS = String.fromCharCode(92);  // backslash, avoids escape-layering with Python strings
@@ -7993,10 +7843,6 @@ def ca_search_text(f, ctx=None):
     return serve_search_text("table-ca_exposure", f, ctx=ctx)
 
 
-def ca_gaps_search_text(f, ctx=None):
-    return serve_search_text("table-ca_gaps", f, ctx=ctx)
-
-
 def ca_sort_value(f, key, ctx=None):
     ch = f.get("conditions_html") or {}
     if key == "severity":
@@ -8039,41 +7885,6 @@ def ca_rows_html(findings, q="", sort_key=None, desc=False, start=0, stop=None,
         r = {"graph": (ctx or {}).get("graph"), "tid": tid,
              "policy_id": f.get("policy_id")}
         tr_attrs = f'data-policy-id="{esc(f.get("policy_id", ""))}"'
-        out.append(row_html(tid, tr_attrs, key, fields, f, r))
-    return out, total
-
-
-def ca_gaps_sort_value(f, key, ctx=None):
-    if key == "severity":
-        return severity_rank(f.get("severity", "Info"))
-    if key == "user":
-        return (f.get("user_display") or "").lower()
-    if key == "userUpn":
-        return (f.get("user_upn") or "").lower()
-    if key == "caPolicies":
-        return ", ".join(f.get("ca_excluded_policies") or []).lower()
-    if key == "caRoles":
-        return ", ".join(f.get("privileged_roles") or []).lower()
-    if key == "userStatus":
-        return 0 if f.get("user_enabled") else 1
-    return 0
-
-
-def ca_gaps_rows_html(findings, q="", sort_key=None, desc=False, start=0,
-                      stop=None, columns=None, ctx=None):
-    tid = "table-ca_gaps"
-    spec = table_spec(tid)
-    fields = list(columns) if columns else list(spec["defaults"])
-    selected, total = page_rows(findings, q, sort_key, desc, start, stop,
-                                lambda f: serve_search_text(tid, f, ctx=ctx),
-                                lambda f, k: ca_gaps_sort_value(f, k, ctx))
-    out = []
-    for f in selected:
-        key = f"row-{len(out)}"
-        r = {"graph": (ctx or {}).get("graph"), "tid": tid,
-             "profile_id": f.get("user_id")}
-        tr_attrs = (f'data-profile-id="{esc(f.get("user_id", ""))}" '
-                    f'data-user-id="{esc(f.get("user_id", ""))}"')
         out.append(row_html(tid, tr_attrs, key, fields, f, r))
     return out, total
 
@@ -8271,25 +8082,6 @@ def render_report(results, tenant_name, db_path, config_path,
     <div class="table-scroll">
     <table id="table-ca_exposure" class="findings" data-serve="1">
       {table_head_html("table-ca_exposure")}
-      <tbody>{rows_html}</tbody>
-    </table>
-    </div>
-    {pager}
-  </section>
-"""
-
-    def ca_gaps_section(res):
-        rows_html = catalog_rows("table-ca_gaps", res["findings"],
-                               ca_gaps_rows_html, ca_gaps_search_text)
-        pager = serve_pager()
-        caview = ' data-caview="main"'
-        return f"""
-  <section data-category="configs"{caview}>
-    <h2>{esc(res["title"])}</h2>
-    <p class="sub">{esc(res["description"])}</p>
-    <div class="table-scroll">
-    <table id="table-ca_gaps" class="findings" data-serve="1">
-      {table_head_html("table-ca_gaps")}
       <tbody>{rows_html}</tbody>
     </table>
     </div>
@@ -8538,7 +8330,6 @@ def render_report(results, tenant_name, db_path, config_path,
                                          ((e["f"].get("target") or {}).get("name")
                                           or "").lower()))
     app_dir_rendered = False
-    ca_gaps_rendered = False
     for res in results:
         if res["id"] == "priv_app_ownership":
             owned_html = legacy_owned_section()
@@ -8558,12 +8349,6 @@ def render_report(results, tenant_name, db_path, config_path,
             if not app_dir_rendered:
                 sections_html.append(app_dir_roles_section(res))
                 app_dir_rendered = True
-        elif res["id"] == "ca_gaps":
-            # Normally rendered directly under the CA policy inventory above;
-            # this branch covers configs where ca_exposure is disabled.
-            if not ca_gaps_rendered:
-                sections_html.append(ca_gaps_section(res))
-                ca_gaps_rendered = True
         elif res["id"] == "app_inventory":
             sections_html.append(app_inventory_section(res))
         elif res["id"] == "privileged_users":
@@ -8586,12 +8371,6 @@ def render_report(results, tenant_name, db_path, config_path,
   </section>
 """)
             sections_html.append(ca_section(res))
-            # Per-user exclusion gaps render as their own table directly under
-            # the policy inventory (the on-demand coverage analysis follows).
-            ca_gaps_res = next((r for r in results if r["id"] == "ca_gaps"), None)
-            if ca_gaps_res:
-                sections_html.append(ca_gaps_section(ca_gaps_res))
-                ca_gaps_rendered = True
             sections_html.append("""
   <section data-category="configs" data-caview="main">
     <h2>CA coverage analysis</h2>
@@ -8761,7 +8540,6 @@ def render_report(results, tenant_name, db_path, config_path,
         "dynmods", "dynattrs", "adtags", "targettype", "status", "hybrid",
         "userstatus", "spstatus", "ownerstatus", "adstatus", "polstate",
         "resource", "permission", "appid", "sptype", "appdirroles",
-        "capolicies", "caroles",
         "owner", "ownerupn", "ownersource", "owneraddn", "ownersid",
         "ownerimmutableid",
         "arcmachine", "arcprincipal", "arcprincipaltype", "arctag",
@@ -13556,7 +13334,6 @@ def _serve_table_id(res_id):
         "app_dir_roles": "app-dir-roles-table",
         "app_inventory": "app-inventory-table",
         "ca_exposure": "table-ca_exposure",
-        "ca_gaps": "table-ca_gaps",
         "azure_arc_machines": "arc-machines-table",
         "azure_arc_sps": "arc-principals-table",
         "azure_arc_providers": "arc-providers-table",
@@ -13691,15 +13468,6 @@ def serve_field_map(table_id, f, owner=None, ctx=None):
                         else str(f.get("policy_type"))),
             "polCreated": f.get("created") or "",
             "polModified": f.get("modified") or "",
-            "severity": f.get("severity", "Info"),
-        })
-    elif table_id == "table-ca_gaps":
-        fields.update({
-            "user": f.get("user_display") or "",
-            "userUpn": f.get("user_upn") or "",
-            "userStatus": "Enabled" if f.get("user_enabled") else "Disabled",
-            "caPolicies": ", ".join(f.get("ca_excluded_policies") or []),
-            "caRoles": ", ".join(f.get("privileged_roles") or []),
             "severity": f.get("severity", "Info"),
         })
     elif table_id == "app-dir-roles-table":
@@ -17071,7 +16839,7 @@ def start_serve(port, total=None, after_start=None):
 # when the database fingerprint is unchanged; when the database changed, the
 # new analysis is diffed against the cached one and surfaced in the report.
 
-CACHE_VERSION = 9
+CACHE_VERSION = 10
 CACHE_DIR = SCRIPT_DIR / "data" / "databases" / ".cache"
 
 CACHE_FINGERPRINT_TABLES = (
