@@ -4944,24 +4944,7 @@ def run_checks(graph, config_resources, check_cfg,
     ctx["direct_user_roles"] = direct_user_roles
     ctx["direct_sp_roles"] = direct_sp_roles
 
-    raw_results = []
-    for spec in selected:
-        sys.stdout.write(f"Running {spec['id']}...")
-        sys.stdout.flush()
-        try:
-            findings = spec["run"](ctx)
-        except Exception:
-            sys.stdout.write(" error\n")
-            raise
-        raw_results.append({"id": spec["id"], "category": spec["category"],
-                            "title": spec["title"], "description": spec["description"],
-                            "findings": findings,
-                            "meta": ctx.get("ad_realm", {})})
-
-    # ---- ARM (Azure RBAC) roles per finding (marker only, never rated) ----
-    # Attach azure role assignments to every finding whose principals carry them
-    # (groups attach their own in check_groups; everything else is derived from
-    # the finding's object_ids, so all tables render the same badge+tag style).
+    # ---- post-processing shared by every check ---------------------------
     def _az_sorted(roles):
         seen = set()
         out = []
@@ -4974,8 +4957,9 @@ def run_checks(graph, config_resources, check_cfg,
         out.sort(key=lambda a: (bool(a.get("eligible")), a["role"].lower()))
         return out
 
-    for res in raw_results:
-        for f in res["findings"]:
+    def postprocess(findings):
+        # ARM (Azure RBAC) roles per finding (marker only, never rated).
+        for f in findings:
             if f.get("az_roles") is not None:
                 continue
             o = f.get("object_ids") or {}
@@ -4986,22 +4970,16 @@ def run_checks(graph, config_resources, check_cfg,
                 roles.extend(graph["az_user_roles"].get(uid, []))
             if roles:
                 f["az_roles"] = _az_sorted(roles)
-
-    # ---- directory roles per SP (Privileges-column severity on app findings) ----
-    # Every finding whose principals include service principals is rated by the
-    # SP's directory roles (direct + via group membership): the finding's
-    # severity is raised to the most critical directory role it holds.
-    sp_dir_tags = sp_dir_resolver
-
-    for res in raw_results:
-        for f in res["findings"]:
+        # Directory roles per SP: the finding's severity is raised to the most
+        # critical active directory role its principals hold.
+        for f in findings:
             o = f.get("object_ids") or {}
             sp_ids = o.get("sp", set())
             if not sp_ids:
                 continue
             merged = {}
             for sp_oid in sorted(sp_ids):
-                for r in sp_dir_tags(sp_oid):
+                for r in sp_dir_resolver(sp_oid):
                     if r["name"] not in merged:
                         merged[r["name"]] = dict(r)
                     else:
@@ -5019,25 +4997,38 @@ def run_checks(graph, config_resources, check_cfg,
             if best_rank < severity_rank(f["severity"]):
                 f["severity"] = next(
                     sev for sev, rank in SEVERITY_ORDER.items() if rank == best_rank)
+        return findings
 
-    # ---- severity/suppress filtering runs *after* all severity escalation --
-    results = []
-    for res in raw_results:
+    def filter_findings(findings):
+        # severity/suppress filtering runs *after* all severity escalation
         filtered = []
-        for f in res["findings"]:
+        for f in findings:
             if severity_rank(f["severity"]) > min_rank:
                 continue
             key = f"{f['check_id']}:{f['primary_id']}"
             if key in suppress or f["check_id"] in suppress:
                 continue
             filtered.append(f)
+        return filtered
+
+    results = []
+    for spec in selected:
+        sys.stdout.write(f"Running {spec['id']}...")
+        sys.stdout.flush()
+        try:
+            findings = spec["run"](ctx)
+            postprocess(findings)
+            filtered = filter_findings(findings)
+        except Exception:
+            sys.stdout.write(" error\n")
+            raise
         sys.stdout.write(f" {len(filtered)}\n")
         if filtered:
-            res = dict(res)
-            res["findings"] = filtered
-            results.append(res)
+            results.append({"id": spec["id"], "category": spec["category"],
+                            "title": spec["title"], "description": spec["description"],
+                            "findings": filtered,
+                            "meta": ctx.get("ad_realm", {})})
     return results
-
 
 # ---------------------------------------------------------------------------
 # Detail-view fields (drilldown modal)
