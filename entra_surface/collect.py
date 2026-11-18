@@ -2240,8 +2240,6 @@ def view_html() -> str:
     default_aad_out = html.escape(str(DEFAULT_AADGRAPH_OUTPUT))
     return r"""<section class="collect-panel">
   <h1>Collect</h1>
-  <p class="sub">Run the Graph or AAD Graph collector to write a
-    ROADrecon-compatible database. Authentication is configured in the Tokens tab.</p>
   <div class="drawer-tabs collect-tabs" id="collect-tabs">
     <button type="button" class="drawer-tab active" data-collect-view="graph">Graph</button>
     <button type="button" class="drawer-tab" data-collect-view="aadgraph">AAD Graph</button>
@@ -2664,8 +2662,6 @@ def tokens_view_html() -> str:
     """Markup and JS for the Tokens view (add + collected token tabs)."""
     return r"""<section class="collect-panel tokens-panel">
   <h1>Tokens</h1>
-  <p class="sub">Refresh and access tokens, stored in
-    <span class="mono">__AUTH_FILE__</span></p>
   <div class="drawer-tabs token-tabs" id="token-tabs">
     <button type="button" class="drawer-tab active" data-token-view="collected">Collected tokens <span class="tab-count" id="token-count">0</span></button>
     <button type="button" class="drawer-tab" data-token-view="add">Add token</button>
