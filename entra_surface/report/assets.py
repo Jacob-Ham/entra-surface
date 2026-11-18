@@ -325,6 +325,12 @@ REPORT_CSS = """<style>
   .filter-error {
     width: 100%; color: var(--status-critical); font-size: 12px; margin-top: 4px;
   }
+  .filter-spinner {
+    flex: 0 0 auto; width: 16px; height: 16px;
+    border: 2px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; animation: filter-spin 0.7s linear infinite;
+  }
+  @keyframes filter-spin { to { transform: rotate(360deg); } }
   .ca-analysis { margin: 4px 0; }
   .ca-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 4px 0 10px; }
   .ca-sep { font-size: 12.5px; }
@@ -3438,6 +3444,8 @@ REPORT_JS = """<script>
   var suggestList = document.getElementById('suggest-list');
   var errorEl = document.getElementById('filter-error');
   var advOn = false;
+  window.__filterState = { advanced: false,
+                           q: input ? input.value : '', seq: 0 };
   var suggestionRange = null;
   var activeSuggestion = -1;
   var SUGGEST = {};
@@ -3618,14 +3626,18 @@ REPORT_JS = """<script>
       buildSuggestions();
       return;
     }
-    var ast = parsed.ast;
-    var uf = ADV_FILTER.uniqFields ? ADV_FILTER.uniqFields(ast) : [];
-    setRowVisibility(function(row) {
-      return ADV_FILTER.evaluate(ast, rowFieldMap(row), row.textContent);
-    }, uf);
+    // The server is authoritative in advanced mode. Do not filter the
+    // currently loaded page here: it causes rows to disappear while the
+    // full query is still running and gives wrong uniq/page semantics.
+    buildSuggestions();
   }
 
   input.addEventListener('input', function() {
+    if (window.__filterState) {
+      window.__filterState.advanced = advOn;
+      window.__filterState.q = input.value;
+      window.__filterState.seq += 1;
+    }
     applyRowFilter();
     if (advOn) buildSuggestions();
   });
@@ -3667,6 +3679,13 @@ REPORT_JS = """<script>
   advToggle.addEventListener('click', function() {
     advOn = !advOn;
     advToggle.setAttribute('aria-pressed', String(advOn));
+    if (window.__filterState) {
+      window.__filterState.advanced = advOn;
+      window.__filterState.q = input.value;
+      window.__filterState.seq += 1;
+    }
+    if (advOn) setRowVisibility(function() { return true; });
+    if (!advOn && window.__filterBusyReset) window.__filterBusyReset();
     input.placeholder = advOn
         ? 'Advanced: severity:High AND target:contains:admin, uniq:owner\u2026'
         : 'Filter all tables by target, owner, evidence\u2026';
@@ -4221,20 +4240,60 @@ REPORT_JS = """<script>
 })();
 
 (function() {
+  var spinner = document.getElementById('filter-spinner');
+  if (!spinner) return;
+  var timer = null;
+  var pending = 0;
+  function advancedMode() {
+    var adv = document.getElementById('advanced-toggle');
+    return !!(adv && adv.getAttribute('aria-pressed') === 'true');
+  }
+  function start() {
+    if (!advancedMode()) return false;
+    pending += 1;
+    if (!timer) {
+      timer = setTimeout(function() {
+        timer = null;
+        if (pending > 0) spinner.classList.remove('hidden');
+      }, 2000);
+    }
+    return true;
+  }
+  function end() {
+    pending = Math.max(0, pending - 1);
+    if (!pending) {
+      if (timer) { clearTimeout(timer); timer = null; }
+      spinner.classList.add('hidden');
+    }
+  }
+  function reset() {
+    pending = 0;
+    if (timer) { clearTimeout(timer); timer = null; }
+    spinner.classList.add('hidden');
+  }
+  window.__filterBusyStart = start;
+  window.__filterBusyEnd = end;
+  window.__filterBusyReset = reset;
+})();
+
+(function() {
   var filterInput = document.getElementById('filter-input');
+
+  function tableVisible(table) {
+    return !!(table && table.getClientRects && table.getClientRects().length);
+  }
+
   function makeLoader(table) {
     if (table.__loaderMade) return;
     var pager = table.closest('.table-scroll') ? table.closest('.table-scroll').nextElementSibling : null;
     if (!pager || !pager.classList.contains('table-pager')) return;
     table.__loaderMade = true;
-    var state = { page: 1, size: 25, q: filterInput ? filterInput.value : '',
-                  sort: '', dir: 'asc' };
+    var state = { page: 1, size: 25, sort: '', dir: 'asc' };
     var tbody = table.tBodies[0];
     var info = pager.querySelector('.tp-info');
     var prev = pager.querySelector('.tp-prev');
     var next = pager.querySelector('.tp-next');
     var sizeSel = pager.querySelector('.tp-size');
-    var timer = null;
     var reqSeq = 0;
     var pendingAbort = null;
 
@@ -4248,12 +4307,24 @@ REPORT_JS = """<script>
       return out.join(',');
     }
 
-    function load() {
-      var adv = document.getElementById('advanced-toggle');
-      var advanced = !!(adv && adv.getAttribute('aria-pressed') === 'true');
+    function load(force) {
+      var fs = window.__filterState;
+      if (!fs) {
+        var advEl = document.getElementById('advanced-toggle');
+        fs = { advanced: !!(advEl && advEl.getAttribute('aria-pressed') === 'true'),
+               q: filterInput ? filterInput.value : '', seq: 0 };
+      }
+      var advanced = !!fs.advanced;
+      var q = fs.q || '';
       // Never replace a table with results for a query the client already
       // rejected as invalid advanced syntax.
       if (advanced && window.__advancedQueryInvalid) return;
+      if (!force && !tableVisible(table)) {
+        table.__dirty = true;
+        return;
+      }
+      table.__dirty = false;
+      var querySeq = fs.seq;
       var seq = ++reqSeq;
       if (pendingAbort) {
         try { pendingAbort.abort(); } catch (e) {}
@@ -4261,12 +4332,14 @@ REPORT_JS = """<script>
       pendingAbort = (typeof AbortController !== 'undefined') ? new AbortController() : null;
 
       var params = 'page=' + state.page + '&size=' + state.size;
-      if (state.q) params += '&q=' + encodeURIComponent(state.q);
+      if (q) params += '&q=' + encodeURIComponent(q);
       if (advanced) params += '&mode=advanced';
       if (state.sort) params += '&sort=' + encodeURIComponent(state.sort) + '&dir=' + state.dir;
       var managed = window.__columns && window.__columns.isManaged(table);
       if (managed) params += '&cols=' + encodeURIComponent(window.__columns.getFields(table).join(','));
       var opts = pendingAbort ? { signal: pendingAbort.signal } : undefined;
+      var busy = !!(advanced && q && window.__filterBusyStart
+                    && window.__filterBusyStart());
       fetch('/api/table/' + encodeURIComponent(table.id) + '?' + params, opts)
         .then(function(r) {
           if (r.status === 400) return null;  // parse error: keep the current table
@@ -4275,6 +4348,7 @@ REPORT_JS = """<script>
         })
         .then(function(d) {
           if (seq !== reqSeq) return;  // an older response lost the race
+          if (window.__filterState && window.__filterState.seq !== querySeq) return;
           var advNow = document.getElementById('advanced-toggle');
           if (window.__advancedQueryInvalid && advNow
               && advNow.getAttribute('aria-pressed') === 'true') return;
@@ -4304,18 +4378,16 @@ REPORT_JS = """<script>
           if (seq !== reqSeq) return;
           info.textContent = 'Failed to load table';
           pager.classList.remove('hidden');
+        })
+        .finally(function() {
+          if (busy && window.__filterBusyEnd) window.__filterBusyEnd();
         });
     }
     table.__reload = function() { state.page = 1; load(); };
+    table.__reloadFiltered = function() { state.page = 1; load(); };
     prev.addEventListener('click', function() { state.page = Math.max(1, state.page - 1); load(); });
     next.addEventListener('click', function() { state.page += 1; load(); });
     sizeSel.addEventListener('change', function() { state.size = parseInt(sizeSel.value, 10) || 25; state.page = 1; load(); });
-    filterInput.addEventListener('input', function() {
-      clearTimeout(timer);
-      reqSeq += 1;  // immediately stale any in-flight page for the old query
-      var v = filterInput.value;
-      timer = setTimeout(function() { state.q = v; state.page = 1; load(); }, 250);
-    });
     table.tHead.addEventListener('click', function(e) {
       var th = e.target.closest('th');
       if (!th || th.classList.contains('no-sort')) return;
@@ -4337,6 +4409,39 @@ REPORT_JS = """<script>
   }
   document.querySelectorAll('table.findings[data-serve="1"]').forEach(makeLoader);
   window.__makeLoader = makeLoader;
+
+  function loadDirtyTables() {
+    Array.prototype.forEach.call(
+        document.querySelectorAll('table.findings[data-serve="1"]'),
+        function(t) {
+          if (t.__dirty && t.__reloadFiltered && tableVisible(t)) {
+            t.__reloadFiltered();
+          }
+        });
+  }
+  window.__loadDirtyTables = loadDirtyTables;
+
+  var filterTimer = null;
+  function scheduleFilterLoads() {
+    clearTimeout(filterTimer);
+    filterTimer = setTimeout(function() {
+      Array.prototype.forEach.call(
+          document.querySelectorAll('table.findings[data-serve="1"]'),
+          function(t) {
+            if (t.__reloadFiltered) t.__reloadFiltered();
+          });
+    }, 300);
+  }
+  if (filterInput) filterInput.addEventListener('input', scheduleFilterLoads);
+  var categoryTabs = document.getElementById('category-tabs');
+  if (categoryTabs) {
+    categoryTabs.addEventListener('click', function() {
+      setTimeout(loadDirtyTables, 0);
+    });
+  }
+  document.addEventListener('app:view', function() {
+    setTimeout(loadDirtyTables, 0);
+  });
 
   // ---- on-demand CA coverage analysis ----------------------------------
   var caRun = document.getElementById('ca-run-btn');
@@ -4435,8 +4540,8 @@ REPORT_JS = """<script>
               if (window.__makeColumnsResizable) window.__makeColumnsResizable(t);
               if (window.__makeLoader) window.__makeLoader(t);
             });
-        // new loaders seed state.q from the filter input; also re-apply plain
-        // client-side filtering so the visible page matches the filter box
+        // new loaders read the global filter state; re-apply plain client-side
+        // filtering so the visible page matches the filter box
         if (window.__applyCurrentFilter) window.__applyCurrentFilter();
       }
     }

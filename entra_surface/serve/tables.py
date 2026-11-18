@@ -1,6 +1,9 @@
 """Server-side table filtering, sorting and pagination."""
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
+
 from ..checks.registry import CHECK_ID_CATEGORY
 from ..filters import (
     AdvancedParseError, evaluate_advanced, extract_uniq_fields,
@@ -14,7 +17,7 @@ from ..report.tables import (
     TABLE_SPECS, allowed_fields, parse_cols_param, table_colgroup_inner_html,
     table_spec, table_thead_row_html,
 )
-from ..state import SERVE_STATE
+from ..state import SERVE_STATE, serve_generation
 
 
 def _serve_table_id(res_id):
@@ -371,6 +374,91 @@ def _serve_int(qs, key, default, lo, hi):
         return default
 
 
+_ADV_CACHE_MAX = 16
+_ADV_CACHE = OrderedDict()
+_ADV_CACHE_LOCK = threading.RLock()
+
+
+def _adv_cache_get(key):
+    with _ADV_CACHE_LOCK:
+        if key in _ADV_CACHE:
+            _ADV_CACHE.move_to_end(key)
+            return _ADV_CACHE[key]
+    return None
+
+
+def _adv_cache_put(key, findings):
+    with _ADV_CACHE_LOCK:
+        generation = key[0]
+        for old_key in list(_ADV_CACHE):
+            if old_key[0] != generation:
+                del _ADV_CACHE[old_key]
+        _ADV_CACHE[key] = findings
+        _ADV_CACHE.move_to_end(key)
+        while len(_ADV_CACHE) > _ADV_CACHE_MAX:
+            _ADV_CACHE.popitem(last=False)
+
+
+def _ast_has_text(ast):
+    if not isinstance(ast, dict):
+        return False
+    if ast.get("op") == "text":
+        return True
+    if ast.get("op") == "not":
+        return _ast_has_text(ast.get("child"))
+    return any(_ast_has_text(child) for child in ast.get("children") or ())
+
+
+def _advanced_filter(entry, table_id, ast, row_ctx):
+    """Filter findings once per row and reuse the field map for uniq keys."""
+    findings = entry["findings"]
+    uniq_fields = extract_uniq_fields(ast)
+    search = entry["search"] if _ast_has_text(ast) else None
+
+    def field_key(field_map):
+        return tuple((field_map.get(field) or "").lower()
+                     for field in uniq_fields)
+
+    if table_id == "owned-table":
+        out = []
+        seen = set()
+        for f in findings:
+            full_text = search(f) if search else ""
+            owners = []
+            for owner in f.get("owners", []):
+                field_map = serve_field_map("owned-table", f, owner, row_ctx)
+                if not evaluate_advanced(ast, field_map, full_text):
+                    continue
+                if uniq_fields:
+                    lowered = {str(k).lower(): v for k, v in field_map.items()}
+                    key = field_key(lowered)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                owners.append(owner)
+            if owners:
+                f2 = dict(f)
+                f2["owners"] = owners
+                out.append(f2)
+        return out
+
+    out = []
+    seen = set()
+    for f in findings:
+        field_map = serve_field_map(table_id, f, ctx=row_ctx)
+        full_text = search(f) if search else ""
+        if not evaluate_advanced(ast, field_map, full_text):
+            continue
+        if uniq_fields:
+            lowered = {str(k).lower(): v for k, v in field_map.items()}
+            key = field_key(lowered)
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(f)
+    return out
+
+
 def serve_table_response(table_id, qs):
     entry = SERVE_STATE["tables"].get(table_id)
     if not entry:
@@ -404,56 +492,14 @@ def serve_table_response(table_id, qs):
             # client already rejected it and must keep the previous rows.
             return {"error": f"invalid advanced filter: {exc}"}, 400
         if ast is not None:
-            uniq_fields = extract_uniq_fields(ast)
             row_ctx = entry.get("ctx")
-
-            def _uniq_key(field_map):
-                return tuple((field_map.get(f) or "").lower()
-                             for f in uniq_fields)
-
-            if table_id == "owned-table":
-                # the owned table renders one row per owner: filter at the
-                # (finding, owner) row level so owner predicates keep only the
-                # matching owner rows (same semantics as the client)
-                filtered = []
-                seen = set()
-                for f in findings:
-                    owners = [o for o in f.get("owners", [])
-                              if evaluate_advanced(
-                                  ast, serve_field_map("owned-table", f, o, row_ctx),
-                                  entry["search"](f))]
-                    if uniq_fields:
-                        deduped_owners = []
-                        for o in owners:
-                            key = _uniq_key(
-                                {k.lower(): v for k, v in
-                                 serve_field_map("owned-table", f, o, row_ctx).items()})
-                            if key in seen:
-                                continue
-                            seen.add(key)
-                            deduped_owners.append(o)
-                        owners = deduped_owners
-                    if owners:
-                        f2 = dict(f)
-                        f2["owners"] = owners
-                        filtered.append(f2)
-                findings = filtered
-            else:
-                findings = [f for f in findings
-                            if evaluate_advanced(ast, serve_field_map(table_id, f, ctx=row_ctx),
-                                                 entry["search"](f))]
-                if uniq_fields:
-                    seen = set()
-                    deduped = []
-                    for f in findings:
-                        key = _uniq_key(
-                            {k.lower(): v for k, v in
-                             serve_field_map(table_id, f, ctx=row_ctx).items()})
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        deduped.append(f)
-                    findings = deduped
+            cache_key = (serve_generation(), table_id,
+                         id(entry["findings"]), q)
+            filtered = _adv_cache_get(cache_key)
+            if filtered is None:
+                filtered = _advanced_filter(entry, table_id, ast, row_ctx)
+                _adv_cache_put(cache_key, filtered)
+            findings = filtered
             row_q = ""
     payload = {}
     if thead_html is not None:

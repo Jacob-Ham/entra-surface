@@ -25,6 +25,11 @@ METHOD_LABELS = {
     "desktop_sso": "Seamless SSO (Desktop SSO)",
 }
 
+# Methods whose user authentication data can be sourced from on-premises AD.
+# The method's tenant policy still lives in Entra, but the credential/identity
+# data is changed on-prem and synchronized up.
+ON_PREM_MANAGED_METHODS = {"password", "cba", "desktop_sso"}
+
 METHOD_ORDER = {
     "fido2": 10,
     "authenticator": 20,
@@ -380,6 +385,7 @@ def check_authentication_methods(ctx):
         f["auth_method_key"] = key
         f["auth_method_label"] = label
         f["auth_method_order"] = METHOD_ORDER.get(key, 999)
+        f["auth_managed_on_prem"] = key in ON_PREM_MANAGED_METHODS
         f["auth_method_raw"] = entry["raw"]
         f["auth_state"] = state
         f["auth_enabled"] = state == "Enabled"

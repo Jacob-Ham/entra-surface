@@ -570,7 +570,14 @@ def _cell_sso_cert_thumb(f, r):
 
 def _cell_auth_method(f, r):
     v = f.get("auth_method_label") or ""
-    return (esc(v) if v else DASH_INNER), v
+    if not v:
+        return DASH_INNER, v
+    inner = esc(v)
+    if f.get("auth_managed_on_prem"):
+        inner += (' <span class="tag-chip" title="Authentication data is managed '
+                  'in on-premises Active Directory and synchronized to Entra ID">'
+                  'Managed on-prem</span>')
+    return inner, v
 
 
 def _cell_auth_state(f, r):

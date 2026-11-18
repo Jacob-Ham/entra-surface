@@ -2310,6 +2310,7 @@ def render_report(results, tenant_name, db_path, config_path,
   <div class="controls">
     <div class="filter-row">
       <input type="search" id="filter-input" placeholder="Filter all tables by target, owner, evidence&hellip;" autocomplete="off">
+      <span class="filter-spinner hidden" id="filter-spinner" role="status" aria-label="Running advanced query" title="Running advanced query&hellip;"></span>
       <button type="button" id="advanced-toggle" class="mode-btn" aria-pressed="false" title="Toggle advanced filtering: field:value, AND, OR, NOT, contains:, uniq:column">Advanced</button>
       <div class="suggest-wrap hidden" id="suggest-wrap"><ul id="suggest-list"></ul></div>
     </div>
