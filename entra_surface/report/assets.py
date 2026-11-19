@@ -372,6 +372,20 @@ REPORT_CSS = """<style>
   .ca-whatif label.hidden { display: none; }
   section h2 { font-size: 15px; font-weight: 600; margin: 0 0 4px; }
   section .sub { color: var(--text-secondary); font-size: 12px; margin: 0 0 10px; }
+  .section-toggle {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 30px; min-height: 30px; padding: 6px 8px;
+    margin: -6px -8px -6px 0; border: 0; border-radius: 6px;
+    background: none; color: var(--text-muted); cursor: pointer;
+    font: inherit; font-size: 14px; line-height: 1; vertical-align: middle;
+  }
+  .section-toggle:hover { color: var(--text-primary); background: var(--row-hover); }
+  .section-title-toggle { cursor: pointer; }
+  .section-title-toggle:hover { color: var(--text-primary); }
+  section.section-collapsed > .table-scroll,
+  section.section-collapsed > .table-pager,
+  section.section-collapsed > .sub,
+  section.section-collapsed > .empty { display: none; }
   .table-scroll {
     overflow-x: auto;
     background: var(--surface-1);
@@ -3061,6 +3075,15 @@ REPORT_JS = """<script>
     return null;
   }
 
+  function setDrawerButton(row, open) {
+    var btn = row ? row.querySelector('.expand-btn') : null;
+    if (!btn) return;
+    btn.textContent = open ? '\u2212' : '+';
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    btn.setAttribute('aria-label', open ? 'Hide full details' : 'View full details');
+    btn.title = open ? 'Hide full details' : 'View full details';
+  }
+
   function activateDrawerTab(container, tab) {
     if (!container || !tab) return;
     var found = false;
@@ -3316,10 +3339,12 @@ REPORT_JS = """<script>
     if (!drawer) return;
     if (drawer.classList.contains('open')) {
       drawer.classList.remove('open');
+      setDrawerButton(row, false);
       return;
     }
     populateDrawer(row);
     drawer.classList.add('open');
+    setDrawerButton(row, true);
   }
 
   document.addEventListener('click', function(e) {
@@ -3393,6 +3418,7 @@ REPORT_JS = """<script>
     delete drawer.dataset.filled;  // back must re-populate even if the drawer was filled once
     delete drawer.dataset.loading;
     if (!drawer.classList.contains('open')) drawer.classList.add('open');
+    setDrawerButton(row, true);
     var body = drawer.querySelector('.drawer-body');
     var returnTab = activeDrawerTab(body);
     if (returnTab) drawer.__returnTab = returnTab;
@@ -4543,6 +4569,7 @@ REPORT_JS = """<script>
         // new loaders read the global filter state; re-apply plain client-side
         // filtering so the visible page matches the filter box
         if (window.__applyCurrentFilter) window.__applyCurrentFilter();
+        if (window.__wireTableCollapse) window.__wireTableCollapse(resultsEl);
       }
     }
 
@@ -4737,5 +4764,72 @@ REPORT_JS = """<script>
       });
     }
   }
+})();
+(function() {
+  function wireSection(section) {
+    if (section.dataset.collapseWired) return;
+    var h2 = null;
+    var headRow = null;
+    var scroll = null;
+    for (var child = section.firstElementChild; child; child = child.nextElementSibling) {
+      if (!headRow && child.classList && child.classList.contains('table-head-row')) {
+        headRow = child;
+      }
+      if (child.tagName === 'H2' && !h2) h2 = child;
+      if (!scroll && child.classList && child.classList.contains('table-scroll')
+          && child.querySelector('table.findings')) {
+        scroll = child;
+      }
+    }
+    if (headRow && !h2) h2 = headRow.querySelector('h2');
+    if (!h2 || !scroll) return;
+    var table = scroll.querySelector('table.findings');
+    section.dataset.collapseWired = '1';
+    if (!headRow) {
+      headRow = document.createElement('div');
+      headRow.className = 'table-head-row';
+      section.insertBefore(headRow, h2);
+      headRow.appendChild(h2);
+    }
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'section-toggle';
+    btn.textContent = '\u25be';
+    btn.setAttribute('aria-expanded', 'true');
+    btn.setAttribute('aria-label', 'Hide table');
+    btn.title = 'Hide table';
+    if (table && table.id) btn.setAttribute('aria-controls', table.id);
+    h2.appendChild(btn);
+    var collapsed = false;
+    function toggleCollapse() {
+      collapsed = !collapsed;
+      section.classList.toggle('section-collapsed', collapsed);
+      btn.textContent = collapsed ? '\u25b8' : '\u25be';
+      var label = collapsed ? 'Show table' : 'Hide table';
+      btn.title = label;
+      btn.setAttribute('aria-label', label);
+      btn.setAttribute('aria-expanded', String(!collapsed));
+      if (!collapsed && window.__loadDirtyTables) {
+        setTimeout(window.__loadDirtyTables, 0);
+      }
+    }
+    btn.addEventListener('click', function(e) {
+      e.stopPropagation();
+      toggleCollapse();
+    });
+    h2.classList.add('section-title-toggle');
+    h2.addEventListener('click', function(e) {
+      if (e.target.closest('.section-toggle')) return;
+      if (window.getSelection && String(window.getSelection())) return;
+      toggleCollapse();
+    });
+  }
+
+  function wireTableCollapse(root) {
+    if (!root || !root.querySelectorAll) return;
+    Array.prototype.forEach.call(root.querySelectorAll('section'), wireSection);
+  }
+  window.__wireTableCollapse = wireTableCollapse;
+  wireTableCollapse(document);
 })();
 </script>"""
