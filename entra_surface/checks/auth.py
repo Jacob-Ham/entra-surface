@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 
 from ..findings import make_finding
+from ..graph import compute_effective_group_membership
 from ..policy import policy_detail_inner
 
 
@@ -346,6 +347,131 @@ def _collect_methods(graph):
             "source_id": policy_id,
         })
     return methods
+
+
+def _cba_target(target, graph, users_by_group, all_users):
+    if not isinstance(target, dict):
+        return str(target or ""), set()
+    target_id = str(target.get("id") or target.get("targetId") or "")
+    target_type = str(target.get("type") or target.get("targetType") or "").lower()
+    if target_id.lower() in ("all_users", "allusers", "all"):
+        return "All users", set(all_users)
+    if target_id in graph.get("group", {}):
+        return (graph["group"][target_id].get("displayName") or target_id,
+                set(users_by_group.get(target_id) or ()))
+    if target_id in graph.get("user", {}):
+        rec = graph["user"][target_id]
+        return (rec.get("userPrincipalName") or rec.get("displayName") or target_id,
+                {target_id})
+    if target_id in graph.get("directory_role", {}) or target_type == "role":
+        label = ((graph.get("directory_role", {}).get(target_id) or {}).get("displayName")
+                 or target_id)
+        users = {uid for role_id, uid in graph.get("role_member_user") or ()
+                 if role_id == target_id}
+        return label or "Role", users
+    return target_id, set()
+
+
+def _cba_mode(settings):
+    mode = ((settings.get("authenticationModeConfiguration") or {})
+            .get("x509CertificateAuthenticationDefaultMode") or "")
+    return {
+        "x509CertificateSingleFactor": "Single-factor",
+        "x509CertificateMultiFactor": "Multi-factor",
+    }.get(mode, mode or "\u2014")
+
+
+def _cba_bindings(settings):
+    parts = []
+    for binding in settings.get("certificateUserBindings") or ():
+        if not isinstance(binding, dict):
+            continue
+        user_attr = binding.get("userAttribute") or ""
+        cert_field = binding.get("x509CertificateField") or ""
+        label = " \u2192 ".join(x for x in (user_attr, cert_field) if x)
+        if label and label not in parts:
+            parts.append(label)
+    return ", ".join(parts) or "\u2014"
+
+
+def check_certificate_auth_users(ctx):
+    """Users whose authentication-method policy scope allows certificate auth.
+
+    This is policy eligibility, not proof that a user has a certificate
+    registered: the database does not contain per-user certificate methods.
+    """
+    graph = ctx["graph"]
+    method = _collect_methods(graph).get("cba")
+    if not method or _state_label(method.get("state")) != "Enabled":
+        return []
+    entries = method.get("entry") if isinstance(method.get("entry"), dict) else {}
+    settings = _settings(entries)
+    indexes = ctx.get("analysis_indexes") or {}
+    users_by_group = ((indexes.get("effective_membership") or {})
+                      .get("users_by_group") or {})
+    if not users_by_group:
+        users_by_group = compute_effective_group_membership(graph)["users_by_group"]
+    all_users = set(graph.get("user") or {})
+    included = {}
+    for target in method.get("include") or ():
+        label, uids = _cba_target(target, graph, users_by_group, all_users)
+        for uid in uids:
+            included.setdefault(uid, set()).add(label)
+    excluded = set()
+    for target in method.get("exclude") or ():
+        _label, uids = _cba_target(target, graph, users_by_group, all_users)
+        excluded |= uids
+    if not included:
+        return []
+    mode = _cba_mode(settings)
+    bindings = _cba_bindings(settings)
+    privilege_by_user = {
+        f.get("user_id"): f
+        for f in (ctx.get("user_findings") or [])
+        if f.get("user_id")
+    }
+    findings = []
+    for uid in sorted(included):
+        if uid in excluded:
+            continue
+        user = graph["user"].get(uid)
+        if not user:
+            continue
+        labels = included[uid]
+        scope = "All users" if "All users" in labels else ", ".join(sorted(labels))
+        upn = (user.get("userPrincipalName") or user.get("displayName") or uid)
+        enabled = bool(user.get("accountEnabled"))
+        hybrid = bool(user.get("dirSyncEnabled") in (1, True)
+                      or user.get("onPremisesSecurityIdentifier"))
+        severity = (privilege_by_user.get(uid) or {}).get("severity") or "Info"
+        f = make_finding(
+            check_id="certificate_auth_users", category="auth", severity=severity,
+            title=f"Certificate authentication allowed: {upn}",
+            evidence=(f"scope: {scope} \u00b7 mode: {mode} \u00b7 "
+                      f"bindings: {bindings}"),
+            remediation=("Confirm the certificate-user bindings and that the "
+                         "targeted users are intended to use certificate-based "
+                         "authentication."),
+            primary_id=uid,
+            object_ids={"user": {uid}},
+            target={"type": "User", "name": user.get("displayName") or upn,
+                    "id": uid},
+            status={"label": "Enabled" if enabled else "Disabled",
+                    "enabled": enabled},
+        )
+        f["user_display"] = user.get("displayName") or upn
+        f["user_upn"] = upn
+        f["user_type"] = user.get("userType") or "Member"
+        f["user_enabled"] = enabled
+        f["hybrid"] = hybrid
+        f["auth_cba_scope"] = scope
+        f["auth_cba_mode"] = mode
+        f["auth_cba_bindings"] = bindings
+        f["auth_cba_policy"] = method.get("source") or ""
+        findings.append(f)
+    findings.sort(key=lambda f: ((f.get("user_upn") or "").lower(),
+                                 f.get("primary_id") or ""))
+    return findings
 
 
 def check_authentication_methods(ctx):

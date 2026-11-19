@@ -14,7 +14,7 @@ from pathlib import Path
 CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "databases" / ".cache"
 
 
-CACHE_VERSION = 21
+CACHE_VERSION = 23
 
 CACHE_FINGERPRINT_TABLES = (
     "Users", "ServicePrincipals", "Applications", "Groups", "Devices",

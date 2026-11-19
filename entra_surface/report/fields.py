@@ -54,6 +54,11 @@ FIELD_META = {
     "authSettings": {"label": "Settings", "width": 380},
     "authSource": {"label": "Source", "width": 220},
     "authId": {"label": "Policy ID", "width": 180, "cls": "mono"},
+    # --- certificate authentication users ----------------------------------
+    "authUserType": {"label": "Type", "width": 90},
+    "authCbaScope": {"label": "CBA scope", "width": 260},
+    "authCbaMode": {"label": "CBA mode", "width": 110},
+    "authCbaBindings": {"label": "Certificate bindings", "width": 300},
     # --- CA policy ----------------------------------------------------------
     "polName": {"label": "Policy", "width": 220, "cls": "clickable"},
     "polState": {"label": "State", "width": 90},
@@ -618,6 +623,28 @@ def _cell_auth_id(f, r):
     return (f'<span class="mono">{esc(v)}</span>' if v else DASH_INNER), v
 
 
+# ---- certificate authentication users --------------------------------------
+
+def _cell_auth_user_type(f, r):
+    v = f.get("user_type") or ""
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_auth_cba_scope(f, r):
+    v = f.get("auth_cba_scope") or ""
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_auth_cba_mode(f, r):
+    v = f.get("auth_cba_mode") or ""
+    return (esc(v) if v else DASH_INNER), v
+
+
+def _cell_auth_cba_bindings(f, r):
+    v = f.get("auth_cba_bindings") or ""
+    return (esc(v) if v else DASH_INNER), v
+
+
 def _cell_pol_name(f, r):
     v = f.get("policy_name") or ""
     return esc(v), v
@@ -957,6 +984,10 @@ FIELD_RENDERERS = {
     "status": _cell_status,
     "appDirRoles": _cell_app_dir_roles,
     "authMethod": _cell_auth_method,
+    "authUserType": _cell_auth_user_type,
+    "authCbaScope": _cell_auth_cba_scope,
+    "authCbaMode": _cell_auth_cba_mode,
+    "authCbaBindings": _cell_auth_cba_bindings,
     "authState": _cell_auth_state,
     "authScope": _cell_auth_scope,
     "authRegistration": _cell_auth_registration,
