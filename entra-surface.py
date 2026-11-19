@@ -39,6 +39,8 @@ Checks (config: privileged_roles.json -> "checks"):
                             and privileged / SP members
   authentication_methods  - authentication methods extracted from collected
                             authentication-method policy configurations
+  certificate_auth_users  - users whose authentication-method policy scope
+                            allows certificate-based authentication
   ca_exposure             - Conditional Access policy inventory: states, scopes,
                             conditions and exclusions
   ad_sync_summary         - sync summary card: engine in use (Entra Connect on-prem
@@ -504,6 +506,10 @@ def run_checks(graph, config_resources, check_cfg,
                             "title": spec["title"], "description": spec["description"],
                             "findings": filtered,
                             "meta": ctx.get("ad_realm", {})})
+            if spec["id"] == "privileged_users":
+                # Later checks can reuse the user rating without recomputing
+                # the full privilege graph.
+                ctx["user_findings"] = filtered
     return results
 
 # ---------------------------------------------------------------------------
@@ -1227,6 +1233,55 @@ def authentication_methods_rows_html(findings, q="", sort_key=None, desc=False,
     return out, len(items)
 
 
+# ---- certificate authentication users ----------------------------------------
+
+def certificate_auth_users_search_text(f, ctx=None):
+    return serve_search_text("certificate-auth-users-table", f, ctx=ctx)
+
+
+def certificate_auth_users_sort_value(f, key, ctx=None):
+    if key == "severity":
+        return severity_rank(f.get("severity", "Info"))
+    if key == "user":
+        return (f.get("user_display") or "").lower()
+    if key == "userUpn":
+        return (f.get("user_upn") or "").lower()
+    if key == "authUserType":
+        return (f.get("user_type") or "").lower()
+    if key == "userStatus":
+        return 0 if f.get("user_enabled") else 1
+    if key == "hybrid":
+        return 0 if f.get("hybrid") else 1
+    if key == "authCbaScope":
+        return (f.get("auth_cba_scope") or "").lower()
+    if key == "authCbaMode":
+        return (f.get("auth_cba_mode") or "").lower()
+    if key == "authCbaBindings":
+        return (f.get("auth_cba_bindings") or "").lower()
+    if key == "id":
+        return ((f.get("target") or {}).get("id") or "").lower()
+    return 0
+
+
+def certificate_auth_users_rows_html(findings, q="", sort_key=None, desc=False,
+                                     start=0, stop=None, columns=None, ctx=None):
+    tid = "certificate-auth-users-table"
+    spec = table_spec(tid)
+    fields = list(columns) if columns else list(spec["defaults"])
+    selected, total = page_rows(
+        findings, q, sort_key, desc, start, stop,
+        lambda f: serve_search_text(tid, f, ctx=ctx),
+        lambda f, k: certificate_auth_users_sort_value(f, k, ctx))
+    out = []
+    for f in selected:
+        uid = f.get("primary_id") or ""
+        r = {"graph": (ctx or {}).get("graph"), "tid": tid, "user_id": uid}
+        tr_attrs = (f'data-profile-id="{esc(uid)}" '
+                    f'data-owner-id="{esc(uid)}"')
+        out.append(row_html(tid, tr_attrs, f"cba-user-{len(out)}", fields, f, r))
+    return out, total
+
+
 # ---- groups / dynamic rows ---------------------------------------------------
 
 def group_search_text(f, ctx=None):
@@ -1656,6 +1711,25 @@ def render_report(results, tenant_name, db_path, config_path,
   </section>
 """
 
+    # ---- certificate authentication users ---------------------------------
+    def certificate_auth_users_section(res):
+        rows_html = catalog_rows(
+            "certificate-auth-users-table", res["findings"],
+            certificate_auth_users_rows_html, certificate_auth_users_search_text)
+        pager = serve_pager()
+        return f"""
+  <section data-category="auth">
+    <h2>{esc(res["title"])}</h2>
+    <div class="table-scroll">
+    <table id="certificate-auth-users-table" class="findings" data-serve="1">
+      {table_head_html("certificate-auth-users-table")}
+      <tbody>{rows_html}</tbody>
+    </table>
+    </div>
+    {pager}
+  </section>
+"""
+
     # ---- groups section ----------------------------------------
     def groups_section(res):
         rows_html = catalog_rows("groups-table", res["findings"], group_rows_html,
@@ -1935,6 +2009,8 @@ def render_report(results, tenant_name, db_path, config_path,
             sections_html.append(enterprise_apps_section(res))
         elif res["id"] == "authentication_methods":
             sections_html.append(authentication_methods_section(res))
+        elif res["id"] == "certificate_auth_users":
+            sections_html.append(certificate_auth_users_section(res))
         elif res["id"] == "app_inventory":
             sections_html.append(app_inventory_section(res))
         elif res["id"] == "privileged_users":
@@ -2127,6 +2203,7 @@ def render_report(results, tenant_name, db_path, config_path,
         "arcmachine", "arcprincipal", "arcprincipaltype", "arctag",
         "arcazroles", "arcprovider", "arcsub", "arcrg", "arcstatus",
         "authmethod", "authstate", "authscope", "authregistration", "authsource",
+        "authusertype", "authcbascope", "authcbamode", "authcbabindings",
     }
     suggest_data = {}
 

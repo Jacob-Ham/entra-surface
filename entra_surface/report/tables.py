@@ -100,6 +100,16 @@ TABLE_SPECS = {
                    "authSettings": "Settings", "authSource": "Source",
                    "authId": "Policy ID"},
     },
+    "certificate-auth-users-table": {
+        "family": "user",
+        "defaults": ["severity", "user", "userUpn", "authUserType",
+                     "userStatus", "hybrid", "authCbaScope", "authCbaMode",
+                     "authCbaBindings"],
+        "extras": [("id", "user")],
+        "labels": {"authUserType": "Type", "authCbaScope": "CBA scope",
+                   "authCbaMode": "CBA mode",
+                   "authCbaBindings": "Certificate bindings"},
+    },
     "ad-sync-users-table": {
         "family": "user",
         "defaults": ["adUser", "adUpn", "adCn", "adDn", "adSid", "adPw",

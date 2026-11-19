@@ -12,7 +12,7 @@ from .apps import (
 from .arc import (
     check_azure_arc_machines, check_azure_arc_providers, check_azure_arc_sps,
 )
-from .auth import check_authentication_methods
+from .auth import check_authentication_methods, check_certificate_auth_users
 from .ca import check_ca_exposure
 from .groups import check_groups
 from .users import check_privileged_users
@@ -110,6 +110,13 @@ CHECK_SPECS = [
         "title": "Authentication methods",
         "description": "",
         "run": check_authentication_methods,
+    },
+    {
+        "id": "certificate_auth_users",
+        "category": "auth",
+        "title": "Users allowed to use certificate authentication",
+        "description": "",
+        "run": check_certificate_auth_users,
     },
     {
         "id": "ca_exposure",

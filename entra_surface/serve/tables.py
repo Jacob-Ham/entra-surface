@@ -30,6 +30,7 @@ def _serve_table_id(res_id):
         "app_inventory": "app-inventory-table",
         "enterprise_apps": "enterprise-apps-table",
         "authentication_methods": "authentication-methods-table",
+        "certificate_auth_users": "certificate-auth-users-table",
         "ca_exposure": "table-ca_exposure",
         "azure_arc_machines": "arc-machines-table",
         "azure_arc_sps": "arc-principals-table",
@@ -207,6 +208,19 @@ def serve_field_map(table_id, f, owner=None, ctx=None):
             "spType": "Application",
             "id": f.get("sp_id") or "",
             "status": (f.get("status") or {}).get("label") or "",
+        })
+    elif table_id == "certificate-auth-users-table":
+        fields.update({
+            "severity": f.get("severity", "Info"),
+            "user": f.get("user_display") or "",
+            "userUpn": f.get("user_upn") or "",
+            "authUserType": f.get("user_type") or "",
+            "userStatus": "Enabled" if f.get("user_enabled") else "Disabled",
+            "hybrid": "AD" if f.get("hybrid") else "Cloud",
+            "authCbaScope": f.get("auth_cba_scope") or "",
+            "authCbaMode": f.get("auth_cba_mode") or "",
+            "authCbaBindings": f.get("auth_cba_bindings") or "",
+            "id": (f.get("target") or {}).get("id") or "",
         })
     elif table_id == "authentication-methods-table":
         fields.update({
