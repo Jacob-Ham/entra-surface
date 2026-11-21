@@ -392,9 +392,72 @@ REPORT_CSS = """<style>
     border: 1px solid var(--border);
     border-radius: 8px;
   }
-  .pager { margin: 10px 0; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-  .pager button:disabled { opacity: 0.4; cursor: default; }
-  .pager select { background: var(--surface-1); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; }
+  .table-pager {
+    display: flex; align-items: center; justify-content: flex-start;
+    flex-wrap: wrap; gap: 4px 16px;
+    min-height: 36px; padding: 5px 14px;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-top: 1px solid var(--gridline);
+    border-radius: 0 0 8px 8px;
+    color: var(--text-muted); font-size: 11.5px; line-height: 1.3;
+  }
+  .table-pager.hidden { display: none; }
+  .table-scroll:has(+ .table-pager:not(.hidden)) {
+    border-bottom: 0;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+  .tp-range {
+    color: var(--text-secondary); font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .tp-range.error { color: var(--status-critical); }
+  .tp-rows {
+    display: inline-flex; align-items: center; gap: 4px;
+    margin-left: auto;
+    color: var(--text-muted); white-space: nowrap; cursor: pointer;
+  }
+  .tp-rows:hover .tp-rows-label { color: var(--text-secondary); }
+  .tp-select-wrap { position: relative; display: inline-flex; align-items: center; }
+  .tp-select-wrap::after {
+    content: ""; position: absolute; right: 5px; top: 50%;
+    width: 4px; height: 4px; pointer-events: none;
+    border-right: 1.5px solid var(--text-muted);
+    border-bottom: 1.5px solid var(--text-muted);
+    transform: translateY(-70%) rotate(45deg);
+  }
+  .tp-size {
+    appearance: none; -webkit-appearance: none;
+    height: 24px; min-width: 38px; padding: 0 17px 0 6px;
+    border: 0; border-radius: 5px; background: transparent;
+    color: var(--text-secondary);
+    font: inherit; font-variant-numeric: tabular-nums;
+    cursor: pointer;
+  }
+  .tp-size:hover { background: var(--row-hover); color: var(--text-primary); }
+  .tp-size:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .tp-nav { display: inline-flex; align-items: center; }
+  .tp-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 24px; height: 24px; padding: 0;
+    border: 0; border-radius: 5px; background: transparent;
+    color: var(--text-secondary); cursor: pointer;
+    transition: background-color .12s ease, color .12s ease;
+  }
+  .tp-btn:hover:not(:disabled) { background: var(--row-hover); color: var(--text-primary); }
+  .tp-btn:active:not(:disabled) { background: var(--border); }
+  .tp-btn:disabled { opacity: .35; color: var(--text-muted); cursor: default; }
+  .tp-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .tp-info {
+    padding: 0 8px; color: var(--text-muted);
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  @media (max-width: 560px) {
+    .table-pager { gap: 3px 12px; }
+    .tp-rows-label { display: none; }
+    .tp-info { padding: 0 6px; }
+  }
   table { border-collapse: collapse; font-size: 13px; table-layout: fixed; }
   table.findings { width: 100%; }
   thead th {
@@ -418,36 +481,76 @@ REPORT_CSS = """<style>
   .table-head-row h2 { margin: 0 0 4px; }
   .table-head-row .colman { margin: 0; }
   .colman-btn {
-    display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
-    background: var(--surface-1); color: var(--text-secondary); border: 1px solid var(--border);
-    border-radius: 6px; padding: 4px 10px; font-size: 12px; font-family: inherit;
+    display: inline-flex; align-items: center; gap: 6px; height: 28px;
+    padding: 0 7px; border: 1px solid transparent; border-radius: 6px;
+    background: transparent; color: var(--text-muted);
+    font: inherit; font-size: 12px; font-weight: 500; cursor: pointer;
+    transition: background-color .12s ease, color .12s ease;
   }
-  .colman-btn:hover { color: var(--text-primary); }
+  .colman-btn:hover { background: var(--row-hover); color: var(--text-primary); }
+  .colman-btn[aria-expanded="true"] {
+    color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+  .colman-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .colman-chevron { flex: none; opacity: .55; transition: transform .15s ease; }
+  .colman-btn[aria-expanded="true"] .colman-chevron { transform: rotate(180deg); }
   .colman-badge {
-    background: var(--accent); color: #fff; border-radius: 999px; font-size: 10px;
-    line-height: 1; padding: 2px 6px; font-weight: 600;
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 16px; height: 16px; padding: 0 4px; border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 13%, transparent); color: var(--accent);
+    font-size: 10px; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums;
   }
+  .colman-badge.hidden { display: none; }
   .colman-pop {
-    position: absolute; right: 0; top: calc(100% + 4px); z-index: 30;
-    min-width: 240px; max-height: 340px; overflow-y: auto; text-align: left;
-    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.18); padding: 6px 0;
+    position: absolute; right: 0; top: calc(100% + 6px); z-index: 30;
+    display: flex; flex-direction: column;
+    width: min(288px, calc(100vw - 16px));
+    max-height: min(360px, 70vh); max-height: min(360px, 70dvh);
+    overflow: hidden; text-align: left;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: 0 12px 32px rgba(0,0,0,.18), 0 2px 6px rgba(0,0,0,.08);
+    transform-origin: top right; animation: colman-in .13s ease-out;
   }
-  .colman-group { padding: 2px 0 6px; }
+  .colman-pop.hidden { display: none; }
+  @keyframes colman-in {
+    from { opacity: 0; transform: translateY(-3px) scale(.985); }
+    to { opacity: 1; transform: none; }
+  }
+  .colman-list {
+    flex: 1 1 auto; min-height: 0; overflow-y: auto;
+    padding: 0 0 4px; overscroll-behavior: contain;
+  }
+  .colman-group { padding: 4px 0 3px; }
   .colman-group-title {
-    padding: 5px 12px 2px; font-size: 10px; font-weight: 600; text-transform: uppercase;
-    letter-spacing: 0.04em; color: var(--text-muted);
+    position: sticky; top: 0; z-index: 1;
+    padding: 7px 12px 3px; background: var(--surface-1);
+    font-size: 10px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .04em; color: var(--text-muted);
   }
   .colman-item {
-    display: flex; align-items: center; gap: 8px; padding: 4px 12px;
+    display: flex; align-items: center; gap: 8px; min-height: 30px; padding: 5px 12px;
     font-size: 12.5px; color: var(--text-secondary); cursor: pointer;
+    transition: background-color .1s ease, color .1s ease;
   }
   .colman-item:hover { background: var(--row-hover); color: var(--text-primary); }
-  .colman-item input { margin: 0; }
-  .colman-foot { border-top: 1px solid var(--gridline); margin-top: 4px; padding: 8px 12px 2px; }
+  .colman-item input {
+    flex: none; width: 14px; height: 14px; margin: 0;
+    accent-color: var(--accent); cursor: pointer;
+  }
+  .colman-item input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .colman-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .colman-foot {
+    flex: none; padding: 6px 12px 7px; border-top: 1px solid var(--gridline);
+  }
   .colman-reset {
-    background: none; border: none; padding: 0; cursor: pointer; text-decoration: underline;
-    color: var(--accent); font-size: 12px; font-family: inherit;
+    padding: 2px 0; border: 0; border-radius: 4px; background: none; cursor: pointer;
+    color: var(--text-muted); font: inherit; font-size: 11.5px;
+  }
+  .colman-reset:hover { color: var(--text-primary); text-decoration: underline; }
+  .colman-reset:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) {
+    .colman-pop { animation: none; }
+    .colman-chevron { transition: none; }
   }
   tbody td { padding: 11px 14px; border-bottom: 1px solid var(--gridline); vertical-align: top; overflow-wrap: anywhere; }
   tbody tr:hover { background: var(--row-hover); }
@@ -635,6 +738,7 @@ JS_FILTER_MODULE = """<script id="filter-module">
     passwords: ['pw'], pw: ['pw'], keys: ['keys'],
     roleassignment: ['rolecount'], rolecount: ['rolecount'],
     group: ['group'], type: ['grptype'], grptype: ['grptype'],
+    groupsource: ['groupsource'],
     members: ['grpmembers'], grpmembers: ['grpmembers'],
     privmembers: ['grppriv'], grppriv: ['grppriv'],
     owners: ['grpowners'], grpowners: ['grpowners'],
@@ -679,6 +783,7 @@ JS_FILTER_MODULE = """<script id="filter-module">
     status: 'Status', target: 'Target', targettype: 'Target Type',
     objectid: 'Object ID', passwords: 'Passwords', keys: 'Keys',
     roleassignment: 'Role assignment', group: 'Group', type: 'Type',
+    groupsource: 'Group source',
     members: 'Members', privmembers: 'Priv. members', owners: 'Owners',
     policy: 'Policy', state: 'State', scope: 'Scope', apps: 'Apps',
     controls: 'Controls', included: 'Included', excluded: 'Excluded',
@@ -699,7 +804,8 @@ JS_FILTER_MODULE = """<script id="filter-module">
     ['Directory roles', 'roles'], ['Priv. members', 'privmembers'],
     ['Priv apps', 'privapps'], ['Capable grp', 'capablegrp'],
     ['Groups owned', 'groupsowned'], ['CA excl.', 'caexcl'],
-    ['Account Source', 'accountsource'], ['Target Type', 'targettype'],
+    ['Account Source', 'accountsource'], ['Group source', 'groupsource'],
+    ['Target Type', 'targettype'],
     ['Target Status', 'status'], ['Object ID', 'objectid'],
     ['Role assignment', 'roleassignment'], ['SP Status', 'spstatus'],
     ['Owner UPN', 'ownerupn'], ['Owner Status', 'ownerstatus'],
@@ -3926,7 +4032,10 @@ REPORT_JS = """<script>
   try { COLUMN_CATALOG = JSON.parse(document.getElementById('table-catalog-data').textContent) || {}; } catch (e) {}
   var COLUMN_EXTRAS = {};
   var COLUMN_STORE = 'entra-surface:cols:v1:';
-  var FAMILY_LABELS = { sp: 'SP / application', user: 'User', group: 'Group', policy: 'CA policy', arc: 'Azure Arc' };
+  var FAMILY_LABELS = {
+    sp: 'Application / service principal', user: 'User', group: 'Group',
+    policy: 'Conditional Access', auth: 'Authentication', arc: 'Azure Arc'
+  };
 
   function columnMeta(tid) {
     var meta = {};
@@ -4113,6 +4222,8 @@ REPORT_JS = """<script>
     defaultColumnFields(table.id).forEach(function(f) { if (!visible[f]) hidden++; });
     ui.badge.textContent = hidden ? String(hidden) : '';
     ui.badge.classList.toggle('hidden', !hidden);
+    ui.badge.title = hidden
+        ? hidden + (hidden === 1 ? ' hidden default column' : ' hidden default columns') : '';
   }
 
   function escHtml(s) {
@@ -4144,10 +4255,16 @@ REPORT_JS = """<script>
     });
     var famOrder = order.filter(function(f) { return f === entry.family; })
         .concat(order.filter(function(f) { return f !== entry.family; }));
-    var html = '';
+    var multiFamily = famOrder.length > 1;
+    var oldList = ui.pop.querySelector('.colman-list');
+    var scrollTop = oldList ? oldList.scrollTop : 0;
+    var html = '<div class="colman-list">';
     famOrder.forEach(function(fam) {
-      html += '<div class="colman-group"><div class="colman-group-title">'
-          + escHtml(FAMILY_LABELS[fam] || fam) + '</div>';
+      html += '<div class="colman-group">';
+      if (multiFamily) {
+        html += '<div class="colman-group-title">'
+            + escHtml(FAMILY_LABELS[fam] || fam) + '</div>';
+      }
       byFamily[fam].forEach(function(f) {
         html += '<label class="colman-item"><input type="checkbox" data-field="'
             + escHtml(f.id) + '"' + (visible[f.id] ? ' checked' : '') + '> <span>'
@@ -4155,9 +4272,12 @@ REPORT_JS = """<script>
       });
       html += '</div>';
     });
+    html += '</div>';
     html += '<div class="colman-foot"><button type="button" class="colman-reset">'
         + 'Reset to defaults</button></div>';
     ui.pop.innerHTML = html;
+    var list = ui.pop.querySelector('.colman-list');
+    if (list) list.scrollTop = scrollTop;
     var reset = ui.pop.querySelector('.colman-reset');
     if (reset) reset.addEventListener('click', function(e) {
       e.stopPropagation();
@@ -4176,10 +4296,15 @@ REPORT_JS = """<script>
     btn.type = 'button';
     btn.className = 'colman-btn';
     btn.setAttribute('aria-expanded', 'false');
-    btn.textContent = 'Columns \u25be';
+    btn.innerHTML = '<span class="colman-btn-label">Columns</span>';
     var badge = document.createElement('span');
     badge.className = 'colman-badge hidden';
     btn.appendChild(badge);
+    btn.insertAdjacentHTML('beforeend',
+        '<svg class="colman-chevron" width="10" height="10" viewBox="0 0 16 16" '
+        + 'aria-hidden="true"><path d="M4 6.5 8 10.5l4-4" fill="none" '
+        + 'stroke="currentColor" stroke-width="1.5" stroke-linecap="round" '
+        + 'stroke-linejoin="round"/></svg>');
     var pop = document.createElement('div');
     pop.className = 'colman-pop hidden';
     wrap.appendChild(btn);
@@ -4316,12 +4441,26 @@ REPORT_JS = """<script>
     table.__loaderMade = true;
     var state = { page: 1, size: 25, sort: '', dir: 'asc' };
     var tbody = table.tBodies[0];
+    var range = pager.querySelector('.tp-range');
     var info = pager.querySelector('.tp-info');
     var prev = pager.querySelector('.tp-prev');
     var next = pager.querySelector('.tp-next');
     var sizeSel = pager.querySelector('.tp-size');
     var reqSeq = 0;
     var pendingAbort = null;
+
+    function setRange(page, size, total) {
+      if (!range) return;
+      range.classList.remove('error');
+      if (!total) {
+        range.textContent = '0 rows';
+        return;
+      }
+      var start = (page - 1) * size + 1;
+      var end = Math.min(page * size, total);
+      range.textContent = start + '\u2013' + end + ' of ' + total
+          + (total === 1 ? ' row' : ' rows');
+    }
 
     function domFieldKey() {
       var out = [];
@@ -4394,7 +4533,8 @@ REPORT_JS = """<script>
             table.__pendingCols = null;
           }
           tbody.innerHTML = d.rows_html;
-          info.textContent = 'Page ' + d.page + ' of ' + d.pages + ' (' + d.total + ' rows)';
+          setRange(d.page, d.size, d.total);
+          info.textContent = 'Page ' + d.page + ' of ' + d.pages;
           pager.classList.remove('hidden');
           prev.disabled = d.page <= 1;
           next.disabled = d.page >= d.pages;
@@ -4402,7 +4542,10 @@ REPORT_JS = """<script>
         .catch(function(err) {
           if (err && err.name === 'AbortError') return;
           if (seq !== reqSeq) return;
-          info.textContent = 'Failed to load table';
+          if (range) {
+            range.textContent = 'Failed to load rows';
+            range.classList.add('error');
+          }
           pager.classList.remove('hidden');
         })
         .finally(function() {

@@ -95,6 +95,7 @@ USER_GRAPH_FIELDS = [
 GROUP_GRAPH_FIELDS = [
     "objectId", "displayName", "isAssignableToRole", "membershipRule",
     "groupTypes", "visibility", "isPublic", "mailEnabled", "deletionTimestamp",
+    "dirSyncEnabled", "onPremisesSecurityIdentifier",
 ]
 DEVICE_GRAPH_FIELDS = [
     "objectId", "displayName", "hostnames", "deviceOSType", "dirSyncEnabled",

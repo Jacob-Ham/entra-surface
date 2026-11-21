@@ -1295,6 +1295,8 @@ def group_sort_value(f, key, ctx=None):
         return (f.get("group_name") or "").lower()
     if key == "grpType":
         return " ".join(f.get("types", [])).lower()
+    if key == "groupSource":
+        return 0 if (f.get("group_synced") or f.get("group_source") == "AD") else 1
     if key == "grpRoles":
         return ", ".join(r["name"] for r in f.get("dir_roles", [])).lower()
     if key == "eligible":
@@ -1609,9 +1611,9 @@ def render_report(results, tenant_name, db_path, config_path,
       {table_head_html("owned-table")}
       <tbody>{owned_rows}</tbody>
     </table>
+    {'<div class="empty">No owned applications matched the configured privileged roles.</div>' if not owned else ''}
     </div>
     {owned_pager}
-    {'<div class="empty">No owned applications matched the configured privileged roles.</div>' if not owned else ''}
   </section>
 """
 
@@ -1631,9 +1633,9 @@ def render_report(results, tenant_name, db_path, config_path,
       {table_head_html("unowned-table")}
       <tbody>{unowned_rows}</tbody>
     </table>
+    {'<div class="empty">No unowned privileged applications found.</div>' if not unowned else ''}
     </div>
     {unowned_pager}
-    {'<div class="empty">No unowned privileged applications found.</div>' if not unowned else ''}
   </section>
 """
 
@@ -2195,7 +2197,7 @@ def render_report(results, tenant_name, db_path, config_path,
     # distinct values per field for advanced-filter autocomplete (capped)
     SUGGEST_VALUE_FIELDS = {
         "severity", "category", "check", "roles", "eligible", "grproles",
-        "dynmods", "dynattrs", "adtags", "targettype", "status", "hybrid",
+        "groupsource", "dynmods", "dynattrs", "adtags", "targettype", "status", "hybrid",
         "userstatus", "spstatus", "ownerstatus", "adstatus", "polstate",
         "resource", "permission", "appid", "sptype", "appdirroles",
         "owner", "ownerupn", "ownersource", "owneraddn", "ownersid",

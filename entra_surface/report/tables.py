@@ -42,9 +42,10 @@ TABLE_SPECS = {
     },
     "groups-table": {
         "family": "group",
-        "defaults": ["severity", "group", "grpType", "grpRoles", "eligible",
-                     "grpMembers", "grpPriv", "grpOwners"],
-        "extras": [("dynRule", "group")],
+        "defaults": ["severity", "group", "grpType", "groupSource", "grpRoles",
+                     "eligible", "grpMembers"],
+        "extras": [("grpPriv", "group"), ("grpOwners", "group"),
+                   ("dynRule", "group")],
     },
     "dynamic-groups-table": {
         "family": "group",
@@ -54,9 +55,9 @@ TABLE_SPECS = {
     "privileged-users-table": {
         "family": "user",
         "defaults": ["severity", "user", "userUpn", "roles", "eligible",
-                     "privApps", "capGroups", "grpOwned", "caExcl", "hybrid",
-                     "userStatus"],
-        "extras": [("adDn", "user"), ("adSid", "user"), ("immutableId", "user")],
+                     "privApps", "caExcl", "hybrid", "userStatus"],
+        "extras": [("capGroups", "user"), ("grpOwned", "user"),
+                   ("adDn", "user"), ("adSid", "user"), ("immutableId", "user")],
     },
     "app-dir-roles-table": {
         "family": "sp",

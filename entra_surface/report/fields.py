@@ -74,6 +74,7 @@ FIELD_META = {
     # --- group --------------------------------------------------------------
     "group": {"label": "Group", "width": 220, "cls": "clickable"},
     "grpType": {"label": "Type", "width": 180},
+    "groupSource": {"label": "Group source", "width": 110},
     "grpRoles": {"label": "Directory roles", "width": 200},
     "grpMembers": {"label": "Members", "width": 80},
     "grpPriv": {"label": "Priv. members", "width": 110},
@@ -276,6 +277,34 @@ def _cell_hybrid(f, r):
             return _dash_pair()
         hyb = rec.get("dirSyncEnabled") in (1, True)
     return _source_badge(bool(hyb))
+
+
+def group_source_value(f, r=None):
+    """'AD' or 'Cloud'; falls back to the graph group when the finding predates
+    the group_source flag (e.g. older analysis caches)."""
+    source = f.get("group_source")
+    if source:
+        return str(source)
+    if "group_synced" in f:
+        return "AD" if f.get("group_synced") else "Cloud"
+    rec = ((_graph_of(r).get("group") or {}).get(f.get("group_id") or "") or {})
+    if not rec:
+        return ""
+    synced = (rec.get("dirSyncEnabled") in (1, True)
+              or bool(rec.get("onPremisesSecurityIdentifier")))
+    return "AD" if synced else "Cloud"
+
+
+def _cell_group_source(f, r):
+    source = group_source_value(f, r)
+    if not source:
+        return _dash_pair()
+    synced = source == "AD"
+    label = "AD" if synced else "Cloud"
+    title = ("Synced from on-prem Active Directory" if synced
+             else "Cloud-only group")
+    cls = "badge-hybrid" if synced else "badge-disabled"
+    return f'<span class="badge {cls}" title="{title}">{label}</span>', label
 
 
 def _cell_user_status(f, r):
@@ -1017,6 +1046,7 @@ FIELD_RENDERERS = {
     "polModified": _cell_pol_modified,
     "group": _cell_group,
     "grpType": _cell_grp_type,
+    "groupSource": _cell_group_source,
     "grpRoles": _cell_grp_roles,
     "grpMembers": _cell_grp_members,
     "grpPriv": _cell_grp_priv,
