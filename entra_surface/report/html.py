@@ -71,13 +71,30 @@ def drawer_for_html(key, colspan):
             f'<td colspan="{colspan}"><div class="drawer-body"></div></td></tr>')
 
 def _serve_pager():
-    """Pager markup for serve-mode tables (Prev/Next + rows-per-page select)."""
-    return ('<div class="table-pager hidden">'
-            '<button type="button" class="icon-btn tp-prev">&#8592; Prev</button>'
-            '<span class="tp-info muted"></span>'
-            '<button type="button" class="icon-btn tp-next">Next &#8594;</button>'
-            '<label class="muted">Rows '
-            '<select class="tp-size">'
-            '<option value="25" selected>25</option><option value="50">50</option><option value="100">100</option><option value="250">250</option>'
+    """Table footer: result range, page navigation and rows-per-page control."""
+    chevron = ('<svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true" '
+               'focusable="false"><path d="{d}" fill="none" stroke="currentColor" '
+               'stroke-width="1.5" stroke-linecap="round" '
+               'stroke-linejoin="round"/></svg>')
+    return ('<div class="table-pager" role="group" aria-label="Table pagination">'
+            '<span class="tp-range">Loading&hellip;</span>'
+            '<div class="tp-nav">'
+            '<button type="button" class="tp-btn tp-prev" aria-label="Previous page" '
+            'title="Previous page" disabled>'
+            + chevron.format(d="M10.25 3.5 5.75 8l4.5 4.5") +
+            '</button>'
+            '<span class="tp-info">Page 1 of 1</span>'
+            '<button type="button" class="tp-btn tp-next" aria-label="Next page" '
+            'title="Next page" disabled>'
+            + chevron.format(d="M5.75 3.5 10.25 8l-4.5 4.5") +
+            '</button>'
+            '</div>'
+            '<label class="tp-rows">'
+            '<span class="tp-rows-label">Rows per page</span>'
+            '<span class="tp-select-wrap">'
+            '<select class="tp-size" aria-label="Rows per page">'
+            '<option value="25" selected>25</option><option value="50">50</option>'
+            '<option value="100">100</option><option value="250">250</option>'
             '<option value="500">500</option><option value="1000">1000</option>'
-            '</select></label></div>')
+            '</select></span></label>'
+            '</div>')

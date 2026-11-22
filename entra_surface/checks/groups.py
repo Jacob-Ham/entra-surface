@@ -161,6 +161,8 @@ def check_groups(ctx):
         visibility = rec.get("visibility") or ""
         is_public = rec.get("isPublic") in (1, True)
         mail = rec.get("mailEnabled") in (1, True)
+        synced = (rec.get("dirSyncEnabled") in (1, True)
+                  or bool(rec.get("onPremisesSecurityIdentifier")))
         rule = (rec.get("membershipRule") or "").strip()
         dynamic = bool(rule) and rule not in ("[]",)
         if dynamic:
@@ -311,6 +313,8 @@ def check_groups(ctx):
         )
         f["group_id"] = gid
         f["group_name"] = name
+        f["group_source"] = "AD" if synced else "Cloud"
+        f["group_synced"] = synced
         f["types"] = types
         f["visibility"] = visibility
         f["is_public"] = is_public

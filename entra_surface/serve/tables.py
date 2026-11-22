@@ -11,7 +11,8 @@ from ..filters import (
 )
 from ..graph import json_list
 from ..report.fields import (
-    graph_user_record, grp_type_value, row_owner_dict, sp_app_id, sp_owner_dict,
+    graph_user_record, group_source_value, grp_type_value, row_owner_dict,
+    sp_app_id, sp_owner_dict,
 )
 from ..report.tables import (
     TABLE_SPECS, allowed_fields, parse_cols_param, table_colgroup_inner_html,
@@ -110,6 +111,7 @@ def serve_field_map(table_id, f, owner=None, ctx=None):
         fields.update({
             "group": f.get("group_name") or "",
             "grpType": grp_type_value(f),
+            "groupSource": group_source_value(f, {"graph": graph}),
             "grpRoles": ", ".join(r["name"] for r in f.get("dir_roles", [])),
             "eligible": ", ".join(r["name"] for r in f.get("eligible_roles", [])),
             "grpMembers": str(f.get("member_count", 0)),
