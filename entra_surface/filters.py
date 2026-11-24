@@ -37,7 +37,8 @@ ADV_COLUMN_ALIASES = {
     "userstatus": ["userstatus"], "spstatus": ["spstatus"],
     "ownerstatus": ["ownerstatus"], "adstatus": ["adstatus"],
     "ownersource": ["ownersource"], "owneraddn": ["owneraddn"],
-    "ownersid": ["ownersid"], "ownerimmutableid": ["ownerimmutableid"],
+    "ownersid": ["owneradsid"], "owneradsid": ["owneradsid"],
+    "ownerimmutableid": ["ownerimmutableid"],
     "target": ["target"], "targettype": ["targettype"],
     "objectid": ["id"], "id": ["id"],
     "passwords": ["pw"], "pw": ["pw"], "keys": ["keys"],
@@ -75,7 +76,7 @@ ADV_COLUMN_ALIASES = {
     "arcprincipal": ["arcprincipal"], "arcprincipaltype": ["arcprincipaltype"],
     "arctag": ["arctag"], "arcazroles": ["arcazroles"], "arcprovider": ["arcprovider"],
     "pwlastset": ["pwlastset"],
-    "appid": ["appid"], "spty": ["spty"], "servicetype": ["spty"],
+    "appid": ["appid"], "spty": ["sptype"], "servicetype": ["sptype"],
     "poltype": ["poltype"], "polcreated": ["polcreated"], "created": ["polcreated"],
     "polmodified": ["polmodified"], "lastmodified": ["polmodified"],
     "immutableid": ["immutableid"],
@@ -105,20 +106,94 @@ ADV_DISPLAY_PHRASES = [
     ("Created", "polcreated"), ("Last modified", "polmodified"),
     ("Immutable ID", "immutableid"),
 ]
-ADV_PHRASE_RES = [
-    (re.compile(r"\b" + re.escape(phrase) + r"(?=\s*:)", re.IGNORECASE), canonical)
-    for phrase, canonical in ADV_DISPLAY_PHRASES
-]
+_AUTO_PHRASES = []
+_PHRASE_RES = None
+
+
+def _phrase_pairs():
+    """Static display phrases plus every multi-word/punctuated catalog label.
+
+    Longest phrases first so 'Resource ID' is not partially rewritten as
+    'Resource' before the tokenizer sees it."""
+    _auto_column_aliases()
+    seen, pairs = set(), []
+    for phrase, canonical in list(ADV_DISPLAY_PHRASES) + list(_AUTO_PHRASES):
+        key = phrase.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        pairs.append((phrase, canonical))
+    pairs.sort(key=lambda item: len(item[0]), reverse=True)
+    return pairs
+
+
+def _phrase_res():
+    global _PHRASE_RES
+    if _PHRASE_RES is None:
+        _PHRASE_RES = [
+            (re.compile(r"(?<![A-Za-z0-9])" + re.escape(phrase) + r"(?=\s*:)",
+                        re.IGNORECASE), canonical)
+            for phrase, canonical in _phrase_pairs()
+        ]
+    return _PHRASE_RES
 
 
 def _rewrite_column_phrases(text):
-    for pattern, canonical in ADV_PHRASE_RES:
+    for pattern, canonical in _phrase_res():
         text = pattern.sub(canonical, text)
     return text
 
 
 def _normalize_field(name):
     return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+_AUTO_COLUMN_ALIASES = None
+
+
+def _auto_column_aliases():
+    """Every field id/label advertised by the table catalog resolves to itself.
+
+    The handwritten alias map carries the friendly/semantic names; this catches
+    columns that were added later or have table-specific labels, so an advanced
+    filter never rejects a column the report actually shows."""
+    global _AUTO_COLUMN_ALIASES, _AUTO_PHRASES
+    if _AUTO_COLUMN_ALIASES is not None:
+        return _AUTO_COLUMN_ALIASES
+    aliases = {}
+    phrases = {}
+
+    def add(name, field):
+        canon = _normalize_field(name)
+        norm = _normalize_field(field)
+        if not canon or not norm:
+            return
+        bucket = aliases.setdefault(canon, [])
+        if norm not in bucket:
+            bucket.append(norm)
+
+    def add_label(label, field):
+        add(label, field)
+        if label and re.search(r"[^A-Za-z0-9]", label):
+            phrases[_normalize_field(label)] = label
+
+    try:
+        from .report.fields import FIELD_META
+        from .report.tables import TABLE_SPECS, allowed_fields, field_label
+    except Exception:  # pragma: no cover - report package always present in app
+        _AUTO_COLUMN_ALIASES = aliases
+        return aliases
+
+    for field, meta in FIELD_META.items():
+        add(field, field)
+        add_label(meta.get("label") or field, field)
+    for table_id in ["table-generic"] + list(TABLE_SPECS):
+        for field in allowed_fields(table_id) or ():
+            add(field, field)
+            add_label(field_label(table_id, field), field)
+    _AUTO_PHRASES = [(label, canon) for canon, label in phrases.items()]
+    _AUTO_COLUMN_ALIASES = aliases
+    return aliases
 
 
 ADV_PHRASE_CANON = {_normalize_field(phrase): canonical
@@ -129,11 +204,19 @@ def resolve_advanced_fields(name):
     """Map a query field (column name or internal name) to the internal DOM
     field names it matches; raises AdvancedParseError for unknown names."""
     canonical = _normalize_field(name)
-    fields = ADV_COLUMN_ALIASES.get(canonical)
-    if fields is None:
-        phrase_canon = ADV_PHRASE_CANON.get(canonical)
-        fields = ADV_COLUMN_ALIASES.get(phrase_canon) if phrase_canon else None
-    if fields is None:
+    fields = []
+
+    def add(values):
+        for value in values or ():
+            if value not in fields:
+                fields.append(value)
+
+    add(ADV_COLUMN_ALIASES.get(canonical))
+    phrase_canon = ADV_PHRASE_CANON.get(canonical)
+    if phrase_canon:
+        add(ADV_COLUMN_ALIASES.get(phrase_canon))
+    add(_auto_column_aliases().get(canonical))
+    if not fields:
         raise AdvancedParseError(
             f"unknown field '{name}' (try privileges, roles, target, check, category&hellip;)")
     return fields

@@ -732,7 +732,8 @@ JS_FILTER_MODULE = """<script id="filter-module">
     userstatus: ['userstatus'], spstatus: ['spstatus'],
     ownerstatus: ['ownerstatus'], adstatus: ['adstatus'],
     ownersource: ['ownersource'], owneraddn: ['owneraddn'],
-    ownersid: ['ownersid'], ownerimmutableid: ['ownerimmutableid'],
+    ownersid: ['owneradsid'], owneradsid: ['owneradsid'],
+    ownerimmutableid: ['ownerimmutableid'],
     target: ['target'], targettype: ['targettype'],
     objectid: ['id'], id: ['id'],
     passwords: ['pw'], pw: ['pw'], keys: ['keys'],
@@ -769,7 +770,7 @@ JS_FILTER_MODULE = """<script id="filter-module">
     arcprincipal: ['arcprincipal'], arcprincipaltype: ['arcprincipaltype'],
     arctag: ['arctag'], arcazroles: ['arcazroles'], arcprovider: ['arcprovider'],
     pwlastset: ['pwlastset'],
-    appid: ['appid'], spty: ['spty'], servicetype: ['spty'],
+    appid: ['appid'], spty: ['sptype'], servicetype: ['sptype'],
     poltype: ['poltype'], polcreated: ['polcreated'], created: ['polcreated'],
     polmodified: ['polmodified'], lastmodified: ['polmodified'],
     immutableid: ['immutableid'],
@@ -852,21 +853,81 @@ JS_FILTER_MODULE = """<script id="filter-module">
     return (name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   }
 
+  // Every column label/id in the rendered catalog is filterable, including
+  // table-specific labels and columns added after the static alias list.
+  var AUTO_ALIASES = {};
+  var AUTO_DISPLAY = {};
+  var AUTO_PHRASES = {};
+  var AUTO_PHRASE_ORDER = [];
+  function addAutoAlias(name, field, display) {
+    var canon = normalizeField(name);
+    var norm = normalizeField(field);
+    if (!canon || !norm) return;
+    var bucket = AUTO_ALIASES[canon] || (AUTO_ALIASES[canon] = []);
+    if (bucket.indexOf(norm) === -1) bucket.push(norm);
+    if (display) {
+      if (!AUTO_DISPLAY[canon]) AUTO_DISPLAY[canon] = display;
+      if (/[^A-Za-z0-9]/.test(display) && !AUTO_PHRASES[canon]) {
+        AUTO_PHRASES[canon] = display;
+        AUTO_PHRASE_ORDER.push(canon);
+      }
+    }
+  }
+  (function() {
+    try {
+      var el = document.getElementById('table-catalog-data');
+      var catalog = el ? JSON.parse(el.textContent) : {};
+      Object.keys(catalog || {}).forEach(function(tid) {
+        ((catalog[tid] || {}).fields || []).forEach(function(f) {
+          addAutoAlias(f.id, f.id, '');
+          addAutoAlias(f.label || f.id, f.id, f.label || f.id);
+        });
+      });
+      var extra = AUTO_PHRASE_ORDER.map(function(canon) {
+        return [AUTO_PHRASES[canon], canon];
+      });
+      extra.sort(function(a, b) { return b[0].length - a[0].length; });
+      PHRASE_RES = extra.map(function(p) {
+        return [new RegExp(BS + 'b' + escapeRegExp(p[0])
+                           + '(?=' + BS + 's*:)', 'i'), p[1]];
+      }).concat(PHRASE_RES);
+    } catch (e) {}
+  })();
+
+  function pushFields(out, values) {
+    (values || []).forEach(function(v) {
+      if (out.indexOf(v) === -1) out.push(v);
+    });
+  }
+
   function fieldsFor(name) {
     var canon = normalizeField(name);
-    var fields = COLUMN_ALIASES[canon];
-    if (!fields) {
-      var mapped = DISPLAY_CANON[canon];
-      if (mapped) fields = COLUMN_ALIASES[mapped];
-    }
-    return fields || null;
+    var fields = [];
+    pushFields(fields, COLUMN_ALIASES[canon]);
+    var mapped = DISPLAY_CANON[canon];
+    if (mapped) pushFields(fields, COLUMN_ALIASES[mapped]);
+    pushFields(fields, AUTO_ALIASES[canon]);
+    return fields.length ? fields : null;
   }
 
   function columns() {
-    var out = [];
+    var out = [], byDisplay = {};
+    function addColumn(canon, display) {
+      var key = normalizeField(display);
+      var item = byDisplay[key];
+      if (!item) {
+        item = {canonical: canon, display: display, fields: []};
+        byDisplay[key] = item;
+        out.push(item);
+      }
+      pushFields(item.fields, COLUMN_ALIASES[canon]);
+      pushFields(item.fields, AUTO_ALIASES[canon]);
+    }
     Object.keys(DISPLAY_NAMES).forEach(function(canon) {
-      out.push({canonical: canon, display: DISPLAY_NAMES[canon],
-                fields: COLUMN_ALIASES[canon] || []});
+      addColumn(canon, DISPLAY_NAMES[canon]);
+    });
+    Object.keys(AUTO_DISPLAY).forEach(function(canon) {
+      addColumn(canon, AUTO_DISPLAY[canon]);
     });
     out.sort(function(a, b) { return a.display < b.display ? -1 : 1; });
     return out;
@@ -3608,9 +3669,9 @@ REPORT_JS = """<script>
     return map;
   }
 
-  function setRowVisibility(test, uniqFields) {
+  function setRowVisibility(test, uniqFields, tables) {
     var seenByTable = {};
-    allTables().forEach(function(table) {
+    (tables || allTables()).forEach(function(table) {
       var seen = (uniqFields && uniqFields.length) ? (seenByTable[table.id] = {}) : null;
       Array.prototype.forEach.call(table.tBodies[0].rows, function(row) {
         if (row.classList.contains('drawer')) return;
@@ -3668,7 +3729,28 @@ REPORT_JS = """<script>
     while (start > 0 && !/[\\s()]/.test(value[start - 1])) start--;
     var end = caret;
     while (end < value.length && !/[\\s()]/.test(value[end])) end++;
-    return { start: start, end: end, token: value.slice(start, end) };
+    var token = value.slice(start, end);
+    // Multi-word column names contain spaces, so expand the token back over the
+    // longest known display label when the caret is in its value (e.g.
+    // completing `Home tenant:...`).
+    var ci = token.indexOf(':');
+    if (ci !== -1) {
+      var colon = start + ci;
+      var before = value.slice(0, colon).toLowerCase();
+      var bestStart = start;
+      knownFields().forEach(function(display) {
+        var d = display.toLowerCase();
+        if (!d || before.slice(-d.length) !== d) return;
+        var at = colon - d.length;
+        if (at > 0 && !/[\\s()]/.test(value[at - 1])) return;
+        if (at < bestStart) bestStart = at;
+      });
+      if (bestStart < start) {
+        start = bestStart;
+        token = value.slice(start, end);
+      }
+    }
+    return { start: start, end: end, token: token };
   }
 
   function buildSuggestions() {
@@ -3724,8 +3806,11 @@ REPORT_JS = """<script>
     if (!suggestionRange) return;
     var r = suggestionRange;
     var value = input.value;
-    input.value = value.slice(0, r.start) + item + ' ' + value.slice(r.end);
-    var pos = r.start + item.length + 1;
+    // A field/operator suggestion already ends with the colon; keep the caret
+    // there so the value can be typed immediately instead of after a space.
+    var trailing = item.charAt(item.length - 1) === ':' ? '' : ' ';
+    input.value = value.slice(0, r.start) + item + trailing + value.slice(r.end);
+    var pos = r.start + item.length + trailing.length;
     input.setSelectionRange(pos, pos);
     hideSuggest();
     input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -3758,9 +3843,15 @@ REPORT_JS = """<script>
       buildSuggestions();
       return;
     }
-    // The server is authoritative in advanced mode. Do not filter the
-    // currently loaded page here: it causes rows to disappear while the
-    // full query is still running and gives wrong uniq/page semantics.
+    // Served tables are filtered by the server. Static tables have every row
+    // in the DOM, so apply the parsed query locally there (e.g. Azure roles).
+    setRowVisibility(function(row) {
+      return ADV_FILTER.evaluate(parsed.ast, rowFieldMap(row),
+                                 row.textContent.toLowerCase());
+    }, ADV_FILTER.uniqFields(parsed.ast),
+       allTables().filter(function(t) {
+         return t.getAttribute('data-serve') !== '1';
+       }));
     buildSuggestions();
   }
 
