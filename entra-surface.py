@@ -94,7 +94,7 @@ from entra_surface.findings import (
 )
 from entra_surface.filters import (
     ADV_COLUMN_ALIASES, ADV_DISPLAY_PHRASES, ADV_LIST_FIELDS, ADV_PHRASE_CANON,
-    ADV_PHRASE_RES, AdvancedParseError, _glob_matches, _normalize_field,
+    AdvancedParseError, _glob_matches, _normalize_field,
     _rewrite_column_phrases, evaluate_advanced, extract_uniq_fields,
     parse_advanced_query, resolve_advanced_fields, tokenize_advanced,
 )
@@ -2197,15 +2197,24 @@ def render_report(results, tenant_name, db_path, config_path,
     # distinct values per field for advanced-filter autocomplete (capped)
     SUGGEST_VALUE_FIELDS = {
         "severity", "category", "check", "roles", "eligible", "grproles",
-        "groupsource", "dynmods", "dynattrs", "adtags", "targettype", "status", "hybrid",
-        "userstatus", "spstatus", "ownerstatus", "adstatus", "polstate",
-        "resource", "permission", "appid", "sptype", "appdirroles",
-        "owner", "ownerupn", "ownersource", "owneraddn", "ownersid",
+        "groupsource", "dynmods", "dynattrs", "adtags", "target", "targettype",
+        "status", "hybrid", "userstatus", "spstatus", "ownerstatus", "adstatus",
+        "polstate",
+        "resource", "permission", "appid", "sptype", "appdirroles", "rolecount",
+        "pw", "keys", "poltype",
+        "owner", "ownerupn", "ownersource", "owneraddn", "owneradsid",
         "ownerimmutableid",
+        "aduser", "adupn", "adcn", "addn", "adsid", "adpw", "immutableid",
+        "ssoprotocol", "ssopublisher", "ssoaudience", "ssohometenant",
+        "ssoassignment", "ssoassigned", "ssoverified", "ssoreplyurls",
+        "ssocertexpiry", "ssocertthumb",
         "arcmachine", "arcprincipal", "arcprincipaltype", "arctag",
         "arcazroles", "arcprovider", "arcsub", "arcrg", "arcstatus",
+        "arcresourceid", "pwlastset", "pwexpiry",
         "authmethod", "authstate", "authscope", "authregistration", "authsource",
-        "authusertype", "authcbascope", "authcbamode", "authcbabindings",
+        "authusertype", "authcbascope", "authcbamode", "authcbabindings", "authid",
+        "azapp", "azgroup", "azuser", "azsproles", "azroles", "azusrroles",
+        "azscopetype", "azsub", "azrg", "azprovider", "azresource",
     }
     suggest_data = {}
 

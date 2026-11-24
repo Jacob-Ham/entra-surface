@@ -114,7 +114,7 @@ CHECK_SPECS = [
     {
         "id": "certificate_auth_users",
         "category": "auth",
-        "title": "Users allowed to use certificate authentication",
+        "title": "Users scoped for certificate authentication",
         "description": "",
         "run": check_certificate_auth_users,
     },
